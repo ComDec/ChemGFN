@@ -1,4 +1,4 @@
-name: "openwebtext"
+name: "smiles"
 
 data:
   path: "/home/wangxi/project/LLM/sft_dataset_chirality_test_sampled.json"
@@ -30,7 +30,7 @@ training:
 
 eval:
   n_probes: 10
-  diversity_metric: "sequence_embedding"
+  diversity_metric: null
 
 reward:
   temp_start: 1.0
@@ -39,8 +39,8 @@ reward:
   vocab_alpha: -50
   buffer_size: 50
   sentence_validator: "smiles"
-  valid_sentence_alpha: 1.0
-  smiles_vocab_path: "/home/wangxi/project/LLM/gfn-lm-tuning/next_sentence/assets/gpt2-smiles-vocab.txt"
+  valid_sentence_alpha: 10.0
+  smiles_vocab_path: "/home/wangxi/project/LLM/ChemGFN/assets/gpt2-smiles-vocab.txt"
 
 callbacks:
   - _target_: pytorch_lightning.callbacks.ModelCheckpoint

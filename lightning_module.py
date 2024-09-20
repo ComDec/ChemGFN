@@ -6,9 +6,14 @@ import pandas as pd
 import torch
 from pytorch_lightning import LightningModule
 
-from utils import (SequenceDiversity, base_to_lora,
-                   generate_and_return_termination_logprob,
-                   get_termination_vals, lora_to_base, modified_subtb_loss)
+from utils import (
+    SequenceDiversity,
+    base_to_lora,
+    generate_and_return_termination_logprob,
+    get_termination_vals,
+    lora_to_base,
+    modified_subtb_loss,
+)
 
 
 class NextSentenceGFNTask(LightningModule):
@@ -48,14 +53,12 @@ class NextSentenceGFNTask(LightningModule):
         self.diversity_metric = SequenceDiversity(diversity_metric)
 
         self.get_lr_at_step = lambda step: min(step / 20 * lr, lr)
-        self.get_reward_temp_at_step = lambda step: reward_temp_start + (
-            reward_temp_end - reward_temp_start
-        ) * min(1, step / reward_temp_horizon)
+        self.get_reward_temp_at_step = lambda step: reward_temp_start + (reward_temp_end - reward_temp_start) * min(
+            1, step / reward_temp_horizon
+        )
 
         try:  # Some tokenizers encode a "." differently when it is the first token
-            self.end_of_sentence_token_id = tokenizer.encode(
-                "A sentence.", add_special_tokens=False
-            )[-1]
+            self.end_of_sentence_token_id = tokenizer.encode("A sentence.", add_special_tokens=False)[-1]
         except:
             self.end_of_sentence_token_id = tokenizer.convert_tokens_to_ids(".")
 
@@ -101,34 +104,23 @@ class NextSentenceGFNTask(LightningModule):
             and self.reward_buffer.sample(self.hparams.n_samples, prompt)[0] is not None
         ):
             # Using a sample from the reward buffer
-            action_seq, log_r = self.reward_buffer.sample(
-                self.hparams.n_samples, prompt
-            )
-            generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                prompt, action_seq=action_seq
-            )
-            log_r = log_r[
-                :, : generated_text.shape[1] - len(prompt)
-            ]  # Undo padding from buffer
+            action_seq, log_r = self.reward_buffer.sample(self.hparams.n_samples, prompt)
+            generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(prompt, action_seq=action_seq)
+            log_r = log_r[:, : generated_text.shape[1] - len(prompt)]  # Undo padding from buffer
             log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
         else:
             # Using the forward policy
             if random.random() < self.hparams.pf_temp_prob:  # With tempering
                 pf_temp = (
-                    random.random()
-                    * (self.hparams.pf_temp_high - self.hparams.pf_temp_low)
-                    + self.hparams.pf_temp_low
+                    random.random() * (self.hparams.pf_temp_high - self.hparams.pf_temp_low) + self.hparams.pf_temp_low
                 )
             else:  # Without tempering
                 pf_temp = 1.0
-            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt, pf_temperature=pf_temp
-            )
+            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(prompt, pf_temperature=pf_temp)
             self.reward_buffer.add_batch(
                 prompt=prompt,
                 sentences=generated_text[:, len(prompt) :],
-                logrewards=log_r
-                * self.reward.temperature,  # undo the effect of reward tempering
+                logrewards=log_r * self.reward.temperature,  # undo the effect of reward tempering
                 tokenizer=self.tokenizer,
             )
 
@@ -213,9 +205,7 @@ class NextSentenceGFNTask(LightningModule):
         prompt = prompt[0]
 
         # Sample a sentence and get the reward
-        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-            prompt
-        )
+        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(prompt)
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -277,12 +267,8 @@ class NextSentenceGFNTask(LightningModule):
             sync_dist=True,
         )
         if self.diversity_metric.method is not None:
-            generated_sentences = self.tokenizer.batch_decode(
-                generated_text[:, len(prompt) :]
-            )
-            generated_sentences = [
-                text.replace(".", "") for text in generated_sentences
-            ]
+            generated_sentences = self.tokenizer.batch_decode(generated_text[:, len(prompt) :])
+            generated_sentences = [text.replace(".", "") for text in generated_sentences]
             diversity = self.diversity_metric(generated_sentences)
             self.log(f"val/{self.diversity_metric_name}", diversity, sync_dist=True)
 
@@ -300,11 +286,7 @@ class NextSentenceGFNTask(LightningModule):
         self.log("scheduled/lr", self.get_lr_at_step(self.global_step), sync_dist=True)
 
         # Log probe samples
-        if (
-            self.hparams.train_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 5 == 0
-        ):
+        if self.hparams.train_probes is not None and self.logger is not None and self.trainer.current_epoch % 5 == 0:
             samples_table = self.sample_probes(self.hparams.train_probes)
             self.logger.log_table("samples/train_probes", dataframe=samples_table)
 
@@ -332,11 +314,7 @@ class NextSentenceGFNTask(LightningModule):
         self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
 
         # Log probe samples
-        if (
-            self.hparams.val_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 5 == 0
-        ):
+        if self.hparams.val_probes is not None and self.logger is not None and self.trainer.current_epoch % 5 == 0:
             samples_table = self.sample_probes(self.hparams.val_probes)
             self.logger.log_table("samples/val_probes", dataframe=samples_table)
 
@@ -433,21 +411,15 @@ class NextSentenceGFNTask(LightningModule):
         samples = []
         for probe in probes:
             probe_str = self.tokenizer.decode(probe)
-            probe_samples = self.sample_baselines(
-                probe.to(self.device), n_samples=n_samples
-            )
+            probe_samples = self.sample_baselines(probe.to(self.device), n_samples=n_samples)
             for i in range(n_samples):
                 sample = {"Prompt": probe_str}
                 for baseline in probe_samples:
-                    sample[f"Sampled sentence ({baseline})"] = probe_samples[baseline][
-                        "sample"
-                    ][i]
-                    sample[f"logP(s) ({baseline})"] = probe_samples[baseline][
-                        "logP(s)"
-                    ][i].item()
-                    sample[f"logP(s) unpenalized ({baseline})"] = probe_samples[
-                        baseline
-                    ]["logP(s) unpenalized"][i].item()
+                    sample[f"Sampled sentence ({baseline})"] = probe_samples[baseline]["sample"][i]
+                    sample[f"logP(s) ({baseline})"] = probe_samples[baseline]["logP(s)"][i].item()
+                    sample[f"logP(s) unpenalized ({baseline})"] = probe_samples[baseline]["logP(s) unpenalized"][
+                        i
+                    ].item()
                 samples.append(sample)
 
         samples = pd.DataFrame(samples)
@@ -471,9 +443,7 @@ class NextSentenceGFNTask(LightningModule):
                     eos_token_id=self.end_of_sentence_token_id,
                     pad_token_id=self.tokenizer.eos_token_id,
                     forced_eos_token_id=self.end_of_sentence_token_id,
-                    suppress_tokens=torch.from_numpy(self.hparams.illegal_token_mask)
-                    .nonzero()
-                    .squeeze(-1),
+                    suppress_tokens=torch.from_numpy(self.hparams.illegal_token_mask).nonzero().squeeze(-1),
                     **kwargs,
                 )
                 base_to_lora(self.model)

@@ -3,15 +3,23 @@ from types import MethodType
 import hydra
 import pytorch_lightning as pl
 import torch
+import rootutils
 from omegaconf import DictConfig, OmegaConf
 from peft import get_peft_model, prepare_model_for_kbit_training
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from lightning_data import PromptDataModule, SMILESDataModule
 from lightning_module import NextSentenceGFNTask
-from utils import (FrozenModelSentenceGivenPrompt, ModelSentenceValidator,
-                   ReplayBuffer, RuleSentenceValidator, SMILESValidator)
+from utils import (
+    FrozenModelSentenceGivenPrompt,
+    ModelSentenceValidator,
+    ReplayBuffer,
+    RuleSentenceValidator,
+    SMILESValidator,
+    RDKitValidator,
+)
+
+rootutils.setup_root(__file__, indicator=".gitignore", pythonpath=True)
 
 
 @hydra.main(version_base=None, config_path="./configs/", config_name="train")
@@ -21,20 +29,19 @@ def train(config: DictConfig):
     model, tokenizer = get_model(config)
 
     try:  # Some tokenizers encode a "." differently when it is the first token
-        end_of_sentence_token_id = tokenizer.encode(
-            "A sentence.", add_special_tokens=False
-        )[-1]
+        end_of_sentence_token_id = tokenizer.encode("A sentence.", add_special_tokens=False)[-1]
     except:
         end_of_sentence_token_id = tokenizer.convert_tokens_to_ids(".")
 
     # Get illegal token mask, 1d tensor, same size with tokenizer.vocab_size
-    illegal_token_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.bool)
+    # For LLama3, use len(tokenizer) instead of tokenizer.vocab_size
+    # illegal_token_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.bool)
+    illegal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
     # extract illegal tokens from config
     illegal_tokens = OmegaConf.to_container(config.task.constraints.illegal_tokens)
     # tokenize illegal tokens, leave numbers as they are
     illegal_tokens = [
-        [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False)
-        for t in illegal_tokens
+        [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False) for t in illegal_tokens
     ]
     assert all(len(t) == 1 for t in illegal_tokens)
     # get inx of illegal tokens
@@ -89,11 +96,7 @@ def train(config: DictConfig):
         accelerator=config.device.accelerator,
         max_epochs=config.task.training.epochs,
         accumulate_grad_batches=config.task.training.accumulate_grad_batches,
-        logger=(
-            config.logger
-            if isinstance(config.logger, bool)
-            else hydra.utils.instantiate(config.logger)
-        ),
+        logger=(config.logger if isinstance(config.logger, bool) else hydra.utils.instantiate(config.logger)),
         callbacks=[hydra.utils.instantiate(c) for c in config.task.callbacks],
     )
 
@@ -121,11 +124,12 @@ def get_model(config: DictConfig):
         bnb_config = None
 
     # Get the model
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.task.model.name, add_bos_token=False
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(config.task.model.name, add_bos_token=False)
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(config.task.model.base_model, add_bos_token=False)
     model = AutoModelForCausalLM.from_pretrained(
-        config.task.model.name, device_map="auto", quantization_config=bnb_config
+        config.task.model.name, device_map="auto", quantization_config=bnb_config, torch_dtype=torch.bfloat16
     )
 
     # Prepare model for k-bit training
@@ -136,9 +140,7 @@ def get_model(config: DictConfig):
         )
 
     # Wrap using Lora
-    model = get_peft_model(
-        model, hydra.utils.instantiate(config.task.model.lora_config)
-    )
+    model = get_peft_model(model, hydra.utils.instantiate(config.task.model.lora_config))
 
     # Remove dropout
     for mod in model.modules():
@@ -167,12 +169,18 @@ def get_reward(config: DictConfig, sentence_token_id, illegal_token_mask):
                 sentence_token_id=sentence_token_id,
                 vocab_path=config.task.reward.smiles_vocab_path,
             ),
+        )
+        config.task.reward.valid_sentence_alpha
+    elif config.task.reward.sentence_validator == "rdkit":
+        sentence_validator, valid_sentence_alpha = (
+            RDKitValidator(
+                sentence_token_id=sentence_token_id,
+                vocab_path=config.task.reward.smiles_vocab_path,
+            ),
             config.task.reward.valid_sentence_alpha,
         )
     else:
-        raise ValueError(
-            f"Invalid sentence validator: {config.task.reward.sentence_validator}"
-        )
+        raise ValueError(f"Invalid sentence validator: {config.task.reward.sentence_validator}")
 
     reward = FrozenModelSentenceGivenPrompt(
         sentence_token_id=sentence_token_id,

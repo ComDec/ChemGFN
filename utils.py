@@ -2,6 +2,7 @@ import gzip
 import heapq
 import pickle
 
+from rdkit import Chem
 import editdistance
 import numpy as np
 import spacy
@@ -39,10 +40,7 @@ def score_fast(
         # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
         batched_prompt_cache = tuple(
             tuple(
-                [
-                    prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1)
-                    for j in range(len(prompt_cache[1][i]))
-                ]
+                [prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1) for j in range(len(prompt_cache[1][i]))]
             )
             for i in range(len(prompt_cache[1]))
         )
@@ -66,9 +64,7 @@ def score_fast(
 
     logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
 
-    reward = logprob[
-        :, :, termination_token_id
-    ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
+    reward = logprob[:, :, termination_token_id]  # logP(generated[i+1]=term | prompt + generated[:i+1])
     reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
     # repeat for sampled size
@@ -212,6 +208,33 @@ class SMILESValidator(SentenceValidator):
         return invalid
 
 
+class RDKitValidator(SentenceValidator):
+    def __init__(self, vocab_path, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        with open(vocab_path, "r") as f:
+            self.vocab = list(set(f.read().splitlines()))
+
+    def __call__(self, sentences, tokenizer):
+        invalid = torch.zeros(
+            sentences.shape[0],
+            sentences.shape[1] + 1,
+            dtype=torch.bool,
+            device=sentences.device,
+        )
+        invalid[:, 0] = True  # Empty sentence is never valid
+        for i in range(sentences.shape[0]):
+            for j in range(sentences.shape[1]):
+                if sentences[i, j] == self.sentence_token_id:
+                    break  # Only unterminated sentences get a reward
+                tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
+                mol = Chem.MolFromSmiles(tokens)
+                if mol:
+                    invalid[i, j + 1] = False
+                else:
+                    invalid[i, j + 1] = True
+        return invalid
+
+
 class ModelSentenceValidator(SentenceValidator):
     def __init__(self, *args, model_name=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -219,9 +242,7 @@ class ModelSentenceValidator(SentenceValidator):
             model_name = "textattack/roberta-base-CoLA"
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, device_map="auto"
-        )
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, device_map="auto")
 
     @torch.no_grad()
     def __call__(self, sentences, tokenizer):
@@ -317,9 +338,7 @@ def generate_and_return_termination_logprob(
                 token_ids = torch.multinomial(prob, num_samples=1)
         else:
             if i >= action_seq.size(-1):
-                token_ids = (
-                    torch.ones_like(action_seq[:, 0]) * termination_token_id
-                ).unsqueeze(-1)
+                token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(-1)
             else:
                 token_ids = action_seq[:, i].unsqueeze(-1)
 
@@ -333,7 +352,6 @@ def generate_and_return_termination_logprob(
         if vocab_naughty_mask is not None:
             logits[:, vocab_naughty_mask] += vocab_alpha
         logprob = logits.log_softmax(dim=-1)
-
         # prob list for termination token by steps
         log_pterm.append(
             torch.where(
@@ -357,7 +375,6 @@ def generate_and_return_termination_logprob(
         # check if all sequences have terminated
         if torch.all(~active_seqs):
             break
-
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
     if skip_rewards:
@@ -379,23 +396,10 @@ def modified_subtb_loss(
     prompt_len,
     subtb_lambda=1.0,
 ):
-    assert (
-        log_pf.shape[1]
-        == log_r.shape[1]
-        == log_pterm.shape[1]
-        == generated_text.shape[1] - prompt_len
-    )
-    assert (
-        log_pf.shape[1] > 1
-    )  # With modified-style losses, we need at least one transition before terminating
+    assert log_pf.shape[1] == log_r.shape[1] == log_pterm.shape[1] == generated_text.shape[1] - prompt_len
+    assert log_pf.shape[1] > 1  # With modified-style losses, we need at least one transition before terminating
 
-    delta = (
-        log_r[:, :-1]
-        + log_pf[:, :-1]
-        + log_pterm[:, 1:]
-        - log_r[:, 1:]
-        - log_pterm[:, :-1]
-    )
+    delta = log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
     delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
 
     # Get a mask for tokens after the termination token in the generated_text
@@ -405,14 +409,10 @@ def modified_subtb_loss(
     total_lambda = 0.0
     generated_len = generated_text.shape[1] - prompt_len
     for subtraj_len in range(1, generated_len):
-        subtb_term = (
-            delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]
-        ) ** 2
+        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
         subtb_term[mask[:, subtraj_len - 1 :]] = 0
         batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
-        total_lambda += (
-            subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
-        )
+        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
     batch_loss /= total_lambda
 
     return batch_loss
@@ -428,9 +428,7 @@ def get_termination_vals(
     prompt_len,
 ):
     batch_idx = torch.arange(generated_text.size(0))
-    gen_len = (
-        (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
-    )
+    gen_len = (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
     if log_pf is None and log_pterm is None:
         log_pfs = None
     else:
@@ -448,9 +446,7 @@ class SequenceDiversity:
         if method is None:
             pass
         elif method == "sequence_embedding":
-            model_name = kwargs.get(
-                "model_name", "sentence-transformers/all-mpnet-base-v2"
-            )
+            model_name = kwargs.get("model_name", "sentence-transformers/all-mpnet-base-v2")
             self.model = SentenceTransformer(model_name)
         else:
             raise ValueError(f"Unknown sequence diversity method: {method}")
@@ -492,19 +488,12 @@ class ReplayBuffer:
         if item["str_sentence"] in self._buffer[str_prompt]["exists"]:
             return
         # if the edit distance between item and any item in the buffer is small, skip it
-        tokenized_sentence = [
-            x
-            for x in item["tensor_sentence"].tolist()
-            if x != self.termination_token_id
-        ]
+        tokenized_sentence = [x for x in item["tensor_sentence"].tolist() if x != self.termination_token_id]
         for buffer_item in self._buffer[str_prompt]["sentences"]:
-            tokenized_existing_sentence = [
-                x for x in buffer_item[2].tolist() if x != self.termination_token_id
-            ]
+            tokenized_existing_sentence = [x for x in buffer_item[2].tolist() if x != self.termination_token_id]
             if (
                 editdistance.eval(tokenized_sentence, tokenized_existing_sentence)
-                < (len(tokenized_sentence) + len(tokenized_existing_sentence))
-                * self.sim_tolerance
+                < (len(tokenized_sentence) + len(tokenized_existing_sentence)) * self.sim_tolerance
             ):
                 if buffer_item[0] >= item["logreward"]:
                     return
@@ -557,17 +546,13 @@ class ReplayBuffer:
                 "sentences": [],
                 "exists": set(),
             }
-        sentences[(sentences == self.termination_token_id).cumsum(dim=-1) >= 1] = (
-            self.termination_token_id
-        )
+        sentences[(sentences == self.termination_token_id).cumsum(dim=-1) >= 1] = self.termination_token_id
         token_sentences = tokenizer.batch_decode(sentences)
         for i in range(sentences.size(0)):
             str_sentence = token_sentences[i].replace(".", "").strip()
             self.add(
                 {
-                    "logreward": logrewards[
-                        i, (sentences[i] != self.termination_token_id).sum()
-                    ].item(),
+                    "logreward": logrewards[i, (sentences[i] != self.termination_token_id).sum()].item(),
                     "str_prompt": str_prompt,
                     "str_sentence": str_sentence,
                     "tensor_sentence": sentences[i],
