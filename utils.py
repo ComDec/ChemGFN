@@ -10,7 +10,9 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
+# slient the warning
+from rdkit import RDLogger 
+RDLogger.DisableLog('rdApp.*')
 
 def lora_to_base(model):
     model.base_model.disable_adapter_layers()
@@ -130,9 +132,10 @@ class FrozenModelSentenceGivenPrompt:
             model.train()
 
         if self.sentence_validator is not None:
-            invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
-            invalid = invalid * self.valid_sentence_alpha
-            reward = torch.min(reward, invalid)
+            # use valid list instead of invalid list
+            valid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
+            valid = valid * self.valid_sentence_alpha
+            reward = torch.max(reward, valid)
 
         return reward, reward_unpenalized
 
@@ -182,7 +185,7 @@ class RuleSentenceValidator(SentenceValidator):
                     invalid[i, j + 1] = True  # Must have a noun and a verb
         return invalid
 
-
+# Decrapated due to the use of fixed vocab
 class SMILESValidator(SentenceValidator):
     def __init__(self, vocab_path, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -202,7 +205,7 @@ class SMILESValidator(SentenceValidator):
                 if sentences[i, j] == self.sentence_token_id:
                     break  # Only unterminated sentences get a reward
                 for token in sentences[i, : j + 1]:
-                    if tokenizer.decode(token) not in self.vocab:
+                    if tokenizer.decode(token, skip_special_tokens=True) not in self.vocab:
                         invalid[i, j + 1] = True
                         continue
         return invalid
@@ -215,13 +218,13 @@ class RDKitValidator(SentenceValidator):
             self.vocab = list(set(f.read().splitlines()))
 
     def __call__(self, sentences, tokenizer):
-        invalid = torch.zeros(
+        valid = torch.zeros(
             sentences.shape[0],
             sentences.shape[1] + 1,
-            dtype=torch.bool,
             device=sentences.device,
         )
-        invalid[:, 0] = True  # Empty sentence is never valid
+        valid[:, 0] = 1 # Empty sentence is never valid
+        
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
                 if sentences[i, j] == self.sentence_token_id:
@@ -229,10 +232,15 @@ class RDKitValidator(SentenceValidator):
                 tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
                 mol = Chem.MolFromSmiles(tokens)
                 if mol:
-                    invalid[i, j + 1] = False
+                    # if recover a SMILES from invalid way, give a high reward
+                    if valid[i, j] == 0:
+                        # TODO: this is a hard-coded value, should be changed
+                        valid[i, j + 1] = 10
+                    else:
+                        valid[i, j + 1] = 1
                 else:
-                    invalid[i, j + 1] = True
-        return invalid
+                    valid[i, j + 1] = 0
+        return valid
 
 
 class ModelSentenceValidator(SentenceValidator):
@@ -300,7 +308,6 @@ def generate_and_return_termination_logprob(
         if action_seq is None:
             with torch.no_grad():
                 prob = logits.softmax(dim=-1)
-
                 # modified logits is used for fullfilling top-k, top-p, and length constraints
                 modified_logits = logits.clone().detach()
                 # implement top-k by getting the top-k largest values and setting the rest to 0
@@ -320,14 +327,15 @@ def generate_and_return_termination_logprob(
                     )
                     modified_logits[~nucleus] = -torch.inf
                 # TODO: actually you can make this process smoother, create a func which increase the prob of the termination token gradually, according to the length of the sequence
-                if i < min_len:
-                    # if we haven't reach the minimum length, set the probability of terminating to 0
-                    modified_logits[:, termination_token_id] = -torch.inf
-                elif i >= max_len:
-                    # if we've reached the maximum length, set the probability of terminating to 1
-                    mask = [True] * modified_logits.shape[1]
-                    mask[termination_token_id] = False
-                    modified_logits[:, mask] = -torch.inf
+                # TODO: I don't think this is necessary, this way to control seq_len is not appropriate for the SMILES generation task
+                # if i < min_len:
+                #     # if we haven't reach the minimum length, set the probability of terminating to 0
+                #     modified_logits[:, termination_token_id] = -torch.inf
+                # elif i >= max_len:
+                #     # if we've reached the maximum length, set the probability of terminating to 1
+                #     mask = [True] * modified_logits.shape[1]
+                #     mask[termination_token_id] = False
+                #     modified_logits[:, mask] = -torch.inf
                 if vocab_nice_mask is not None:
                     # add vocab_alpha to the logits of the unmasked vocab items
                     modified_logits[:, ~vocab_nice_mask] += vocab_alpha

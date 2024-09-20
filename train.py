@@ -36,7 +36,14 @@ def train(config: DictConfig):
     # Get illegal token mask, 1d tensor, same size with tokenizer.vocab_size
     # For LLama3, use len(tokenizer) instead of tokenizer.vocab_size
     # illegal_token_mask = torch.zeros(tokenizer.vocab_size, dtype=torch.bool)
-    illegal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
+    
+    with open(config.task.reward.smiles_vocab_path, "r") as f:
+        legal_tokens = f.readlines()
+    
+    legal_tokens = [line.rstrip("\n") for line in legal_tokens]
+    legal_tokens = [tokenizer.encode(t, add_special_tokens=False)[0] for t in legal_tokens]
+    
+    illegal_token_mask = torch.ones(len(tokenizer), dtype=torch.bool)
     # extract illegal tokens from config
     illegal_tokens = OmegaConf.to_container(config.task.constraints.illegal_tokens)
     # tokenize illegal tokens, leave numbers as they are
@@ -44,11 +51,13 @@ def train(config: DictConfig):
         [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False) for t in illegal_tokens
     ]
     assert all(len(t) == 1 for t in illegal_tokens)
+    
     # get inx of illegal tokens
     illegal_tokens = [t[0] for t in illegal_tokens]
     illegal_token_mask[illegal_tokens] = True
     illegal_token_mask = illegal_token_mask.numpy()
-
+    illegal_token_mask[legal_tokens] = False
+    
     # get reward function
     reward = get_reward(config, end_of_sentence_token_id, illegal_token_mask)
 
