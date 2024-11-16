@@ -151,7 +151,9 @@ class SMILESDataPipe(MapDataPipe):
         ]
 
     def __getitem__(self, index):
-        _prompt = PROMPTS_AHEAD + self.prompts[index] + PROMPTS_EXAMPLES + PROMPTS_BEHIND
+        _prompt = (
+            PROMPTS_AHEAD + self.prompts[index] + PROMPTS_EXAMPLES + PROMPTS_BEHIND
+        )
         message = self.generate_message(_prompt)
         input_ids = self.tokenizer.apply_chat_template(
             message,

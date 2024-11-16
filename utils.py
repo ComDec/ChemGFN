@@ -1,18 +1,23 @@
 import gzip
 import heapq
 import pickle
+import random
 
-from rdkit import Chem
 import editdistance
 import numpy as np
 import spacy
 import torch
+# slient the warning
+from rdkit import Chem, RDLogger
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-# slient the warning
-from rdkit import RDLogger 
-RDLogger.DisableLog('rdApp.*')
+from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
+                          RepetitionPenaltyLogitsProcessor)
+from transformers_cfg.generation.logits_process import \
+    GrammarConstrainedLogitsProcessor
+
+RDLogger.DisableLog("rdApp.*")
+
 
 def lora_to_base(model):
     model.base_model.disable_adapter_layers()
@@ -42,7 +47,10 @@ def score_fast(
         # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
         batched_prompt_cache = tuple(
             tuple(
-                [prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1) for j in range(len(prompt_cache[1][i]))]
+                [
+                    prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1)
+                    for j in range(len(prompt_cache[1][i]))
+                ]
             )
             for i in range(len(prompt_cache[1]))
         )
@@ -66,7 +74,9 @@ def score_fast(
 
     logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
 
-    reward = logprob[:, :, termination_token_id]  # logP(generated[i+1]=term | prompt + generated[:i+1])
+    reward = logprob[
+        :, :, termination_token_id
+    ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
     reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
     # repeat for sampled size
@@ -135,6 +145,7 @@ class FrozenModelSentenceGivenPrompt:
             # use valid list instead of invalid list
             valid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
             valid = valid * self.valid_sentence_alpha
+            # TODO: max or mean
             reward = torch.max(reward, valid)
 
         return reward, reward_unpenalized
@@ -185,6 +196,7 @@ class RuleSentenceValidator(SentenceValidator):
                     invalid[i, j + 1] = True  # Must have a noun and a verb
         return invalid
 
+
 # Decrapated due to the use of fixed vocab
 class SMILESValidator(SentenceValidator):
     def __init__(self, vocab_path, *args, **kwargs) -> None:
@@ -205,7 +217,10 @@ class SMILESValidator(SentenceValidator):
                 if sentences[i, j] == self.sentence_token_id:
                     break  # Only unterminated sentences get a reward
                 for token in sentences[i, : j + 1]:
-                    if tokenizer.decode(token, skip_special_tokens=True) not in self.vocab:
+                    if (
+                        tokenizer.decode(token, skip_special_tokens=True)
+                        not in self.vocab
+                    ):
                         invalid[i, j + 1] = True
                         continue
         return invalid
@@ -223,8 +238,8 @@ class RDKitValidator(SentenceValidator):
             sentences.shape[1] + 1,
             device=sentences.device,
         )
-        valid[:, 0] = 1 # Empty sentence is never valid
-        
+        valid[:, 0] = 1  # Empty sentence is never valid
+
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
                 if sentences[i, j] == self.sentence_token_id:
@@ -233,13 +248,13 @@ class RDKitValidator(SentenceValidator):
                 mol = Chem.MolFromSmiles(tokens)
                 if mol:
                     # if recover a SMILES from invalid way, give a high reward
-                    if valid[i, j] == 0:
+                    if valid[i, j] < 10:
                         # TODO: this is a hard-coded value, should be changed
                         valid[i, j + 1] = 10
                     else:
-                        valid[i, j + 1] = 1
+                        valid[i, j + 1] = 5
                 else:
-                    valid[i, j + 1] = 0
+                    valid[i, j + 1] = 1 + random.random()
         return valid
 
 
@@ -250,7 +265,9 @@ class ModelSentenceValidator(SentenceValidator):
             model_name = "textattack/roberta-base-CoLA"
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, device_map="auto")
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, device_map="auto"
+        )
 
     @torch.no_grad()
     def __call__(self, sentences, tokenizer):
@@ -278,11 +295,18 @@ class ModelSentenceValidator(SentenceValidator):
         return invalid
 
 
+from transformers.generation.logits_process import (LogitsProcessorList,
+                                                    TemperatureLogitsWarper,
+                                                    TopKLogitsWarper,
+                                                    TopPLogitsWarper)
+
+
 def generate_and_return_termination_logprob(
     model,
     encoded_prompt,
     termination_token_id,
     reward_fn,
+    grammar=None,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
     vocab_alpha=-99,
@@ -291,6 +315,7 @@ def generate_and_return_termination_logprob(
     temperature=1.0,
     top_k=999999,
     top_p=1.0,
+    min_tokens_to_keep=1,
     action_seq=None,
     skip_rewards=False,
 ):
@@ -301,31 +326,68 @@ def generate_and_return_termination_logprob(
     log_pterm = []
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
-    for i in range(max_len + 1):
+
+    # if grammar is not None:
+    #     logits_wrapper = LogitsProcessorList(
+    #         [
+    #             GrammarConstrainedLogitsProcessor(grammar),
+    #         ]
+    #     )
+    # else:
+
+    logits_processor = LogitsProcessorList(
+        [
+            GrammarConstrainedLogitsProcessor(grammar),
+            RepetitionPenaltyLogitsProcessor(1.9),
+        ]
+    )
+
+    logits_processor[0].reset()
+    last_token_ids = token_ids[0, -1]
+    i = 0
+
+    while last_token_ids.item() != termination_token_id:
+        if i >= max_len:
+            break
+
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
         logits = output.logits[:, -1, :]
+
         if action_seq is None:
             with torch.no_grad():
-                prob = logits.softmax(dim=-1)
+
+                # set the probability of illegal tokens to 0, except for the termination token and bos token
+                # prob[:, np.where(vocab_naughty_mask == True)] = 0
                 # modified logits is used for fullfilling top-k, top-p, and length constraints
+
+                # repalce native top-k and top-p with the LogitsProcessorList
                 modified_logits = logits.clone().detach()
+                try:
+                    modified_logits = logits_processor(state, modified_logits)
+                except:
+                    import ipdb
+
+                    ipdb.set_trace()
+                # modified_logits = logits_wrapper(token_ids, modified_logits)
+
                 # implement top-k by getting the top-k largest values and setting the rest to 0
-                if top_k < 999999:
-                    modified_logits[prob >= prob.topk(top_k)] = -torch.inf
-                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
-                if top_p < 1.0:
-                    sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
-                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
-                    nucleus = cumsum_prob < top_p
-                    nucleus = torch.cat(
-                        [
-                            nucleus.new_ones(nucleus.shape[:-1] + (1,)),
-                            nucleus[..., :-1],
-                        ],
-                        dim=-1,
-                    )
-                    modified_logits[~nucleus] = -torch.inf
+                # if top_k < 999999:
+                #     modified_logits[prob >= prob.topk(top_k)] = -torch.inf
+                # # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                # if top_p < 1.0:
+                #     prob[vocab_naughty_mask] = -torch.inf
+                #     sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
+                #     cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                #     nucleus = cumsum_prob < top_p
+                #     nucleus = torch.cat(
+                #         [
+                #             nucleus.new_ones(nucleus.shape[:-1] + (1,)),
+                #             nucleus[..., :-1],
+                #         ],
+                #         dim=-1,
+                #     )
+                #     modified_logits[~nucleus] = -torch.inf
                 # TODO: actually you can make this process smoother, create a func which increase the prob of the termination token gradually, according to the length of the sequence
                 # TODO: I don't think this is necessary, this way to control seq_len is not appropriate for the SMILES generation task
                 # if i < min_len:
@@ -336,19 +398,31 @@ def generate_and_return_termination_logprob(
                 #     mask = [True] * modified_logits.shape[1]
                 #     mask[termination_token_id] = False
                 #     modified_logits[:, mask] = -torch.inf
-                if vocab_nice_mask is not None:
-                    # add vocab_alpha to the logits of the unmasked vocab items
-                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+
+                # temp remove the nice/naughty token mask
+
+                # if vocab_nice_mask is not None:
+                #     # add vocab_alpha to the logits of the unmasked vocab items
+                #     modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+
                 if vocab_naughty_mask is not None:
                     # add vocab_alpha to the logits of the masked vocab items
                     modified_logits[:, vocab_naughty_mask] += vocab_alpha
+
                 prob = (modified_logits / temperature).softmax(dim=-1)
                 token_ids = torch.multinomial(prob, num_samples=1)
+                last_token_ids = token_ids[0]
+
         else:
             if i >= action_seq.size(-1):
-                token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(-1)
+                token_ids = (
+                    torch.ones_like(action_seq[:, 0]) * termination_token_id
+                ).unsqueeze(-1)
             else:
                 token_ids = action_seq[:, i].unsqueeze(-1)
+            last_token_ids = token_ids[:, -1]
+
+        i += 1
 
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
@@ -359,6 +433,7 @@ def generate_and_return_termination_logprob(
             logits[:, ~vocab_nice_mask] += vocab_alpha
         if vocab_naughty_mask is not None:
             logits[:, vocab_naughty_mask] += vocab_alpha
+
         logprob = logits.log_softmax(dim=-1)
         # prob list for termination token by steps
         log_pterm.append(
@@ -383,6 +458,7 @@ def generate_and_return_termination_logprob(
         # check if all sequences have terminated
         if torch.all(~active_seqs):
             break
+
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
     if skip_rewards:
@@ -404,23 +480,39 @@ def modified_subtb_loss(
     prompt_len,
     subtb_lambda=1.0,
 ):
-    assert log_pf.shape[1] == log_r.shape[1] == log_pterm.shape[1] == generated_text.shape[1] - prompt_len
-    assert log_pf.shape[1] > 1  # With modified-style losses, we need at least one transition before terminating
+    assert (
+        log_pf.shape[1]
+        == log_r.shape[1]
+        == log_pterm.shape[1]
+        == generated_text.shape[1] - prompt_len
+    )
+    assert (
+        log_pf.shape[1] > 1
+    )  # With modified-style losses, we need at least one transition before terminating
 
-    delta = log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
+    delta = (
+        log_r[:, :-1]
+        + log_pf[:, :-1]
+        + log_pterm[:, 1:]
+        - log_r[:, 1:]
+        - log_pterm[:, :-1]
+    )
     delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
 
     # Get a mask for tokens after the termination token in the generated_text
     mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(-1) >= 1
-
     batch_loss = 0.0
     total_lambda = 0.0
     generated_len = generated_text.shape[1] - prompt_len
     for subtraj_len in range(1, generated_len):
-        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
+        subtb_term = (
+            delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]
+        ) ** 2
         subtb_term[mask[:, subtraj_len - 1 :]] = 0
         batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
-        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
+        total_lambda += (
+            subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
+        )
     batch_loss /= total_lambda
 
     return batch_loss
@@ -436,7 +528,9 @@ def get_termination_vals(
     prompt_len,
 ):
     batch_idx = torch.arange(generated_text.size(0))
-    gen_len = (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
+    gen_len = (
+        (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
+    )
     if log_pf is None and log_pterm is None:
         log_pfs = None
     else:
@@ -454,7 +548,9 @@ class SequenceDiversity:
         if method is None:
             pass
         elif method == "sequence_embedding":
-            model_name = kwargs.get("model_name", "sentence-transformers/all-mpnet-base-v2")
+            model_name = kwargs.get(
+                "model_name", "sentence-transformers/all-mpnet-base-v2"
+            )
             self.model = SentenceTransformer(model_name)
         else:
             raise ValueError(f"Unknown sequence diversity method: {method}")
@@ -496,12 +592,19 @@ class ReplayBuffer:
         if item["str_sentence"] in self._buffer[str_prompt]["exists"]:
             return
         # if the edit distance between item and any item in the buffer is small, skip it
-        tokenized_sentence = [x for x in item["tensor_sentence"].tolist() if x != self.termination_token_id]
+        tokenized_sentence = [
+            x
+            for x in item["tensor_sentence"].tolist()
+            if x != self.termination_token_id
+        ]
         for buffer_item in self._buffer[str_prompt]["sentences"]:
-            tokenized_existing_sentence = [x for x in buffer_item[2].tolist() if x != self.termination_token_id]
+            tokenized_existing_sentence = [
+                x for x in buffer_item[2].tolist() if x != self.termination_token_id
+            ]
             if (
                 editdistance.eval(tokenized_sentence, tokenized_existing_sentence)
-                < (len(tokenized_sentence) + len(tokenized_existing_sentence)) * self.sim_tolerance
+                < (len(tokenized_sentence) + len(tokenized_existing_sentence))
+                * self.sim_tolerance
             ):
                 if buffer_item[0] >= item["logreward"]:
                     return
@@ -554,19 +657,39 @@ class ReplayBuffer:
                 "sentences": [],
                 "exists": set(),
             }
-        sentences[(sentences == self.termination_token_id).cumsum(dim=-1) >= 1] = self.termination_token_id
+        sentences[(sentences == self.termination_token_id).cumsum(dim=-1) >= 1] = (
+            self.termination_token_id
+        )
         token_sentences = tokenizer.batch_decode(sentences)
+
         for i in range(sentences.size(0)):
             str_sentence = token_sentences[i].replace(".", "").strip()
-            self.add(
-                {
-                    "logreward": logrewards[i, (sentences[i] != self.termination_token_id).sum()].item(),
-                    "str_prompt": str_prompt,
-                    "str_sentence": str_sentence,
-                    "tensor_sentence": sentences[i],
-                    "full_logrewards": logrewards[i, :],
-                }
-            )
+            try:
+                self.add(
+                    {
+                        "logreward": logrewards[
+                            i, (sentences[i] != self.termination_token_id).sum()
+                        ].item(),
+                        "str_prompt": str_prompt,
+                        "str_sentence": str_sentence,
+                        "tensor_sentence": sentences[i],
+                        "full_logrewards": logrewards[i, :],
+                    }
+                )
+            except:
+                import ipdb
+
+                ipdb.set_trace()
+
+            # self.add(
+            #     {
+            #         "logreward": logrewards[i, (sentences[i] != self.termination_token_id).sum()].item(),
+            #         "str_prompt": str_prompt,
+            #         "str_sentence": str_sentence,
+            #         "tensor_sentence": sentences[i],
+            #         "full_logrewards": logrewards[i, :],
+            #     }
+            # )
 
     def sample(self, batch_size, prompt):
         """

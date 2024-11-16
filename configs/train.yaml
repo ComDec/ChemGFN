@@ -15,5 +15,5 @@ logger:
   save_dir: ${save_dir}
   offline: False
 
-trainer: 
+trainer:
   precision: "bf16-ture"
