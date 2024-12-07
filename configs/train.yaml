@@ -1,19 +1,47 @@
+# @package _global_
+
+# specify here default configuration
+# order of defaults determines the order in which configs override each other
 defaults:
   - _self_
-  - task: smiles_llama3
-  - device: gpu
+  - data: default
+  - model: llama3
+  - callbacks: default
+  - logger: null # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
+  - trainer: default
+  - paths: default
+  - extras: default
   - hydra: default
 
-seed: 27
-exp_name: "smiles_llama3"
-save_dir: "runs/${exp_name}"
+  # experiment configs allow for version control of specific hyperparameters
+  # e.g. best hyperparameters for given model and datamodule
+  - experiment: null
 
-logger:
-  _target_: pytorch_lightning.loggers.WandbLogger
-  name: ${exp_name}
-  project: "ChemGFN"
-  save_dir: ${save_dir}
-  offline: False
+  # config for hyperparameter optimization
+  - hparams_search: null
 
-trainer:
-  precision: "bf16-ture"
+  # optional local config for machine/user specific settings
+  # it's optional since it doesn't need to exist and is excluded from version control
+  - optional local: default
+
+  # debugging config (enable through command line, e.g. `python train.py debug=default)
+  - debug: null
+
+# task name, determines output directory path
+task_name: "train"
+
+exp_name: "default"
+
+# tags to help you identify your experiments
+# you can overwrite this in experiment configs
+# overwrite from command line with `python train.py tags="[first_tag, second_tag]"`
+tags: ["dev"]
+
+# set False to skip model training
+train: True
+
+# simply provide checkpoint path to resume training
+ckpt_path: null
+
+# seed for random number generators in pytorch, numpy and python.random
+seed: null

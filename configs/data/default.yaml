@@ -1,0 +1,6 @@
+_target_: chemgfn.data.gfn_datamodule.SMILESDataModule
+tokenizer_name: "meta-llama/Meta-Llama-3-8B-Instruct"
+data_path: ${paths.data_dir}/mol_description_train.json
+train_size: 0.95
+num_workers: 0
+pin_memory: True

@@ -1,0 +1,13 @@
+defaults:
+  - default
+
+strategy: ddp
+
+accelerator: gpu
+devices: 1
+num_nodes: 1
+sync_batchnorm: True
+
+precision: bf16-true
+
+accumulate_grad_batches: 1
