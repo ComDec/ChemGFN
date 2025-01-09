@@ -7,19 +7,14 @@ import editdistance
 import numpy as np
 import spacy
 import torch
+import xgrammar as xgr
 
 # slient the warning
 from rdkit import Chem, RDLogger
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
 from transformers import PreTrainedTokenizer
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
-from transformers_cfg.generation.logits_process import GrammarConstrainedLogitsProcessor
+from transformers.generation.logits_process import LogitsProcessorList
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -68,16 +63,18 @@ def generate_and_return_termination_logprob(
     encoded_prompt,
     termination_token_id,
     reward_fn,
+    xgr_processor=None,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
     vocab_alpha=-99,
     max_len=10,
     min_len=0,
     temperature=1.0,
-    top_k=999999,
+    top_k=50,
     top_p=1.0,
     action_seq=None,
     skip_rewards=False,
+    tokenizer: PreTrainedTokenizer = None,
 ):
     # generate and return the probability of terminating at every step
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
@@ -87,16 +84,12 @@ def generate_and_return_termination_logprob(
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
 
-    logits_processor = LogitsProcessorList(
-        [
-            TopKLogitsWarper(top_k=top_k),
-            TopPLogitsWarper(top_p=top_p),
-        ]
-    )
-    # use only when apply grammar constraints
-    # logits_processor[0].reset()
+    if xgr_processor is not None:
+        logits_processor = LogitsProcessorList([xgr_processor])
+    else:
+        logits_processor = LogitsProcessorList([])
 
-    temperature_processor = TemperatureLogitsWarper(temperature=temperature)
+    # temperature_processor = TemperatureLogitsWarper(temperature=temperature)
 
     last_token_ids = token_ids[0, -1]
     i = 0
@@ -104,66 +97,25 @@ def generate_and_return_termination_logprob(
     while last_token_ids.item() != termination_token_id:
         if i >= max_len:
             break
-
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
         logits = output.logits[:, -1, :]
 
         if action_seq is None:
             with torch.no_grad():
-                # set the probability of illegal tokens to 0, except for the termination token and bos token
-                # prob[:, np.where(vocab_naughty_mask == True)] = 0
-                # modified logits is used for fullfilling top-k, top-p, and length constraints
-
-                # repalce native top-k and top-p with the LogitsProcessorList
+                # Consider using a more efficient logits processor
                 modified_logits = logits.clone().detach()
                 modified_logits = logits_processor(state, modified_logits)
 
-                # modified_logits = logits_wrapper(token_ids, modified_logits)
-
-                # implement top-k by getting the top-k largest values and setting the rest to 0
-                # if top_k < 999999:
-                #     modified_logits[prob >= prob.topk(top_k)] = -torch.inf
-                # # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
-                # if top_p < 1.0:
-                #     prob[vocab_naughty_mask] = -torch.inf
-                #     sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
-                #     cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
-                #     nucleus = cumsum_prob < top_p
-                #     nucleus = torch.cat(
-                #         [
-                #             nucleus.new_ones(nucleus.shape[:-1] + (1,)),
-                #             nucleus[..., :-1],
-                #         ],
-                #         dim=-1,
-                #     )
-                #     modified_logits[~nucleus] = -torch.inf
-                # TODO: actually you can make this process smoother, create a func which increase the prob of the termination token gradually, according to the length of the sequence
-                # TODO: I don't think this is necessary, this way to control seq_len is not appropriate for the SMILES generation task
-                # if i < min_len:
-                #     # if we haven't reach the minimum length, set the probability of terminating to 0
-                #     modified_logits[:, termination_token_id] = -torch.inf
-                # elif i >= max_len:
-                #     # if we've reached the maximum length, set the probability of terminating to 1
-                #     mask = [True] * modified_logits.shape[1]
-                #     mask[termination_token_id] = False
-                #     modified_logits[:, mask] = -torch.inf
-
-                # temp remove the nice/naughty token mask
-
-                # if vocab_nice_mask is not None:
-                #     # add vocab_alpha to the logits of the unmasked vocab items
-                #     modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                if i < min_len:
+                    modified_logits[:, termination_token_id] = 0
 
                 if vocab_naughty_mask is not None:
-                    # add vocab_alpha to the logits of the masked vocab items
                     modified_logits[:, vocab_naughty_mask] += vocab_alpha
 
-                prob = temperature_processor(state, modified_logits)
+                prob = (modified_logits / temperature).softmax(dim=-1)
 
-                # replace with HF temperature processor
-                # prob = (modified_logits / temperature).softmax(dim=-1)
-
+                # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
                 last_token_ids = token_ids[0]
 
@@ -177,7 +129,6 @@ def generate_and_return_termination_logprob(
             last_token_ids = token_ids[:, -1]
 
         i += 1
-
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
             token_ids,
@@ -234,29 +185,36 @@ def modified_subtb_loss(
     prompt_len,
     subtb_lambda=1.0,
 ):
+    # Ensure the dimensions of log probabilities, rewards, and generated text match
     assert (
         log_pf.shape[1]
         == log_r.shape[1]
         == log_pterm.shape[1]
         == generated_text.shape[1] - prompt_len
     )
-    assert (
-        log_pf.shape[1] > 1
-    )  # With modified-style losses, we need at least one transition before terminating
+    # Ensure there is at least one transition before termination
+    assert log_pf.shape[1] > 1
 
+    # Calculate the change in expected reward and probability at each step
     delta = log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
+    # Compute cumulative sum of delta for subtrajectory balance calculation
     delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
 
-    # Get a mask for tokens after the termination token in the generated_text
+    # Create a mask for tokens after the termination token
     mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(-1) >= 1
     batch_loss = 0.0
     total_lambda = 0.0
     generated_len = generated_text.shape[1] - prompt_len
     for subtraj_len in range(1, generated_len):
+        # Calculate the subtrajectory balance term
         subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
+        # Apply mask to ignore invalid parts of the sequence
         subtb_term[mask[:, subtraj_len - 1 :]] = 0
+        # Accumulate weighted subtrajectory balance term
         batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
+        # Accumulate total weight for normalization
         total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
+    # Normalize the loss by the total weight
     batch_loss /= total_lambda
 
     return batch_loss

@@ -4,8 +4,17 @@ from typing import Any, Dict, Tuple
 
 import pandas as pd
 import torch
+import torch.utils
+import torch.utils.data
+import xgrammar as xgr
 from lightning import LightningModule
-from transformers import PreTrainedTokenizer
+from peft import LoraConfig, get_peft_model
+from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers_cfg.grammar_utils import (
+    IncrementalGrammarConstraint,
+    NonIncrementalGrammarConstraint,
+)
+from transformers_cfg.parser import parse_ebnf
 
 from chemgfn.utils.gfn_utils import (
     base_to_lora,
@@ -22,6 +31,7 @@ class ChemGFNModule(LightningModule):
         net,
         reward,
         reward_buffer,
+        lora_config: LoraConfig,
         reward_config: Dict[str, Any],
         training_mixed_config: Dict[str, Any],
         constraint_config: Dict[str, Any],
@@ -42,7 +52,10 @@ class ChemGFNModule(LightningModule):
         self.save_hyperparameters(ignore=["net"])
 
         self.net = net
-        self.tokenizer: PreTrainedTokenizer = net.get_tokenizer()
+        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
+            self.net.config._name_or_path
+        )
+        self.net = get_peft_model(self.net, lora_config)
 
         self.reward_config = reward_config
         self.constraint_config = constraint_config
@@ -57,6 +70,15 @@ class ChemGFNModule(LightningModule):
         self.reward = reward
         self.reward_buffer = reward_buffer
 
+        with open(constraint_config.grammar_path) as file:
+            grammar_str = file.read()
+
+        full_vocab_size = self.tokenizer.vocab_size
+        tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.tokenizer)
+        compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
+        compiled_grammar = compiler.compile_grammar(grammar_str)
+        self.xgr_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
+
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.compile = compile
@@ -68,7 +90,6 @@ class ChemGFNModule(LightningModule):
     def forward(self, prompt, n_samples=None, pf_temperature=1.0, action_seq=None):
         assert prompt.ndim == 1
         n_samples = self.training_mixed_config.n_samples if n_samples is None else n_samples
-
         # expand prompts to n_samples
         prompt = prompt.unsqueeze(0).expand(n_samples, -1)
 
@@ -88,6 +109,7 @@ class ChemGFNModule(LightningModule):
         ) = generate_and_return_termination_logprob(
             self.net,
             prompt,
+            xgr_processor=self.xgr_processor,
             reward_fn=reward_fn,
             termination_token_id=self.end_of_sentence_token_id,
             min_len=self.constraint_config.min_sentence_len,
@@ -101,6 +123,7 @@ class ChemGFNModule(LightningModule):
     def training_step(self, prompt, batch_idx) -> torch.Tensor:
         prompt = prompt[0]
         # Sample a sentence and get the reward
+
         if (
             random.random() < self.training_mixed_config.use_buffer_prob
             and self.reward_buffer.sample(self.training_mixed_config.n_samples, prompt)[0]
@@ -210,8 +233,7 @@ class ChemGFNModule(LightningModule):
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         # Should always be (1, prompt_len)
-        prompt = prompt[0]
-
+        prompt = batch[0]
         # Sample a sentence and get the reward
         generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(prompt)
 
@@ -300,11 +322,14 @@ class ChemGFNModule(LightningModule):
     def on_validation_epoch_start(self):
         # Log variance of (logR - logP(s)) using exploration, which should be 0.0
         log_rs, log_pfss = [], []
-        val_data = self.trainer.datamodule.val_dataloader().dataset
-        for prompt in val_data:
-            prompt = prompt[0]
+        val_dataset = self.trainer.datamodule.val_dataloader().dataset
+        self.val_probes = torch.utils.data.Subset(
+            val_dataset, random.sample(range(len(val_dataset)), 10)
+        )
+        for item in self.trainer.datamodule.val_dataloader():
+            prompt = item[0]
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt.to(self.device), pf_temperature=2.0
+                prompt.to(self.net.device), pf_temperature=2.0
             )
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
@@ -319,7 +344,6 @@ class ChemGFNModule(LightningModule):
             log_pfss.append(log_pfs)
         log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
         self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
-
         # Log probe samples
         if (
             self.val_probes is not None
