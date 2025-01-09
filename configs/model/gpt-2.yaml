@@ -2,7 +2,7 @@ _target_: chemgfn.models.gfn.ChemGFNModule
 
 lora_config:
   _target_: peft.LoraConfig
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+  target_modules: ["c_attn"]
   r: 16
   lora_alpha: 16
   lora_dropout: 0.1
@@ -15,7 +15,7 @@ lora_config:
 
 net:
   _target_: transformers.AutoModelForCausalLM.from_pretrained
-  pretrained_model_name_or_path: "meta-llama/Meta-Llama-3-8B-Instruct"
+  pretrained_model_name_or_path: "openai-community/gpt2"
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -54,9 +54,12 @@ reward_buffer:
   sim_tolerance: 0.25
 
 constraint_config:
-  min_sentence_len: 1
-  max_sentence_len: 100
+  min_sentence_len: 10
+  max_sentence_len: 10
   grammar_path: ${paths.assets_dir}/SMIELS_grammars/generic.ebnf
+  apply_grammar: false
+  legal_tokens: ${paths.assets_dir}/token_list/number/allowed_gpt2_token
+  vocab_alpha: "-inf"
 
 training_mixed_config:
   subtb_lambda: 1.0

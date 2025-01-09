@@ -1,0 +1,6 @@
+_target_: chemgfn.data.gfn_datamodule.NumberDataModule
+tokenizer_name: "openai-community/gpt2"
+data_path: ${paths.data_dir}/dataset.npy
+train_size: 0.95
+num_workers: 8
+pin_memory: True

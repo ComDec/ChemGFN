@@ -11,8 +11,9 @@ import xgrammar as xgr
 
 # slient the warning
 from rdkit import Chem, RDLogger
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import cos_sim
+
+# from sentence_transformers import SentenceTransformer
+# from sentence_transformers.util import cos_sim
 from transformers import PreTrainedTokenizer
 from transformers.generation.logits_process import LogitsProcessorList
 
@@ -36,26 +37,26 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
     legal_tokens = [line.rstrip("\n") for line in legal_tokens]
     legal_tokens = [tokenizer.encode(t, add_special_tokens=False)[0] for t in legal_tokens]
 
-    illegal_token_mask = torch.ones(len(tokenizer), dtype=torch.bool)
+    legal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
 
-    # tokenize illegal tokens, leave numbers as they are
-    illegal_tokens = [
+    # tokenize legal tokens, leave numbers as they are
+    legal_tokens = [
         [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False)
-        for t in illegal_tokens
+        for t in legal_tokens
     ]
-    assert all(len(t) == 1 for t in illegal_tokens)
+    assert all(len(t) == 1 for t in legal_tokens)
 
-    # get inx of illegal tokens
-    illegal_tokens = [t[0] for t in illegal_tokens]
-    illegal_token_mask[illegal_tokens] = True
-    illegal_token_mask = illegal_token_mask.numpy()
-    illegal_token_mask[legal_tokens] = False
+    # get inx of legal tokens
+    legal_tokens = [t[0] for t in legal_tokens]
+    legal_token_mask[legal_tokens] = True
 
     # add bos and eos as legal tokens
-    illegal_token_mask[tokenizer.bos_token_id] = False
-    illegal_token_mask[tokenizer.eos_token_id] = False
+    legal_token_mask[tokenizer.bos_token_id] = True
+    legal_token_mask[tokenizer.eos_token_id] = True
 
-    return illegal_token_mask
+    illegal_token_mask = ~legal_token_mask
+
+    return legal_token_mask, illegal_token_mask
 
 
 def generate_and_return_termination_logprob(
@@ -66,12 +67,10 @@ def generate_and_return_termination_logprob(
     xgr_processor=None,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
-    vocab_alpha=-99,
+    vocab_alpha=float("-inf"),
     max_len=10,
     min_len=0,
     temperature=1.0,
-    top_k=50,
-    top_p=1.0,
     action_seq=None,
     skip_rewards=False,
     tokenizer: PreTrainedTokenizer = None,
@@ -89,7 +88,10 @@ def generate_and_return_termination_logprob(
     else:
         logits_processor = LogitsProcessorList([])
 
-    # temperature_processor = TemperatureLogitsWarper(temperature=temperature)
+    if min_len == max_len:
+        force_termination_length = max_len
+    else:
+        force_termination_length = 99999
 
     last_token_ids = token_ids[0, -1]
     i = 0
@@ -97,6 +99,7 @@ def generate_and_return_termination_logprob(
     while last_token_ids.item() != termination_token_id:
         if i >= max_len:
             break
+
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
         logits = output.logits[:, -1, :]
@@ -108,7 +111,10 @@ def generate_and_return_termination_logprob(
                 modified_logits = logits_processor(state, modified_logits)
 
                 if i < min_len:
-                    modified_logits[:, termination_token_id] = 0
+                    modified_logits[:, termination_token_id] = float("-inf")
+
+                if i >= force_termination_length:
+                    modified_logits[:, termination_token_id] = float("inf")
 
                 if vocab_naughty_mask is not None:
                     modified_logits[:, vocab_naughty_mask] += vocab_alpha
@@ -134,12 +140,9 @@ def generate_and_return_termination_logprob(
             token_ids,
             termination_token_id,
         )
-        if vocab_nice_mask is not None:
-            logits[:, ~vocab_nice_mask] += vocab_alpha
-        if vocab_naughty_mask is not None:
-            logits[:, vocab_naughty_mask] += vocab_alpha
 
         logprob = logits.log_softmax(dim=-1)
+
         # prob list for termination token by steps
         log_pterm.append(
             torch.where(
@@ -171,7 +174,7 @@ def generate_and_return_termination_logprob(
     else:
         # Reward for all intermediate states (except the last one,
         # which is guaranteed to be the termination token)
-        log_r, log_r_unpenalized = reward_fn(state[:, :-1])
+        log_r, log_r_unpenalized = reward_fn(state)
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized
 
@@ -240,31 +243,6 @@ def get_termination_vals(
     log_r = log_r[batch_idx, gen_len]
     log_r_unpenalized = log_r_unpenalized[batch_idx, gen_len]
     return log_pfs, log_r, log_r_unpenalized, gen_len
-
-
-class SequenceDiversity:
-    def __init__(self, method, **kwargs):
-        self.method = method
-        if method is None:
-            pass
-        elif method == "sequence_embedding":
-            model_name = kwargs.get("model_name", "sentence-transformers/all-mpnet-base-v2")
-            self.model = SentenceTransformer(model_name)
-        else:
-            raise ValueError(f"Unknown sequence diversity method: {method}")
-
-    @torch.no_grad()
-    def __call__(self, sequences):
-        if self.method is None:
-            return None
-        elif self.method == "sequence_embedding":
-            embeddings = self.model.encode(sequences, show_progress_bar=False)
-            sim = cos_sim(embeddings, embeddings)
-            indices = torch.triu_indices(len(sequences), len(sequences), offset=1)
-            diversity = 1 - sim[indices[0], indices[1]].mean().item()
-        else:
-            raise ValueError(f"Unknown sequence diversity method: {self.method}")
-        return diversity
 
 
 class ReplayBuffer:

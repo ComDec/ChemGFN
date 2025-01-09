@@ -1,3 +1,4 @@
+import os
 import random
 from functools import partial
 from typing import Any, Dict, Tuple
@@ -10,11 +11,6 @@ import xgrammar as xgr
 from lightning import LightningModule
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, PreTrainedTokenizer
-from transformers_cfg.grammar_utils import (
-    IncrementalGrammarConstraint,
-    NonIncrementalGrammarConstraint,
-)
-from transformers_cfg.parser import parse_ebnf
 
 from chemgfn.utils.gfn_utils import (
     base_to_lora,
@@ -22,6 +18,7 @@ from chemgfn.utils.gfn_utils import (
     get_termination_vals,
     lora_to_base,
     modified_subtb_loss,
+    prepare_token_mask,
 )
 
 
@@ -70,14 +67,29 @@ class ChemGFNModule(LightningModule):
         self.reward = reward
         self.reward_buffer = reward_buffer
 
-        with open(constraint_config.grammar_path) as file:
-            grammar_str = file.read()
+        if constraint_config.apply_grammar:
+            with open(constraint_config.grammar_path) as file:
+                grammar_str = file.read()
 
-        full_vocab_size = self.tokenizer.vocab_size
-        tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.tokenizer)
-        compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
-        compiled_grammar = compiler.compile_grammar(grammar_str)
-        self.xgr_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
+            full_vocab_size = self.tokenizer.vocab_size
+            tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.tokenizer)
+            compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
+            compiled_grammar = compiler.compile_grammar(grammar_str)
+            self.xgr_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
+
+        else:
+            self.xgr_processor = None
+
+        if os.path.exists(self.constraint_config.legal_tokens):
+            self.legal_tokens_mask, self.illegal_tokens_mask = prepare_token_mask(
+                self.tokenizer, self.constraint_config.legal_tokens
+            )
+        else:
+            self.legal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
+            self.illegal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
+            print(f"Legal tokens file not found: {self.constraint_config.legal_tokens}")
+
+        self.vocab_alpha = float(self.constraint_config.vocab_alpha)
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -87,15 +99,21 @@ class ChemGFNModule(LightningModule):
         self.train_probes = train_probes
         self.val_probes = val_probes
 
-    def forward(self, prompt, n_samples=None, pf_temperature=1.0, action_seq=None):
-        assert prompt.ndim == 1
+    def forward(
+        self, encoded_prompt, numbers_list, n_samples=None, pf_temperature=1.0, action_seq=None
+    ):
+        if encoded_prompt.ndim != 1:
+            # remove batch dimension
+            encoded_prompt = encoded_prompt.squeeze(0)
+
         n_samples = self.training_mixed_config.n_samples if n_samples is None else n_samples
+
         # expand prompts to n_samples
-        prompt = prompt.unsqueeze(0).expand(n_samples, -1)
+        encoded_prompt = encoded_prompt.unsqueeze(0).expand(n_samples, -1)
 
         reward_fn = partial(
             self.reward.score,
-            prompt_length=prompt.shape[1],
+            prompt_length=encoded_prompt.shape[1],
             model=self.net,
             tokenizer=self.tokenizer,
         )
@@ -108,7 +126,7 @@ class ChemGFNModule(LightningModule):
             log_r_unpenalized,
         ) = generate_and_return_termination_logprob(
             self.net,
-            prompt,
+            encoded_prompt,
             xgr_processor=self.xgr_processor,
             reward_fn=reward_fn,
             termination_token_id=self.end_of_sentence_token_id,
@@ -117,26 +135,33 @@ class ChemGFNModule(LightningModule):
             temperature=pf_temperature,
             skip_rewards=False,
             action_seq=action_seq,
+            vocab_nice_mask=self.legal_tokens_mask,
+            vocab_naughty_mask=self.illegal_tokens_mask,
+            vocab_alpha=self.vocab_alpha,
         )
+
         return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
 
-    def training_step(self, prompt, batch_idx) -> torch.Tensor:
-        prompt = prompt[0]
+    def training_step(self, item, batch_idx) -> torch.Tensor:
+        encoded_prompt = item["encoded_prompt"]
+        numbers_list = item["numbers_list"]
         # Sample a sentence and get the reward
 
         if (
             random.random() < self.training_mixed_config.use_buffer_prob
-            and self.reward_buffer.sample(self.training_mixed_config.n_samples, prompt)[0]
+            and self.reward_buffer.sample(self.training_mixed_config.n_samples, encoded_prompt)[0]
             is not None
         ):
             # Using a sample from the reward buffer
             action_seq, log_r = self.reward_buffer.sample(
-                self.training_mixed_config.n_samples, prompt
+                self.training_mixed_config.n_samples, encoded_prompt
             )
             generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                prompt, action_seq=action_seq
+                encoded_prompt, action_seq=action_seq
             )
-            log_r = log_r[:, : generated_text.shape[1] - len(prompt)]  # Undo padding from buffer
+            log_r = log_r[
+                :, : generated_text.shape[1] - len(encoded_prompt)
+            ]  # Undo padding from buffer
             log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
 
         else:
@@ -153,11 +178,11 @@ class ChemGFNModule(LightningModule):
             else:  # Without tempering
                 pf_temp = 1.0
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt, pf_temperature=pf_temp
+                encoded_prompt, numbers_list, pf_temperature=pf_temp
             )
             self.reward_buffer.add_batch(
-                prompt=prompt,
-                sentences=generated_text[:, len(prompt) :],
+                prompt=encoded_prompt,
+                sentences=generated_text[:, len(encoded_prompt) :],
                 logrewards=log_r * self.reward.temperature,  # undo the effect of reward tempering
                 tokenizer=self.tokenizer,
             )
@@ -169,7 +194,7 @@ class ChemGFNModule(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=len(encoded_prompt),
             subtb_lambda=self.training_mixed_config.subtb_lambda,
         )
 
@@ -181,7 +206,7 @@ class ChemGFNModule(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=len(encoded_prompt),
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -233,9 +258,12 @@ class ChemGFNModule(LightningModule):
 
     def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         # Should always be (1, prompt_len)
-        prompt = batch[0]
+        encoded_prompt = batch["encoded_prompt"]
+        numbers_list = batch["numbers_list"]
         # Sample a sentence and get the reward
-        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(prompt)
+        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
+            encoded_prompt, numbers_list
+        )
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -244,7 +272,7 @@ class ChemGFNModule(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=len(encoded_prompt),
             subtb_lambda=self.training_mixed_config.subtb_lambda,
         )
 
@@ -256,7 +284,7 @@ class ChemGFNModule(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(prompt),
+            prompt_len=len(encoded_prompt),
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -297,7 +325,7 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
-    def on_train_batch_start(self, prompt, batch_idx):
+    def on_train_batch_start(self, encoded_prompt, numbers_list, batch_idx):
         # Update scheduled quantities
         reward_temp = self.get_reward_temp_at_step(self.global_step)
         lr = self.get_lr_at_step(self.global_step)
@@ -327,9 +355,10 @@ class ChemGFNModule(LightningModule):
             val_dataset, random.sample(range(len(val_dataset)), 10)
         )
         for item in self.trainer.datamodule.val_dataloader():
-            prompt = item[0]
+            encoded_prompt = item["encoded_prompt"]
+            numbers_list = item["numbers_list"]
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                prompt.to(self.net.device), pf_temperature=2.0
+                encoded_prompt.to(self.net.device), numbers_list, pf_temperature=2.0
             )
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
@@ -338,7 +367,7 @@ class ChemGFNModule(LightningModule):
                 log_r=log_r,
                 log_r_unpenalized=log_r_unpenalized,
                 termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(prompt),
+                prompt_len=len(encoded_prompt),
             )
             log_rs.append(log_r)
             log_pfss.append(log_pfs)

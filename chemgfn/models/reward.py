@@ -40,9 +40,10 @@ def score_fast(
             for i in range(len(prompt_cache[1]))
         )
         logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
+
     # get rid of the first few tokens
     # I didn't see the necessity, maybe to ensure the initial state have a penalty
-    logits = logits[:, skip_first - 1 :]
+    logits = logits[:, skip_first:]
 
     # score the log probability of the input sequence while ignoring termination and padding tokens
     if vocab_nice_mask is not None:
