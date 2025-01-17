@@ -97,7 +97,7 @@ def generate_and_return_termination_logprob(
     i = 0
 
     while last_token_ids.item() != termination_token_id:
-        if i >= max_len:
+        if i > max_len:
             break
 
         output = model(input_ids=token_ids, past_key_values=past_key_values)
@@ -111,10 +111,13 @@ def generate_and_return_termination_logprob(
                 modified_logits = logits_processor(state, modified_logits)
 
                 if i < min_len:
-                    modified_logits[:, termination_token_id] = float("-inf")
+                    modified_logits[:, termination_token_id] += float("-inf")
 
-                if i >= force_termination_length:
-                    modified_logits[:, termination_token_id] = float("inf")
+                # take the termination token as the last token
+                if i == force_termination_length:
+                    mask = [True] * modified_logits.shape[1]
+                    mask[termination_token_id] = False
+                    modified_logits[:, mask] = -torch.inf
 
                 if vocab_naughty_mask is not None:
                     modified_logits[:, vocab_naughty_mask] += vocab_alpha
@@ -124,7 +127,6 @@ def generate_and_return_termination_logprob(
                 # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
                 last_token_ids = token_ids[0]
-
         else:
             if i >= action_seq.size(-1):
                 token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
@@ -132,9 +134,8 @@ def generate_and_return_termination_logprob(
                 )
             else:
                 token_ids = action_seq[:, i].unsqueeze(-1)
-            last_token_ids = token_ids[:, -1]
+                last_token_ids = token_ids[0, -1]
 
-        i += 1
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
             token_ids,
@@ -163,18 +164,27 @@ def generate_and_return_termination_logprob(
         )
         # update the state, i.e., the sequence so far
         state = torch.cat([state, token_ids], dim=-1)
-        # check if all sequences have terminated
-        if torch.all(~active_seqs):
-            break
+
+        i += 1
+
+        # check if all sequences have terminated, apply when we need non-fixed length generation
+        # if torch.all(~active_seqs):
+        #     break
 
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
+
     if skip_rewards:
         log_r, log_r_unpenalized = None, None
     else:
         # Reward for all intermediate states (except the last one,
         # which is guaranteed to be the termination token)
-        log_r, log_r_unpenalized = reward_fn(state)
+        log_r, log_r_unpenalized = reward_fn(
+            state[:, :-1],
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            vocab_alpha=vocab_alpha,
+        )
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized
 
@@ -336,6 +346,7 @@ class ReplayBuffer:
             (sentences == self.termination_token_id).cumsum(dim=-1) >= 1
         ] = self.termination_token_id
         token_sentences = tokenizer.batch_decode(sentences)
+        prompt_len = prompt.shape[1]
 
         for i in range(sentences.size(0)):
             # str_sentence = token_sentences[i].replace(".", "").strip()
@@ -344,7 +355,7 @@ class ReplayBuffer:
             self.add(
                 {
                     "logreward": logrewards[
-                        i, (sentences[i] != self.termination_token_id).sum()
+                        i, (sentences[i][prompt_len - 1 :] != self.termination_token_id).sum()
                     ].item(),
                     "str_prompt": str_prompt,
                     "str_sentence": str_sentence,

@@ -66,6 +66,7 @@ class ChemGFNModule(LightningModule):
 
         self.reward = reward
         self.reward_buffer = reward_buffer
+        self.reward_buffer.set_termination_token_id(self.end_of_sentence_token_id)
 
         if constraint_config.apply_grammar:
             with open(constraint_config.grammar_path) as file:
@@ -100,7 +101,12 @@ class ChemGFNModule(LightningModule):
         self.val_probes = val_probes
 
     def forward(
-        self, encoded_prompt, numbers_list, n_samples=None, pf_temperature=1.0, action_seq=None
+        self,
+        encoded_prompt,
+        numbers_list=None,
+        n_samples=None,
+        pf_temperature=1.0,
+        action_seq=None,
     ):
         if encoded_prompt.ndim != 1:
             # remove batch dimension
@@ -194,7 +200,7 @@ class ChemGFNModule(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(encoded_prompt),
+            prompt_len=len(encoded_prompt[0]),
             subtb_lambda=self.training_mixed_config.subtb_lambda,
         )
 
@@ -206,7 +212,7 @@ class ChemGFNModule(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(encoded_prompt),
+            prompt_len=len(encoded_prompt[0]),
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -272,7 +278,7 @@ class ChemGFNModule(LightningModule):
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(encoded_prompt),
+            prompt_len=len(encoded_prompt[0]),
             subtb_lambda=self.training_mixed_config.subtb_lambda,
         )
 
@@ -284,7 +290,7 @@ class ChemGFNModule(LightningModule):
             log_r=log_r,
             log_r_unpenalized=log_r_unpenalized,
             termination_token_id=self.end_of_sentence_token_id,
-            prompt_len=len(encoded_prompt),
+            prompt_len=len(encoded_prompt[0]),
         )
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
@@ -325,27 +331,28 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
-    def on_train_batch_start(self, encoded_prompt, numbers_list, batch_idx):
+    def on_train_batch_start(self, batch, batch_idx):
         # Update scheduled quantities
         reward_temp = self.get_reward_temp_at_step(self.global_step)
-        lr = self.get_lr_at_step(self.global_step)
+        lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
         for pg in self.optimizers().param_groups:
             pg["lr"] = lr
 
-    def on_train_epoch_start(self):
-        # Log scheduled quantities
-        self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
-        self.log("scheduled/lr", self.get_lr_at_step(self.global_step), sync_dist=True)
+    # def on_train_epoch_start(self, ):
+    #     # Log scheduled quantities
+    #     self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
+    #     self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
 
-        # Log probe samples
-        if (
-            self.train_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 1 == 0
-        ):
-            samples_table = self.sample_probes(self.train_probes)
-            self.logger.log_table("samples/train_probes", dataframe=samples_table)
+    #     # Log probe samples
+    #     # There is no need to sample probes during training
+    #     # if (
+    #     #     self.train_probes is not None
+    #     #     and self.logger is not None
+    #     #     and self.trainer.current_epoch % 1 == 0
+    #     # ):
+    #     #     samples_table = self.sample_probes(self.train_probes)
+    #     #     self.logger.log_table("samples/train_probes", dataframe=samples_table)
 
     def on_validation_epoch_start(self):
         # Log variance of (logR - logP(s)) using exploration, which should be 0.0
@@ -354,7 +361,7 @@ class ChemGFNModule(LightningModule):
         self.val_probes = torch.utils.data.Subset(
             val_dataset, random.sample(range(len(val_dataset)), 10)
         )
-        for item in self.trainer.datamodule.val_dataloader():
+        for idx, item in enumerate(self.trainer.datamodule.val_dataloader()):
             encoded_prompt = item["encoded_prompt"]
             numbers_list = item["numbers_list"]
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
@@ -367,10 +374,14 @@ class ChemGFNModule(LightningModule):
                 log_r=log_r,
                 log_r_unpenalized=log_r_unpenalized,
                 termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(encoded_prompt),
+                prompt_len=len(encoded_prompt[0]),
             )
             log_rs.append(log_r)
             log_pfss.append(log_pfs)
+
+            if idx == 10:
+                break
+
         log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
         self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
         # Log probe samples
@@ -380,7 +391,13 @@ class ChemGFNModule(LightningModule):
             and self.trainer.current_epoch % 2 == 0
         ):
             samples_table = self.sample_probes(self.val_probes)
-            self.logger.log_table("samples/val_probes", dataframe=samples_table)
+            samples_table.to_csv(
+                os.path.join(
+                    self.trainer.default_root_dir,
+                    f"samples_val_probes_{self.trainer.current_epoch}.csv",
+                ),
+                index=False,
+            )
 
     def on_train_start(self):
         pass
@@ -435,14 +452,16 @@ class ChemGFNModule(LightningModule):
         #     self.logger.log_table("samples/val_probes (baselines)", dataframe=samples_table)
 
     def sample_probes(self, probes, n_samples=4):
-        assert isinstance(probes, list) and probes[0].ndim == 1
         samples = []
         for probe in probes:
-            probe_str = self.tokenizer.decode(probe)
+            encoded_prompt = probe["encoded_prompt"]
+            probe_str = self.tokenizer.decode(encoded_prompt[0])
+
             with torch.no_grad():
                 generated_text, _, _, log_r, log_r_unpenalized = self.forward(
-                    probe.to(self.device), n_samples=n_samples
+                    encoded_prompt.to(self.device), n_samples=n_samples
                 )
+
             log_ps, log_ps_unpenalized = get_termination_vals(
                 generated_text=generated_text,
                 log_pf=None,
@@ -450,13 +469,16 @@ class ChemGFNModule(LightningModule):
                 log_r=log_r,
                 log_r_unpenalized=log_r_unpenalized,
                 termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(probe),
+                prompt_len=len(encoded_prompt[0]),
             )[1:3]
+
             log_ps *= self.reward.temperature
             log_ps_unpenalized *= self.reward.temperature
-            generated_text = generated_text[:, len(probe) :]
-            generated_text = self.tokenizer.batch_decode(generated_text)
-            generated_text = [text.replace(".", "") for text in generated_text]
+            generated_text = generated_text[:, len(encoded_prompt[0]) :]
+            generated_text = [
+                ",".join(self.tokenizer.decode(token, skip_special_tokens=False) for token in text)
+                for text in generated_text
+            ]
             for i in range(len(generated_text)):
                 samples.append(
                     {
@@ -464,6 +486,8 @@ class ChemGFNModule(LightningModule):
                         "Sampled sentence": generated_text[i],
                         "logP(s)": log_ps[i].item(),
                         "logP(s) unpenalized": log_ps_unpenalized[i].item(),
+                        "logR": log_r[i].tolist(),
+                        "logR unpenalized": log_r_unpenalized[i].tolist(),
                     }
                 )
         samples = pd.DataFrame(samples)

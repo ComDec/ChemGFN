@@ -3,8 +3,8 @@ _target_: chemgfn.models.gfn.ChemGFNModule
 lora_config:
   _target_: peft.LoraConfig
   target_modules: ["c_attn"]
-  r: 16
-  lora_alpha: 16
+  r: 32
+  lora_alpha: 32
   lora_dropout: 0.1
   bias: "none"
   fan_in_fan_out: false
@@ -20,7 +20,7 @@ net:
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.0001
+  lr: 0.001
   weight_decay: 0.01
 
 # If use bnb, plz use
@@ -35,18 +35,14 @@ scheduler:
 reward:
   _target_: chemgfn.models.reward.FrozenModelSentenceGivenPrompt
   temperature: 1.0
-  min_len: 1
-  vocab_alpha: 1.0
-  vocab_nice_mask: null
-  vocab_naughty_mask: null
   valid_sentence_alpha: 1.0
   sentence_validator:
-    _target_: chemgfn.models.reward.RDKitValidator
+    _target_: chemgfn.models.reward.NumberValidator
 
 reward_config:
-  temp_start: 1.0
-  temp_end: 0.8
-  temp_horizon: 10000
+  reward_temp_start: 1.0
+  reward_temp_end: 0.8
+  reward_temp_horizon: 10000
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -66,7 +62,7 @@ training_mixed_config:
   pf_temp_high: 2.0
   pf_temp_low: 0.5
   pf_temp_prob: 0.666
-  use_buffer_prob: 0.25
+  use_buffer_prob: 0.00
   n_samples: 4
 
 compile: false

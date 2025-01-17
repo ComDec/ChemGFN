@@ -19,7 +19,6 @@ def score_fast(
     model,
     encoded_input,
     termination_token_id,
-    min_len,
     skip_first,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
@@ -43,7 +42,10 @@ def score_fast(
 
     # get rid of the first few tokens
     # I didn't see the necessity, maybe to ensure the initial state have a penalty
-    logits = logits[:, skip_first:]
+
+    # predict the logits of next tokens
+    # the input tokens remove the last token: state[:-1], so the logits is for state[1:]
+    logits = logits[:, skip_first - 1 :]
 
     # score the log probability of the input sequence while ignoring termination and padding tokens
     if vocab_nice_mask is not None:
@@ -55,6 +57,7 @@ def score_fast(
 
     logprob = logits.log_softmax(-1)
     token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
+
     # catch the log probability of each token in the input sequence
     logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
 
@@ -63,9 +66,13 @@ def score_fast(
     reward = logprob[
         :, :, termination_token_id
     ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
+
     reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
+
+    ### all the shift above is wired
+
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
-    # repeat for sampled size
+
     non_term_mask = torch.cat(
         (
             non_term_mask.new_ones(non_term_mask.shape[0], 1),
@@ -73,9 +80,11 @@ def score_fast(
         ),
         dim=-1,
     )  # Start (i.e., empty) state has never terminated
+
     reward[~non_term_mask] = 0.0
     reward_unpenalized = reward.clone()
-    reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -99, reward)
+
+    # reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -99, reward)
     return reward, reward_unpenalized
 
 
@@ -119,33 +128,70 @@ class RDKitValidator(SentenceValidator):
         return valid
 
 
+def number_reward(sampled_numbers):
+    # check if the list of numbers follow the rule: even number followed by odd number and odd number followed by even number and between 0 and 20.
+    # if any number larger than 20, return 0, else return 1.
+    # if number follow the rule, return 2, else return 1.
+    numbers = [int(number) for number in sampled_numbers]
+    if not all((numbers[i] % 2 != numbers[i + 1] % 2) for i in range(len(numbers) - 1)):
+        return 0
+    else:
+        return 1
+
+
+class NumberValidator(SentenceValidator):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
+        termination_token_id = tokenizer.eos_token_id
+
+        invalid = torch.zeros(
+            sentences.shape[0],
+            sentences.shape[1] + 1,
+            device=sentences.device,
+        )
+        invalid[:, 0] = 1  # Empty sentence is never valid
+
+        for i in range(sentences.shape[0]):
+            for j in range(sentences.shape[1]):
+                if sentences[i, j] == termination_token_id:
+                    break  # Only unterminated sentences get a reward
+                tokens = [tokenizer.decode(t) for t in sentences[i, : j + 1]]
+                numbers = [int(number) for number in tokens]
+                if all(0 <= number <= 20 for number in numbers):
+                    invalid[i, j + 1] = 0
+                    if number_reward(numbers):
+                        invalid[i, j + 1] = 0
+                    else:
+                        invalid[i, j + 1] = -1
+                else:
+                    invalid[i, j + 1] = -2
+        return invalid
+
+
 class FrozenModelSentenceGivenPrompt:
     def __init__(
         self,
         sentence_validator: SentenceValidator,
         temperature=1.0,
-        min_len=1,
-        vocab_alpha=-50.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
         valid_sentence_alpha=None,
     ):
-        assert (
-            sentence_validator is None
-            and valid_sentence_alpha is None
-            or sentence_validator is not None
-            and valid_sentence_alpha is not None
-        )
-
         self.temperature = temperature
-        self.vocab_nice_mask = vocab_nice_mask
-        self.vocab_naughty_mask = vocab_naughty_mask
-        self.vocab_alpha = vocab_alpha
-        self.min_len = min_len
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
 
-    def score(self, input_batch, prompt_length, model, tokenizer: PreTrainedTokenizer):
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        vocab_alpha=-99,
+    ):
+        # why lora_to_base?
         lora_to_base(model)
         training = model.training
         model.eval()
@@ -154,22 +200,23 @@ class FrozenModelSentenceGivenPrompt:
             encoded_input=input_batch,
             termination_token_id=tokenizer.eos_token_id,
             skip_first=prompt_length,
-            vocab_nice_mask=self.vocab_nice_mask,
-            vocab_naughty_mask=self.vocab_naughty_mask,
-            vocab_alpha=self.vocab_alpha,
-            min_len=self.min_len,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            vocab_alpha=vocab_alpha,
         )
         reward /= self.temperature
         reward_unpenalized /= self.temperature
+
         base_to_lora(model)
         if training:
             model.train()
 
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
-            valid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
-            valid = valid * self.valid_sentence_alpha
+            invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
+            invalid = invalid * self.valid_sentence_alpha
+
             # TODO: max or mean
-            reward = torch.max(reward, valid)
+            reward = torch.min(reward, invalid)
 
         return reward, reward_unpenalized
