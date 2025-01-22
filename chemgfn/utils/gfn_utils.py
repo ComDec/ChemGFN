@@ -114,7 +114,7 @@ def generate_and_return_termination_logprob(
                     modified_logits[:, termination_token_id] += float("-inf")
 
                 # take the termination token as the last token
-                if i == force_termination_length:
+                if i == max_len:
                     mask = [True] * modified_logits.shape[1]
                     mask[termination_token_id] = False
                     modified_logits[:, mask] = -torch.inf
