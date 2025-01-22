@@ -1,4 +1,4 @@
-list ::= number_list
+root ::= number_list
 
 number_list ::= number (number_list)?
 

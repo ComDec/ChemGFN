@@ -72,7 +72,6 @@ class ChemGFNModule(LightningModule):
             with open(constraint_config.grammar_path) as file:
                 grammar_str = file.read()
 
-            full_vocab_size = self.tokenizer.vocab_size
             tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.tokenizer)
             compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
             compiled_grammar = compiler.compile_grammar(grammar_str)

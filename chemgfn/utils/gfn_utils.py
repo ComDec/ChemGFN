@@ -77,6 +77,7 @@ def generate_and_return_termination_logprob(
 ):
     # generate and return the probability of terminating at every step
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    prompt_len = encoded_prompt.size(1)
     state = encoded_prompt.clone()
     log_pf = []
     log_pterm = []
@@ -88,18 +89,7 @@ def generate_and_return_termination_logprob(
     else:
         logits_processor = LogitsProcessorList([])
 
-    if min_len == max_len:
-        force_termination_length = max_len
-    else:
-        force_termination_length = 99999
-
-    last_token_ids = token_ids[0, -1]
-    i = 0
-
-    while last_token_ids.item() != termination_token_id:
-        if i > max_len:
-            break
-
+    for i in range(max_len + 1):
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
         logits = output.logits[:, -1, :]
@@ -114,7 +104,7 @@ def generate_and_return_termination_logprob(
                     modified_logits[:, termination_token_id] += float("-inf")
 
                 # take the termination token as the last token
-                if i == max_len:
+                if i >= max_len:
                     mask = [True] * modified_logits.shape[1]
                     mask[termination_token_id] = False
                     modified_logits[:, mask] = -torch.inf
@@ -126,15 +116,13 @@ def generate_and_return_termination_logprob(
 
                 # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
-                last_token_ids = token_ids[0]
         else:
             if i >= action_seq.size(-1):
                 token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
                     -1
                 )
             else:
-                token_ids = action_seq[:, i].unsqueeze(-1)
-                last_token_ids = token_ids[0, -1]
+                token_ids = action_seq[:, prompt_len - 1 + i].unsqueeze(-1)
 
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
@@ -164,8 +152,6 @@ def generate_and_return_termination_logprob(
         )
         # update the state, i.e., the sequence so far
         state = torch.cat([state, token_ids], dim=-1)
-
-        i += 1
 
         # check if all sequences have terminated, apply when we need non-fixed length generation
         # if torch.all(~active_seqs):

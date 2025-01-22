@@ -7,9 +7,9 @@ import torch
 # slient the warning
 from rdkit import Chem, RDLogger
 from transformers import PreTrainedTokenizer
+from transformers.generation.logits_process import LogitsProcessorList
 
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
-from chemgfn.utils.register import ClassRegistry
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -214,7 +214,7 @@ class FrozenModelSentenceGivenPrompt:
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
             invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
-            invalid = invalid * self.valid_sentence_alpha
+            invalid = invalid * reward.max()
 
             # TODO: max or mean
             reward = torch.min(reward, invalid)

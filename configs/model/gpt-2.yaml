@@ -51,8 +51,8 @@ reward_buffer:
 
 constraint_config:
   min_sentence_len: 10
-  max_sentence_len: 10
-  grammar_path: ${paths.assets_dir}/SMIELS_grammars/generic.ebnf
+  max_sentence_len: 20
+  grammar_path: ${paths.assets_dir}/number_grammars/odd_even.ebnf
   apply_grammar: false
   legal_tokens: ${paths.assets_dir}/token_list/number/allowed_gpt2_token
   vocab_alpha: "-inf"
@@ -62,7 +62,7 @@ training_mixed_config:
   pf_temp_high: 2.0
   pf_temp_low: 0.5
   pf_temp_prob: 0.666
-  use_buffer_prob: 0.00
+  use_buffer_prob: 0.25
   n_samples: 4
 
 compile: false
