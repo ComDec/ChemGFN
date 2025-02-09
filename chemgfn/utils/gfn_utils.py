@@ -7,7 +7,6 @@ import editdistance
 import numpy as np
 import spacy
 import torch
-import xgrammar as xgr
 
 # slient the warning
 from rdkit import Chem, RDLogger
@@ -56,7 +55,7 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
 
     illegal_token_mask = ~legal_token_mask
 
-    return legal_token_mask, illegal_token_mask
+    return legal_token_mask, illegal_token_mask, legal_tokens
 
 
 def generate_and_return_termination_logprob(
@@ -64,7 +63,7 @@ def generate_and_return_termination_logprob(
     encoded_prompt,
     termination_token_id,
     reward_fn,
-    xgr_processor=None,
+    grammar_processor=None,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
     vocab_alpha=float("-inf"),
@@ -84,10 +83,12 @@ def generate_and_return_termination_logprob(
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
 
-    if xgr_processor is not None:
-        logits_processor = LogitsProcessorList([xgr_processor])
-    else:
-        logits_processor = LogitsProcessorList([])
+    # if grammar_processor is not None:
+    #     logits_processor = LogitsProcessorList([grammar_processor])
+    # else:
+    #     pass
+
+    logits_processor = LogitsProcessorList([])
 
     for i in range(max_len + 1):
         output = model(input_ids=token_ids, past_key_values=past_key_values)

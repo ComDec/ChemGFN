@@ -7,10 +7,16 @@ import pandas as pd
 import torch
 import torch.utils
 import torch.utils.data
-import xgrammar as xgr
 from lightning import LightningModule
 from peft import LoraConfig, get_peft_model
 from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers_cfg.generation.logits_process import (
+    GrammarConstrainedLogitsProcessor,
+    GrammarLimitedOneTimeLogitsProcessor,
+)
+from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
+from transformers_cfg.parser import parse_ebnf
+from transformers_cfg.recognizer import StringRecognizer
 
 from chemgfn.utils.gfn_utils import (
     base_to_lora,
@@ -68,26 +74,36 @@ class ChemGFNModule(LightningModule):
         self.reward_buffer = reward_buffer
         self.reward_buffer.set_termination_token_id(self.end_of_sentence_token_id)
 
+        if os.path.exists(self.constraint_config.legal_tokens):
+            (
+                self.legal_tokens_mask,
+                self.illegal_tokens_mask,
+                self.legal_token_ids_list,
+            ) = prepare_token_mask(self.tokenizer, self.constraint_config.legal_tokens)
+        else:
+            self.legal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
+            self.illegal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
+            self.legal_token_ids_list = None
+            print(f"Legal tokens file not found: {self.constraint_config.legal_tokens}")
+
         if constraint_config.apply_grammar:
             with open(constraint_config.grammar_path) as file:
                 grammar_str = file.read()
 
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.tokenizer)
-            compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=8)
-            compiled_grammar = compiler.compile_grammar(grammar_str)
-            self.xgr_processor = xgr.contrib.hf.LogitsProcessor(compiled_grammar)
-
-        else:
-            self.xgr_processor = None
-
-        if os.path.exists(self.constraint_config.legal_tokens):
-            self.legal_tokens_mask, self.illegal_tokens_mask = prepare_token_mask(
-                self.tokenizer, self.constraint_config.legal_tokens
+            parsed_grammar = parse_ebnf(grammar_str)
+            self.string_grammar = StringRecognizer(
+                parsed_grammar.grammar_encoding, parsed_grammar.symbol_table["root"]
             )
+
+            self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
+            self.grammar_processor = GrammarLimitedOneTimeLogitsProcessor(
+                parsed_grammar,
+                tokenizer=self.tokenizer,
+                nice_token_ids_list=self.legal_token_ids_list,
+            )
+
         else:
-            self.legal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
-            self.illegal_tokens_mask = torch.zeros(self.tokenizer.vocab_size, dtype=torch.bool)
-            print(f"Legal tokens file not found: {self.constraint_config.legal_tokens}")
+            self.grammar_processor = None
 
         self.vocab_alpha = float(self.constraint_config.vocab_alpha)
 
@@ -121,6 +137,8 @@ class ChemGFNModule(LightningModule):
             prompt_length=encoded_prompt.shape[1],
             model=self.net,
             tokenizer=self.tokenizer,
+            logits_processor=self.grammar_processor,
+            nice_token_ids_list=self.legal_token_ids_list,
         )
 
         (
@@ -132,7 +150,7 @@ class ChemGFNModule(LightningModule):
         ) = generate_and_return_termination_logprob(
             self.net,
             encoded_prompt,
-            xgr_processor=self.xgr_processor,
+            grammar_processor=self.grammar_processor,
             reward_fn=reward_fn,
             termination_token_id=self.end_of_sentence_token_id,
             min_len=self.constraint_config.min_sentence_len,

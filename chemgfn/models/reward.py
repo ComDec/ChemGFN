@@ -24,6 +24,7 @@ def score_fast(
     vocab_naughty_mask=None,
     vocab_alpha=-99,
     prompt_cache=None,
+    logits_processor=None,
 ):
     if prompt_cache is None:
         logits = model(encoded_input).logits
@@ -40,8 +41,12 @@ def score_fast(
         )
         logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
 
-    # get rid of the first few tokens
-    # I didn't see the necessity, maybe to ensure the initial state have a penalty
+    if logits_processor is not None:
+        modified_logits = torch.zeros_like(logits)
+        for batch in range(encoded_input.shape[0]):
+            modified_logits[batch] = logits_processor(
+                encoded_input[batch], logits[batch], ignore_length=skip_first
+            )
 
     # predict the logits of next tokens
     # the input tokens remove the last token: state[:-1], so the logits is for state[1:]
@@ -58,9 +63,22 @@ def score_fast(
     logprob = logits.log_softmax(-1)
     token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
 
-    # catch the log probability of each token in the input sequence
-    logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
+    # # catch the log probability of each token in the input sequence
+    # logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
 
+    batch_size, seq_length, vocab_size = logprob.size()
+    updated_logprob = logprob.clone()
+
+    for i in range(batch_size):
+        for j in range(seq_length - 1):
+            current_logprob = logprob[i, j]
+            if torch.isinf(current_logprob).any():
+                valid_indices = torch.where(~torch.isinf(current_logprob))[0]
+                sampled_index = valid_indices[torch.multinomial(torch.ones(len(valid_indices)), 1)]
+                updated_logprob[i, j, token_ids[i, j]] = current_logprob[sampled_index]
+
+    # 计算logPF
+    logPF = updated_logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
     logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
 
     reward = logprob[
@@ -186,7 +204,9 @@ class FrozenModelSentenceGivenPrompt:
         input_batch,
         prompt_length,
         model,
+        logits_processor: LogitsProcessorList,
         tokenizer: PreTrainedTokenizer,
+        nice_token_ids_list=None,
         vocab_nice_mask=None,
         vocab_naughty_mask=None,
         vocab_alpha=-99,
@@ -203,6 +223,7 @@ class FrozenModelSentenceGivenPrompt:
             vocab_nice_mask=vocab_nice_mask,
             vocab_naughty_mask=vocab_naughty_mask,
             vocab_alpha=vocab_alpha,
+            logits_processor=logits_processor,
         )
         reward /= self.temperature
         reward_unpenalized /= self.temperature

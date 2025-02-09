@@ -7,7 +7,7 @@ lora_config:
   lora_alpha: 32
   lora_dropout: 0.1
   bias: "none"
-  fan_in_fan_out: false
+  fan_in_fan_out: true
 
 # bnb_config:
 #   _target_: transformers.BitsAndBytesConfig
@@ -41,7 +41,7 @@ reward:
 
 reward_config:
   reward_temp_start: 1.0
-  reward_temp_end: 0.8
+  reward_temp_end: 1.0
   reward_temp_horizon: 10000
 
 reward_buffer:
@@ -53,7 +53,7 @@ constraint_config:
   min_sentence_len: 10
   max_sentence_len: 20
   grammar_path: ${paths.assets_dir}/number_grammars/odd_even.ebnf
-  apply_grammar: false
+  apply_grammar: true
   legal_tokens: ${paths.assets_dir}/token_list/number/allowed_gpt2_token
   vocab_alpha: "-inf"
 
