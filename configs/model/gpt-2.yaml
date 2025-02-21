@@ -1,20 +1,28 @@
 _target_: chemgfn.models.gfn.ChemGFNModule
 
-lora_config:
-  _target_: peft.LoraConfig
-  target_modules: ["c_attn"]
-  r: 32
-  lora_alpha: 32
-  lora_dropout: 0.1
-  bias: "none"
-  fan_in_fan_out: true
+
 
 # bnb_config:
 #   _target_: transformers.BitsAndBytesConfig
 #   load_in_8bit: true
 
-net:
-  _target_: transformers.AutoModelForCausalLM.from_pretrained
+net_config:
+  pretrained_model_name_or_path: "openai-community/gpt2"
+
+lora_config:
+  _target_: peft.LoraConfig
+  target_modules: ["c_attn"]
+  r: 32
+  task_type: "CAUSAL_LM"
+  lora_alpha: 32
+  lora_dropout: 0.1
+  inference_mode: false
+  bias: "none"
+  fan_in_fan_out: true
+
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
   pretrained_model_name_or_path: "openai-community/gpt2"
 
 optimizer:
@@ -37,12 +45,13 @@ reward:
   temperature: 1.0
   valid_sentence_alpha: 1.0
   sentence_validator:
-    _target_: chemgfn.models.reward.NumberValidator
+    _target_: chemgfn.models.reward.ParenthesesValidator
 
 reward_config:
   reward_temp_start: 1.0
   reward_temp_end: 1.0
   reward_temp_horizon: 10000
+  invalid_vocab_alpha: -50
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -52,10 +61,12 @@ reward_buffer:
 constraint_config:
   min_sentence_len: 10
   max_sentence_len: 20
-  grammar_path: ${paths.assets_dir}/number_grammars/odd_even.ebnf
+  grammar_path: ${paths.assets_dir}/parentheses_grammars/general.ebnf
   apply_grammar: true
-  legal_tokens: ${paths.assets_dir}/token_list/number/allowed_gpt2_token
-  vocab_alpha: "-inf"
+  processor_type: "prefix"
+  legal_tokens: ${paths.assets_dir}/token_list/parentheses/allowed_gpt2_token
+  naughty_vocab_alpha: "-inf"
+  parse_mode: "limited"
 
 training_mixed_config:
   subtb_lambda: 1.0

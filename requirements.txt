@@ -27,3 +27,4 @@ editdistance
 spacy
 pandas
 rdkit
+peft

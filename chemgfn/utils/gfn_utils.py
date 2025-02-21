@@ -66,13 +66,14 @@ def generate_and_return_termination_logprob(
     grammar_processor=None,
     vocab_nice_mask=None,
     vocab_naughty_mask=None,
-    vocab_alpha=float("-inf"),
+    naughty_vocab_alpha=float("-inf"),
+    invalid_vocab_alpha=-50,
     max_len=10,
     min_len=0,
     temperature=1.0,
+    reward_temperature=1.0,
     action_seq=None,
     skip_rewards=False,
-    tokenizer: PreTrainedTokenizer = None,
 ):
     # generate and return the probability of terminating at every step
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
@@ -83,12 +84,10 @@ def generate_and_return_termination_logprob(
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
 
-    # if grammar_processor is not None:
-    #     logits_processor = LogitsProcessorList([grammar_processor])
-    # else:
-    #     pass
-
-    logits_processor = LogitsProcessorList([])
+    if grammar_processor is not None:
+        logits_processor = LogitsProcessorList([grammar_processor])
+    else:
+        logits_processor = LogitsProcessorList([])
 
     for i in range(max_len + 1):
         output = model(input_ids=token_ids, past_key_values=past_key_values)
@@ -99,10 +98,14 @@ def generate_and_return_termination_logprob(
             with torch.no_grad():
                 # Consider using a more efficient logits processor
                 modified_logits = logits.clone().detach()
-                modified_logits = logits_processor(state, modified_logits)
+                if vocab_naughty_mask is not None:
+                    modified_logits[:, vocab_naughty_mask] += naughty_vocab_alpha
+
+                results = logits_processor(state, modified_logits, prompt_length=prompt_len)
+                modified_logits = results["masked_logits"]
 
                 if i < min_len:
-                    modified_logits[:, termination_token_id] += float("-inf")
+                    modified_logits[:, termination_token_id] = -torch.inf
 
                 # take the termination token as the last token
                 if i >= max_len:
@@ -110,13 +113,15 @@ def generate_and_return_termination_logprob(
                     mask[termination_token_id] = False
                     modified_logits[:, mask] = -torch.inf
 
-                if vocab_naughty_mask is not None:
-                    modified_logits[:, vocab_naughty_mask] += vocab_alpha
+                # if all the logits are -inf, then we set the probability of eos to 1
+                if (modified_logits == -torch.inf).all():
+                    modified_logits[:, termination_token_id] = 0
 
                 prob = (modified_logits / temperature).softmax(dim=-1)
 
                 # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
+
         else:
             if i >= action_seq.size(-1):
                 token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
@@ -168,9 +173,11 @@ def generate_and_return_termination_logprob(
         # which is guaranteed to be the termination token)
         log_r, log_r_unpenalized = reward_fn(
             state[:, :-1],
+            reward_temperature=reward_temperature,
             vocab_nice_mask=vocab_nice_mask,
             vocab_naughty_mask=vocab_naughty_mask,
-            vocab_alpha=vocab_alpha,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+            invalid_vocab_alpha=invalid_vocab_alpha,
         )
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized

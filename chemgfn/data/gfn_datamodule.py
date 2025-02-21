@@ -1,4 +1,5 @@
 import json
+import random
 import warnings
 
 import numpy as np
@@ -150,6 +151,89 @@ class NumberDataModule(LightningDataModule):
         num_train = int(len(numbers_list) * self.train_size)
         self.train_data = NumberDataSet(numbers_list[:num_train], self.tokenizer)
         self.val_data = NumberDataSet(numbers_list[num_train:], self.tokenizer)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_data,
+            shuffle=True,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_data,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+
+
+class ParenthesesDataSet(Dataset):
+    def __init__(self, prompts, tokenizer, total_size: int = 10000) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+        self.total_size = total_size
+
+        # Generate prompts by randomly sampling with replacement
+        self.prompts = random.choices(prompts, k=self.total_size)
+
+    def __len__(self):
+        return self.total_size
+
+    def __getitem__(self, index):
+        prompts = self.prompts[index]
+        encoded_prompt = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+        )
+        return {
+            "encoded_prompt": encoded_prompt["input_ids"],
+        }
+
+
+class ParenthesesDataModule(LightningDataModule):
+    def __init__(
+        self,
+        data_path,
+        tokenizer_name: str = "openai-community/gpt2",
+        prompt_size: int = 1,
+        total_size: int = 10000,
+        train_size: float = 0.95,
+        num_workers: int = 8,
+        pin_memory: bool = True,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.data_path = data_path
+        self.train_size = train_size
+        self.train_data = None
+        self.val_data = None
+
+        self.prompt_size = prompt_size
+        self.total_size = total_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    def prepare_data(self) -> None:
+        pass
+
+    def setup(self, stage):
+        with open(self.data_path) as f:
+            prompts = f.readlines()
+
+        # strip all the \n
+        prompts = [prompt.strip() for prompt in prompts][: self.prompt_size]
+
+        num_train = int(self.total_size * self.train_size)
+
+        self.train_data = ParenthesesDataSet(prompts, self.tokenizer, num_train)
+        self.val_data = ParenthesesDataSet(prompts, self.tokenizer, self.total_size - num_train)
 
     def train_dataloader(self):
         return DataLoader(
