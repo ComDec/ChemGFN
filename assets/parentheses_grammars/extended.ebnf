@@ -1,1 +1,5 @@
-root ::= "" | "(" root ")" | "[" root "]" | "<" root ">" | "()" root | "[]" root | "<>" root
+root ::= "" | SUB root
+SUB ::=  "(" SUB ")" | "[" SUB "]" | "<" SUB ">" | ""
+
+
+()()

@@ -10,12 +10,12 @@ import torch.utils
 import torch.utils.data
 from lightning import LightningModule
 from peft import LoraConfig, PeftModel, get_peft_model
-from sympy import im
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
 from transformers_cfg.generation.logits_process import (
     GrammarIncrementalLogitsProcessorForNumberOnly,
     GrammarIncrementalLogitsProcessorGeneral,
     GrammarLimitedOneTimeLogitsProcessor,
+    GrammarLogitsProcessorPartheseness,
 )
 from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
 from transformers_cfg.parser import parse_ebnf
@@ -99,7 +99,6 @@ class ChemGFNModule(LightningModule):
             self.string_grammar = StringRecognizer(
                 parsed_grammar.grammar_encoding, parsed_grammar.symbol_table["root"]
             )
-
             self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
             self.grammar_processor = GrammarLimitedOneTimeLogitsProcessor(
                 parsed_grammar,
@@ -109,6 +108,13 @@ class ChemGFNModule(LightningModule):
             )
             if self.constraint_config.processor_type == "prefix":
                 self.pre_grammar_processor = GrammarIncrementalLogitsProcessorGeneral(
+                    parsed_grammar,
+                    tokenizer=self.tokenizer,
+                    nice_token_ids_list=self.legal_token_ids_list,
+                    execution_mode=self.constraint_config.parse_mode,
+                )
+            if self.constraint_config.processor_type == "partheseness":
+                self.pre_grammar_processor = GrammarLogitsProcessorPartheseness(
                     parsed_grammar,
                     tokenizer=self.tokenizer,
                     nice_token_ids_list=self.legal_token_ids_list,

@@ -85,6 +85,10 @@ def generate_and_return_termination_logprob(
     past_key_values = None  # For caching hidden states during generation
 
     if grammar_processor is not None:
+        try:
+            grammar_processor.reset()
+        except:
+            pass
         logits_processor = LogitsProcessorList([grammar_processor])
     else:
         logits_processor = LogitsProcessorList([])
@@ -96,26 +100,19 @@ def generate_and_return_termination_logprob(
 
         if action_seq is None:
             with torch.no_grad():
-                # Consider using a more efficient logits processor
                 modified_logits = logits.clone().detach()
-                if vocab_naughty_mask is not None:
-                    modified_logits[:, vocab_naughty_mask] += naughty_vocab_alpha
 
+                # 应用 logits processor
                 results = logits_processor(state, modified_logits, prompt_length=prompt_len)
                 modified_logits = results["masked_logits"]
 
                 if i < min_len:
                     modified_logits[:, termination_token_id] = -torch.inf
 
-                # take the termination token as the last token
-                if i >= max_len:
-                    mask = [True] * modified_logits.shape[1]
-                    mask[termination_token_id] = False
-                    modified_logits[:, mask] = -torch.inf
-
-                # if all the logits are -inf, then we set the probability of eos to 1
-                if (modified_logits == -torch.inf).all():
-                    modified_logits[:, termination_token_id] = 0
+                elif i >= max_len:
+                    mask = torch.ones_like(modified_logits, dtype=torch.bool)
+                    mask[:, termination_token_id] = False  # EOS token保留
+                    modified_logits[mask] = -torch.inf
 
                 prob = (modified_logits / temperature).softmax(dim=-1)
 

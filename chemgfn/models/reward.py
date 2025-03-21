@@ -14,6 +14,7 @@ from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
 RDLogger.DisableLog("rdApp.*")
 
 
+@torch.no_grad()
 def score_fast(
     model,
     encoded_input,
@@ -41,52 +42,16 @@ def score_fast(
         logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
 
     # predict the logits of next tokens
-    # the input tokens remove the last token: state[:-1], so the logits is for state[1:]
-    logits = logits.detach()
-    logits = logits[:, skip_first - 1 :]
+    logits = logits.detach()[:, skip_first - 1 :]
 
     # score the log probability of the input sequence while ignoring termination and padding tokens
-    if vocab_nice_mask is not None:
-        # add vocab_alpha to the logits of the unmasked vocab items
-        logits[:, :, ~vocab_nice_mask] += naughty_vocab_alpha
-    elif vocab_naughty_mask is not None:
-        # add vocab_alpha to the logits of the masked vocab items
-        logits[:, :, vocab_naughty_mask] += naughty_vocab_alpha
+    # if vocab_naughty_mask is not None:
+    #     logits[:, :, vocab_naughty_mask] += naughty_vocab_alpha
 
-    # add reward temperature
+    # Add reward temperature
     logits /= reward_temperature
     logprob = logits.log_softmax(-1)
     token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
-
-    # # catch the log probability of each token in the input sequence
-    # logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
-
-    # strategy 0: replace -inf with P(eos), random sample token_is'prob
-    # batch_size, seq_length, vocab_size = logprob.size()
-    # updated_logprob = logprob.clone()
-
-    # for i in range(batch_size):
-    #     for j in range(seq_length - 1):
-    #         current_logprob = logprob[i, j]
-    #         if torch.isinf(current_logprob).any():
-    #             valid_indices = torch.where(~torch.isinf(current_logprob))[0]
-    #             sampled_index = valid_indices[torch.multinomial(torch.ones(len(valid_indices)), 1)]
-    #             updated_logprob[i, j, token_ids[i, j]] = current_logprob[sampled_index]
-
-    # # 计算logPF
-    # logPF = updated_logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
-
-    # strategy1: repalce -inf with P(eos), add temperature control
-    # updated_logprob = logprob.clone()
-
-    # # Replace -inf values with termination token probability
-    # inf_mask = torch.isinf(updated_logprob)
-    # if inf_mask.any():
-    #     termination_probs = logprob[:, :, termination_token_id].unsqueeze(-1)  # Get termination token probabilities
-    #     updated_logprob[inf_mask] = termination_probs.expand_as(updated_logprob)[inf_mask]
-
-    # # Calculate logPF using updated probabilities
-    # logPF = updated_logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
 
     logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
     logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
@@ -167,28 +132,60 @@ def number_reward(sampled_numbers):
         return 1
 
 
-def validate_brackets(s: torch.Tensor, tokenizer: PreTrainedTokenizer) -> bool:
-    stack = []
-    pairs = {")": "(", "]": "[", ">": "<"}
+class BracketValidator:
+    def __init__(self, tokenizer: PreTrainedTokenizer):
+        # 定义括号映射关系（右括号 -> 左括号）
+        self.bracket_map = {")": "(", "]": "[", ">": "<"}
+        self.left_brackets = set(self.bracket_map.values())
+        self.right_brackets = set(self.bracket_map.keys())
+        self.tokenizer = tokenizer
 
-    decoded_list = []
-    # remove the eos token
-    for t in s:
-        if t.item() != tokenizer.eos_token_id:
-            decoded_list.append(tokenizer.decode(t))
-        else:
-            break
+    def preprocess(self, s: str) -> tuple[str, bool]:
+        decoded_list = []
+        # remove the eos token
+        total_length = len(s)
+        for idx, t in enumerate(s):
+            if t.item() != self.tokenizer.eos_token_id:
+                decoded_list.append(self.tokenizer.decode(t))
+            else:
+                break
 
-    # think of "<<" due to bpe, we need to re-concatenate the tokens
-    decoded_string = "".join(decoded_list)
-    for char in list(decoded_string):
-        if char in pairs.values():
-            stack.append(char)
-        elif char in pairs.keys():
-            if not stack or stack[-1] != pairs[char]:
-                return False
-            stack.pop()
-    return not stack
+        # think of "<<" due to bpe, we need to re-concatenate the tokens
+        decoded_string = "".join(decoded_list)
+
+        # if total_length > idx, it means the sentence is termiated
+        return decoded_string, total_length > idx
+
+    def is_valid(self, s: str) -> bool:
+        """验证完整括号匹配"""
+        s, early_terminated = self.preprocess(s)
+        stack = []
+        for char in s:
+            if char in self.left_brackets:
+                stack.append(char)
+            elif char in self.right_brackets:
+                if not stack or stack[-1] != self.bracket_map[char]:
+                    return False
+                stack.pop()
+            else:
+                return False  # 包含非括号字符
+        valid = not stack
+        return valid
+
+    def is_valid_prefix(self, s: str) -> bool:
+        """验证有效前缀"""
+        s, early_terminated = self.preprocess(s)
+        stack = []
+        for char in s:
+            if char in self.left_brackets:
+                stack.append(char)
+            elif char in self.right_brackets:
+                if not stack or stack[-1] != self.bracket_map[char]:
+                    return False
+                stack.pop()
+            else:
+                return False  # 包含非括号字符
+        return True
 
 
 def number_accuracy(generated_tokens, tokenizer):
@@ -208,13 +205,6 @@ def number_accuracy(generated_tokens, tokenizer):
     for batch in range(generated_tokens.shape[0]):
         correct += number_reward(numbers_list[batch])
 
-    return correct / generated_tokens.shape[0]
-
-
-def parentheses_accuracy(generated_tokens, tokenizer):
-    correct = 0
-    for batch in range(generated_tokens.shape[0]):
-        correct += float(validate_brackets(generated_tokens[batch], tokenizer))
     return correct / generated_tokens.shape[0]
 
 
@@ -254,10 +244,16 @@ class ParenthesesValidator(SentenceValidator):
         super().__init__(*args, **kwargs)
 
     def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
-        return parentheses_accuracy(sentences, tokenizer)
+        validator = BracketValidator(tokenizer)
+        correct = 0
+        for batch in range(sentences.shape[0]):
+            valid = validator.is_valid(sentences[batch])
+            correct += valid
+        return correct / sentences.shape[0]
 
     def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
         termination_token_id = tokenizer.eos_token_id
+        validator = BracketValidator(tokenizer)
 
         invalid = torch.zeros(
             sentences.shape[0],
@@ -270,13 +266,13 @@ class ParenthesesValidator(SentenceValidator):
             for j in range(sentences.shape[1]):
                 if sentences[i, j] == termination_token_id:
                     break  # Only unterminated sentences get a reward
-                if validate_brackets(sentences[i, : j + 1], tokenizer):
-                    invalid[i, j + 1] = False
+
+                valid = validator.is_valid(sentences[i, : j + 1])
+                if valid:
+                    # current step is valid and yield eos now, so the model should terminate now.
+                    invalid[i, j + 1] = 0
                 else:
-                    invalid[i, j + 1] = True
-            # if the final sentence is valid, the whole sentence traj. should be valid
-            if validate_brackets(sentences[i, :], tokenizer):
-                invalid[i, :] = False
+                    invalid[i, j + 1] = 1
 
         return invalid
 
@@ -326,8 +322,18 @@ class FrozenModelSentenceGivenPrompt:
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
             invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
-            invalid = invalid * invalid_vocab_alpha
+            invalid_value = invalid * invalid_vocab_alpha
+
             # TODO: max or mean
-            reward = torch.min(reward, invalid)
+            # reward = reward + invalid
+
+            reward_min_value = torch.min(reward, dim=-1).values
+            invalid_min_value = reward_min_value.unsqueeze(-1) * invalid * 1.05
+
+            # v0
+            reward = torch.min(reward, invalid_value)
+
+            # v1
+            # reward = torch.min(reward, invalid_min_value)
 
         return reward, reward_unpenalized

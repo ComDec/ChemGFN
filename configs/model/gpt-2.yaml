@@ -12,9 +12,9 @@ net_config:
 lora_config:
   _target_: peft.LoraConfig
   target_modules: ["c_attn"]
-  r: 32
+  r: 64
   task_type: "CAUSAL_LM"
-  lora_alpha: 32
+  lora_alpha: 16
   lora_dropout: 0.1
   inference_mode: false
   bias: "none"
@@ -48,10 +48,10 @@ reward:
     _target_: chemgfn.models.reward.ParenthesesValidator
 
 reward_config:
-  reward_temp_start: 1.0
-  reward_temp_end: 1.0
-  reward_temp_horizon: 10000
-  invalid_vocab_alpha: -50
+  reward_temp_start: 2
+  reward_temp_end: 0.8
+  reward_temp_horizon: 50000
+  invalid_vocab_alpha: -80
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -60,12 +60,12 @@ reward_buffer:
 
 constraint_config:
   min_sentence_len: 10
-  max_sentence_len: 20
+  max_sentence_len: 50
   grammar_path: ${paths.assets_dir}/parentheses_grammars/general.ebnf
   apply_grammar: true
   processor_type: "prefix"
   legal_tokens: ${paths.assets_dir}/token_list/parentheses/allowed_gpt2_token
-  naughty_vocab_alpha: "-inf"
+  naughty_vocab_alpha: -50
   parse_mode: "limited"
 
 training_mixed_config:
