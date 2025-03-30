@@ -44,6 +44,8 @@ reward:
   _target_: chemgfn.models.reward.FrozenModelSentenceGivenPrompt
   temperature: 1.0
   valid_sentence_alpha: 1.0
+  start_ratio: 0.2
+  end_ratio: 1.2
   sentence_validator:
     _target_: chemgfn.models.reward.ParenthesesValidator
 
@@ -60,7 +62,7 @@ reward_buffer:
 
 constraint_config:
   min_sentence_len: 10
-  max_sentence_len: 50
+  max_sentence_len: 20
   grammar_path: ${paths.assets_dir}/parentheses_grammars/general.ebnf
   apply_grammar: true
   processor_type: "prefix"

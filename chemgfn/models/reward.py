@@ -283,10 +283,14 @@ class FrozenModelSentenceGivenPrompt:
         sentence_validator: SentenceValidator,
         temperature=1.0,
         valid_sentence_alpha=None,
+        start_ratio: float = 0.2,
+        end_ratio: float = 1.2,
     ):
         self.temperature = temperature
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
+        self.start_ratio = start_ratio
+        self.end_ratio = end_ratio
 
     def score(
         self,
@@ -322,18 +326,66 @@ class FrozenModelSentenceGivenPrompt:
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
             invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
-            invalid_value = invalid * invalid_vocab_alpha
 
             # TODO: max or mean
             # reward = reward + invalid
 
-            reward_min_value = torch.min(reward, dim=-1).values
-            invalid_min_value = reward_min_value.unsqueeze(-1) * invalid * 1.05
-
             # v0
-            reward = torch.min(reward, invalid_value)
+            # invalid_value = invalid * invalid_vocab_alpha
+            # reward = torch.min(reward, invalid_value)
 
             # v1
+            # reward_min_value = torch.min(reward, dim=-1).values
+            # invalid_min_value = reward_min_value.unsqueeze(-1) * invalid * 1.05
             # reward = torch.min(reward, invalid_min_value)
+
+            # v3
+            # reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
+
+            # start_values = reward_min * 0.2
+            # end_values = reward_min * 1.2
+
+            # invalid_list = []
+            # for i in range(reward.shape[0]):
+            #     seq = torch.linspace(
+            #         start=start_values[i],
+            #         end=end_values[i],
+            #         steps=reward.shape[1],  # 直接使用L作为步数
+            #         device=reward.device
+            #     )
+            #     invalid_list.append(seq)
+
+            # invalid_value = torch.stack(invalid_list, dim=0)
+
+            # reward = torch.min(reward, invalid_value * invalid)
+
+            # v4
+            # 确保已经定义了prompt_len，例如：prompt_len = ...（某个整数）
+            reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
+            start_values = reward_min * self.start_ratio
+            end_values = reward_min * self.end_ratio
+
+            invalid_list = []
+            for i in range(reward.shape[0]):
+                # 前prompt_len个元素固定为start_values[i]
+                prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
+                # 生成后面的线性增长部分
+                if reward.shape[1] > prompt_length:
+                    suffix = torch.linspace(
+                        start=start_values[i],
+                        end=end_values[i],
+                        steps=reward.shape[1] - prompt_length,
+                        device=reward.device,
+                    )
+                    seq = torch.cat([prefix, suffix])
+                else:
+                    # 如果prompt_len >= L，直接取prefix的前L个元素
+                    seq = prefix[: reward.shape[1]]
+                invalid_list.append(seq)
+
+            invalid_value = torch.stack(invalid_list, dim=0)  # 形状 [B, L]
+
+            # 假设invalid是一个与reward形状相同的掩码张量（值为0或1）
+            reward = torch.min(reward, invalid_value * invalid)
 
         return reward, reward_unpenalized
