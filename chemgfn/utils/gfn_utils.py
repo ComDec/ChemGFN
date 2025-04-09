@@ -101,11 +101,9 @@ def generate_and_return_termination_logprob(
         if action_seq is None:
             with torch.no_grad():
                 modified_logits = logits.clone().detach()
-
                 # 应用 logits processor
                 results = logits_processor(state, modified_logits, prompt_length=prompt_len)
                 modified_logits = results["masked_logits"]
-
                 if i < min_len:
                     modified_logits[:, termination_token_id] = -torch.inf
 
@@ -219,8 +217,7 @@ def modified_subtb_loss(
         # Accumulate total weight for normalization
         total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
     # Normalize the loss by the total weight
-    batch_loss /= total_lambda
-
+    batch_loss /= total_lambda + 1e-9
     return batch_loss
 
 

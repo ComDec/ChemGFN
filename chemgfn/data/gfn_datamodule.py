@@ -14,10 +14,14 @@ warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
 
 class SMILESDataPipe(Dataset):
-    def __init__(self, prompts, tokenizer) -> None:
+    def __init__(self, prompts, tokenizer, total_size: int = 10000) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.prompts = prompts
+        self.total_size = total_size
+
+        # Generate prompts by randomly sampling with replacement
+        self.prompts = random.choices(prompts, k=self.total_size)
 
     def __len__(self):
         return len(self.prompts)
@@ -32,19 +36,27 @@ class SMILESDataPipe(Dataset):
         ]
 
     def __getitem__(self, index):
-        _prompt = (
-            SMILES_PROMPTS_AHEAD
-            + self.prompts[index]
-            + BASE_PROMPTS_EXAMPLES
-            + SMILES_PROMPTS_BEHIND
-        )
-        message = self.generate_message(_prompt)
-        input_ids = self.tokenizer.apply_chat_template(
-            message,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
-        return input_ids
+        # _prompt = (
+        #     SMILES_PROMPTS_AHEAD
+        #     + self.prompts[index]
+        #     + BASE_PROMPTS_EXAMPLES
+        #     + SMILES_PROMPTS_BEHIND
+        # )
+
+        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
+
+        # message = self.generate_message(_prompt)
+        # encoded_prompt = self.tokenizer.apply_chat_template(
+        #     message,
+        #     add_generation_prompt=True,
+        #     return_tensors="pt",
+        # )
+
+        encoded_prompt = self.tokenizer(self.prompts[index], return_tensors="pt")
+
+        return {
+            "encoded_prompt": encoded_prompt["input_ids"],
+        }
 
 
 class SMILESDataModule(LightningDataModule):
@@ -52,6 +64,8 @@ class SMILESDataModule(LightningDataModule):
         self,
         data_path,
         tokenizer_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+        prompt_size: int = 1,
+        total_size: int = 10000,
         train_size: float = 0.95,
         num_workers: int = 8,
         pin_memory: bool = True,
@@ -64,6 +78,9 @@ class SMILESDataModule(LightningDataModule):
         self.train_data = None
         self.val_data = None
 
+        self.prompt_size = prompt_size
+        self.total_size = total_size
+
         self.num_workers = num_workers
         self.pin_memory = pin_memory
 
@@ -74,12 +91,14 @@ class SMILESDataModule(LightningDataModule):
 
     def setup(self, stage):
         with open(self.data_path) as f:
-            data = json.load(f)
-        prompts = [x["instruction"] for x in data]
+            prompts = f.readlines()
 
-        num_train = int(len(prompts) * self.train_size)
-        self.train_data = SMILESDataPipe(prompts[:num_train], self.tokenizer)
-        self.val_data = SMILESDataPipe(prompts[num_train:], self.tokenizer)
+        # strip all the \n
+        prompts = [prompt.strip() for prompt in prompts][: self.prompt_size]
+        num_train = int(self.total_size * self.train_size)
+
+        self.train_data = SMILESDataPipe(prompts, self.tokenizer, num_train)
+        self.val_data = SMILESDataPipe(prompts, self.tokenizer, self.total_size - num_train)
 
     def train_dataloader(self):
         return DataLoader(

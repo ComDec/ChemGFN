@@ -1,31 +1,38 @@
 _target_: chemgfn.models.gfn.ChemGFNModule
 
-lora_config:
-  _target_: peft.LoraConfig
-  # target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
-  target_modules: ["q_proj", "k_proj"]
-  r: 16
-  lora_alpha: 32
-  lora_dropout: 0.1
-  bias: "none"
-  fan_in_fan_out: false
+
 
 # bnb_config:
 #   _target_: transformers.BitsAndBytesConfig
 #   load_in_8bit: true
 
 net_config:
-  pretrained_model_name_or_path: "meta-llama/Meta-Llama-3-8B-Instruct"
+  pretrained_model_name_or_path: "openai-community/gpt2"
+
+lora_config:
+  _target_: peft.LoraConfig
+  target_modules: ["c_attn"]
+  r: 16
+  task_type: "CAUSAL_LM"
+  lora_alpha: 32
+  lora_dropout: 0.1
+  inference_mode: false
+  bias: "none"
+  fan_in_fan_out: true
+
+
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: "openai-community/gpt2"
 
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.0001
+  lr: 0.001
   weight_decay: 0.01
 
-tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: "meta-llama/Meta-Llama-3-8B-Instruct"
+# If use bnb, plz use
+# _target_: bitsandbytes.optim.PagedAdamW8bit
 
 scheduler:
   _target_: torch.optim.lr_scheduler.PolynomialLR
@@ -40,7 +47,7 @@ reward:
   invalid_start_ratio: 0.2
   invalid_end_ratio: 1.2
   sentence_validator:
-    _target_: chemgfn.models.reward.RDKitValidator
+    _target_: chemgfn.models.reward.NumberValidator
 
 reward_config:
   reward_temp_start: 2
@@ -50,16 +57,16 @@ reward_config:
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
-  buffer_size: 50
+  buffer_size: 100
   sim_tolerance: 0.25
 
 constraint_config:
   min_sentence_len: 10
   max_sentence_len: 20
-  grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
+  grammar_path: ${paths.assets_dir}/number_grammars/odd_even_old.ebnf
   apply_grammar: true
-  processor_type: "prefix"
-  legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3_8B_Instruct_tokens
+  processor_type: "number_only"
+  legal_tokens: ${paths.assets_dir}/token_list/number/allowed_gpt2_token
   naughty_vocab_alpha: -50
   parse_mode: "limited"
 

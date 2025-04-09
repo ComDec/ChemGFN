@@ -1,18 +1,9 @@
 _target_: chemgfn.models.gfn.ChemGFNModule
 
-
-
-# bnb_config:
-#   _target_: transformers.BitsAndBytesConfig
-#   load_in_8bit: true
-
-net_config:
-  pretrained_model_name_or_path: "openai-community/gpt2"
-
 lora_config:
   _target_: peft.LoraConfig
   target_modules: ["c_attn"]
-  r: 64
+  r: 8
   task_type: "CAUSAL_LM"
   lora_alpha: 16
   lora_dropout: 0.1
@@ -20,10 +11,12 @@ lora_config:
   bias: "none"
   fan_in_fan_out: true
 
+# bnb_config:
+#   _target_: transformers.BitsAndBytesConfig
+#   load_in_8bit: true
 
-tokenizer:
-  _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: "openai-community/gpt2"
+net_config:
+  pretrained_model_name_or_path: "EleutherAI/gpt-j-6b"
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -31,8 +24,9 @@ optimizer:
   lr: 0.001
   weight_decay: 0.01
 
-# If use bnb, plz use
-# _target_: bitsandbytes.optim.PagedAdamW8bit
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: "EleutherAI/gpt-j-6b"
 
 scheduler:
   _target_: torch.optim.lr_scheduler.PolynomialLR
@@ -44,10 +38,10 @@ reward:
   _target_: chemgfn.models.reward.FrozenModelSentenceGivenPrompt
   temperature: 1.0
   valid_sentence_alpha: 1.0
-  start_ratio: 0.2
-  end_ratio: 1.2
+  invalid_start_ratio: 0.2
+  invalid_end_ratio: 1.2
   sentence_validator:
-    _target_: chemgfn.models.reward.ParenthesesValidator
+    _target_: chemgfn.models.reward.RDKitValidator
 
 reward_config:
   reward_temp_start: 2
@@ -63,10 +57,10 @@ reward_buffer:
 constraint_config:
   min_sentence_len: 10
   max_sentence_len: 20
-  grammar_path: ${paths.assets_dir}/parentheses_grammars/general.ebnf
+  grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
   apply_grammar: true
   processor_type: "prefix"
-  legal_tokens: ${paths.assets_dir}/token_list/parentheses/allowed_gpt2_token
+  legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_gptj_6B_token
   naughty_vocab_alpha: -50
   parse_mode: "limited"
 
@@ -76,6 +70,6 @@ training_mixed_config:
   pf_temp_low: 0.5
   pf_temp_prob: 0.666
   use_buffer_prob: 0.25
-  n_samples: 4
+  n_samples: 8
 
 compile: false

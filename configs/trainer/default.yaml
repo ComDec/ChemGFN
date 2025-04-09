@@ -2,8 +2,9 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-min_epochs: 1 # prevents early stopping
-max_epochs: 10
+# min_epochs: 1 # prevents early stopping
+# max_steps: 100
+max_epochs: 50
 
 accelerator: gpu
 devices: 1
@@ -21,3 +22,7 @@ deterministic: False
 precision: bf16-true
 
 accumulate_grad_batches: 1
+
+# profiler:
+#   _target_: lightning.pytorch.profilers.PyTorchProfiler
+#   sort_by_key: "cpu_time_total"

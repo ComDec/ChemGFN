@@ -93,15 +93,44 @@ class RDKitValidator(SentenceValidator):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
+    @staticmethod
+    def smiles_accuracy(generated_tokens, tokenizer):
+        smiles_list = []
+
+        for batch in range(generated_tokens.shape[0]):
+            string = []
+            for t in generated_tokens[batch]:
+                if t.item() != tokenizer.eos_token_id:
+                    string.append(tokenizer.decode(t))
+                else:
+                    break
+            smiles_list.append(string)
+
+        correct = 0
+
+        for batch in range(generated_tokens.shape[0]):
+            try:
+                tokens = "".join(smiles_list[batch])
+                mol = Chem.MolFromSmiles(tokens)
+            except:
+                mol = None
+
+            correct += 1 if mol else 0
+
+        return {"acc": correct / generated_tokens.shape[0]}
+
+    def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
+        return self.smiles_accuracy(sentences, tokenizer)
+
     def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
         termination_token_id = tokenizer.eos_token_id
 
-        valid = torch.zeros(
+        invalid = torch.zeros(
             sentences.shape[0],
             sentences.shape[1] + 1,
             device=sentences.device,
         )
-        valid[:, 0] = 1  # Empty sentence is never valid
+        invalid[:, 0] = 1  # Empty sentence is never valid
 
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
@@ -110,15 +139,11 @@ class RDKitValidator(SentenceValidator):
                 tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
                 mol = Chem.MolFromSmiles(tokens)
                 if mol:
-                    # if recover a SMILES from invalid way, give a high reward
-                    if valid[i, j] < 10:
-                        # TODO: this is a hard-coded value, should be changed
-                        valid[i, j + 1] = 10
-                    else:
-                        valid[i, j + 1] = 5
+                    invalid[i, j + 1] = 0
                 else:
-                    valid[i, j + 1] = 1 + random.random()
-        return valid
+                    invalid[i, j + 1] = 1
+
+        return invalid
 
 
 def number_reward(sampled_numbers):
@@ -187,6 +212,27 @@ class BracketValidator:
                 return False  # 包含非括号字符
         return True
 
+    def has_multiple_nesting(self, s: str) -> bool:
+        """检查有效括号字符串是否存在至少两层的嵌套"""
+        s, early_terminated = self.preprocess(s)
+        stack = []
+        has_nesting = False
+        for char in s:
+            if char in self.left_brackets:
+                stack.append(char)
+            elif char in self.right_brackets:
+                if not stack or stack[-1] != self.bracket_map[char]:
+                    return False  # 括号不匹配，结构无效
+                stack.pop()
+                # 检查闭合后栈的深度是否仍有未闭合的左括号
+                if len(stack) >= 1:
+                    has_nesting = True
+            else:
+                return False  # 包含非括号字符，结构无效
+        if stack:  # 检查是否所有括号已闭合
+            return False
+        return has_nesting
+
 
 def number_accuracy(generated_tokens, tokenizer):
     numbers_list = []
@@ -201,7 +247,6 @@ def number_accuracy(generated_tokens, tokenizer):
         numbers_list.append(number)
 
     correct = 0
-
     for batch in range(generated_tokens.shape[0]):
         correct += number_reward(numbers_list[batch])
 
@@ -213,7 +258,7 @@ class NumberValidator(SentenceValidator):
         super().__init__(*args, **kwargs)
 
     def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
-        return number_accuracy(sentences, tokenizer)
+        return {"acc": number_accuracy(sentences, tokenizer)}
 
     def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
         termination_token_id = tokenizer.eos_token_id
@@ -246,10 +291,14 @@ class ParenthesesValidator(SentenceValidator):
     def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
         validator = BracketValidator(tokenizer)
         correct = 0
+        nest = 0
         for batch in range(sentences.shape[0]):
             valid = validator.is_valid(sentences[batch])
+            nested = validator.has_multiple_nesting(sentences[batch])
             correct += valid
-        return correct / sentences.shape[0]
+            nest += int(nested)
+
+        return {"acc": correct / sentences.shape[0], "nest": nest / sentences.shape[0]}
 
     def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
         termination_token_id = tokenizer.eos_token_id
@@ -283,14 +332,14 @@ class FrozenModelSentenceGivenPrompt:
         sentence_validator: SentenceValidator,
         temperature=1.0,
         valid_sentence_alpha=None,
-        start_ratio: float = 0.2,
-        end_ratio: float = 1.2,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
     ):
         self.temperature = temperature
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
-        self.start_ratio = start_ratio
-        self.end_ratio = end_ratio
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
 
     def score(
         self,
@@ -362,30 +411,26 @@ class FrozenModelSentenceGivenPrompt:
             # v4
             # 确保已经定义了prompt_len，例如：prompt_len = ...（某个整数）
             reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
-            start_values = reward_min * self.start_ratio
-            end_values = reward_min * self.end_ratio
+
+            start_values = reward_min * self.invalid_start_ratio
+            end_values = reward_min * self.invalid_end_ratio
 
             invalid_list = []
             for i in range(reward.shape[0]):
-                # 前prompt_len个元素固定为start_values[i]
-                prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
-                # 生成后面的线性增长部分
-                if reward.shape[1] > prompt_length:
-                    suffix = torch.linspace(
-                        start=start_values[i],
-                        end=end_values[i],
-                        steps=reward.shape[1] - prompt_length,
-                        device=reward.device,
-                    )
-                    seq = torch.cat([prefix, suffix])
-                else:
-                    # 如果prompt_len >= L，直接取prefix的前L个元素
-                    seq = prefix[: reward.shape[1]]
+                # prompt_len: large enough value
+                # prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
+
+                # generate linear incresement part for the rest of the sequence
+                seq = torch.linspace(
+                    start=start_values[i],
+                    end=end_values[i],
+                    steps=reward.shape[1],
+                    device=reward.device,
+                )
                 invalid_list.append(seq)
 
-            invalid_value = torch.stack(invalid_list, dim=0)  # 形状 [B, L]
+            invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
 
-            # 假设invalid是一个与reward形状相同的掩码张量（值为0或1）
             reward = torch.min(reward, invalid_value * invalid)
 
         return reward, reward_unpenalized

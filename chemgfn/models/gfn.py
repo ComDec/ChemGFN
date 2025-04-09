@@ -4,14 +4,17 @@ import sys
 from functools import partial
 from typing import Any, Dict, Tuple
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 import torch.utils
 import torch.utils.data
+import wandb
 from lightning import LightningModule
-from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 from transformers_cfg.generation.logits_process import (
+    GrammarConstrainedLogitsProcessor,
     GrammarIncrementalLogitsProcessorForNumberOnly,
     GrammarIncrementalLogitsProcessorGeneral,
     GrammarLimitedOneTimeLogitsProcessor,
@@ -60,7 +63,6 @@ class ChemGFNModule(LightningModule):
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(ignore=["net"])
-
         model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
         self.net = get_peft_model(model, lora_config)
         self.tokenizer = tokenizer
@@ -127,6 +129,10 @@ class ChemGFNModule(LightningModule):
                     nice_token_ids_list=self.legal_token_ids_list,
                     execution_mode=self.constraint_config.parse_mode,
                 )
+            elif self.constraint_config.processor_type == "general":
+                self.pre_grammar_processor = GrammarConstrainedLogitsProcessor(
+                    self.grammar,
+                )
             elif self.constraint_config.processor_type == "none":
                 self.pre_grammar_processor = None
 
@@ -139,6 +145,10 @@ class ChemGFNModule(LightningModule):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.compile = compile
+
+        # metrics
+        self.train_sentence_length = []
+        self.train_samples = []
 
     def set_probes(self, train_probes, val_probes):
         self.train_probes = train_probes
@@ -260,12 +270,31 @@ class ChemGFNModule(LightningModule):
             prompt_len=len(encoded_prompt[0]),
         )
 
-        acc = self.reward.sentence_validator.accuracy(
+        validator_metric_dict = self.reward.sentence_validator.accuracy(
             generated_text[:, encoded_prompt.shape[-1] :], self.tokenizer
         )
+        self.train_sentence_length.append(sentence_len.detach().cpu())
 
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+
+        if batch_idx % 10 == 0:
+            if self.constraint_config.processor_type == "number_only":
+                text = []
+                raw_tokens = generated_text[0, encoded_prompt.shape[-1] :]
+                for t in raw_tokens:
+                    if t.item() != self.tokenizer.eos_token_id:
+                        text.append(self.tokenizer.decode(t))
+                    else:
+                        break
+                self.train_samples.append(",".join(text))
+            else:
+                self.train_samples.append(
+                    self.tokenizer.decode(
+                        generated_text[0, encoded_prompt.shape[-1] :], skip_special_tokens=True
+                    )
+                )
+
         self.log(
             "train/loss",
             loss,
@@ -274,7 +303,14 @@ class ChemGFNModule(LightningModule):
             prog_bar=True,
         )
 
-        self.log("train/number_accuracy", acc, on_step=True, sync_dist=True, prog_bar=True)
+        for key, value in validator_metric_dict.items():
+            self.log(
+                f"train/validator_{key}",
+                value,
+                on_step=True,
+                sync_dist=True,
+                prog_bar=True,
+            )
 
         self.log(
             "train/logR",
@@ -344,14 +380,20 @@ class ChemGFNModule(LightningModule):
             prompt_len=len(encoded_prompt[0]),
         )
 
-        acc = self.reward.sentence_validator.accuracy(
+        validator_metric_dict = self.reward.sentence_validator.accuracy(
             generated_text[:, encoded_prompt.shape[-1] :], self.tokenizer
         )
 
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
 
-        self.log("val/number_accuracy", acc, sync_dist=True, prog_bar=True)
+        for key, value in validator_metric_dict.items():
+            self.log(
+                f"val/validator_{key}",
+                value,
+                sync_dist=True,
+                on_epoch=True,
+            )
 
         self.log(
             "val/loss",
@@ -384,14 +426,10 @@ class ChemGFNModule(LightningModule):
             log_ps_unpenalized.max(),
             sync_dist=True,
         )
-        self.log(
-            "val/sentence_len",
-            sentence_len.float().mean(),
-            sync_dist=True,
-        )
 
-    def on_train_batch_start(self, batch, batch_idx):
-        # Update scheduled quantities
+    def on_train_batch_start(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> None:
         reward_temp = self.get_reward_temp_at_step(self.global_step)
         lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
@@ -399,6 +437,32 @@ class ChemGFNModule(LightningModule):
 
         for pg in self.optimizers().param_groups:
             pg["lr"] = lr
+
+    def on_train_epoch_end(self):
+        df = pd.DataFrame(self.train_samples, columns=["Sampled sentence"])
+        df.to_csv(
+            os.path.join(
+                self.trainer.default_root_dir,
+                f"samples_train_probes_{self.trainer.current_epoch}.csv",
+            ),
+            index=False,
+        )
+
+        plt.hist(self.train_sentence_length, bins=50)
+        plt.savefig(
+            os.path.join(
+                self.trainer.default_root_dir,
+                f"train_sentence_length_{self.trainer.current_epoch}.png",
+            )
+        )
+        plt.close()
+
+        self.logger.log_table(
+            "train/samples_latest",
+            dataframe=df,
+        )
+        self.train_samples.clear()
+        self.train_sentence_length.clear()
 
     # def on_train_epoch_start(self, ):
     #     # Log scheduled quantities
@@ -535,14 +599,21 @@ class ChemGFNModule(LightningModule):
             log_ps *= self.reward.temperature
             log_ps_unpenalized *= self.reward.temperature
             generated_text = generated_text[:, len(encoded_prompt[0]) :]
-            generated_text = [
-                "".join(self.tokenizer.decode(token, skip_special_tokens=False) for token in text)
-                for text in generated_text
-            ]
+            if self.constraint_config.processor_type == "number_only":
+                generated_text = [
+                    ",".join(
+                        self.tokenizer.decode(token, skip_special_tokens=False) for token in text
+                    )
+                    for text in generated_text
+                ]
+            else:
+                generated_text = [
+                    self.tokenizer.decode(text, skip_special_tokens=False)
+                    for text in generated_text
+                ]
             for i in range(len(generated_text)):
                 samples.append(
                     {
-                        "Prompt": probe_str,
                         "Sampled sentence": generated_text[i],
                         "logP(s)": log_ps[i].item(),
                         "logP(s) unpenalized": log_ps_unpenalized[i].item(),
@@ -551,7 +622,7 @@ class ChemGFNModule(LightningModule):
                     }
                 )
         samples = pd.DataFrame(samples)
-        samples = samples.sort_values(by=["Prompt", "logP(s)"], ascending=False)
+        samples = samples.sort_values(by=["logP(s)"], ascending=False)
         return samples
 
     def sample_probes_baselines(self, probes, n_samples=4):
