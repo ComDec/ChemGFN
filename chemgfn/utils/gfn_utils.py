@@ -74,6 +74,9 @@ def generate_and_return_termination_logprob(
     reward_temperature=1.0,
     action_seq=None,
     skip_rewards=False,
+    use_buffer_sample=False,
+    buffer_sample=None,
+    buffer_mixture_ratio=0.5,
 ):
     # generate and return the probability of terminating at every step
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
@@ -93,6 +96,12 @@ def generate_and_return_termination_logprob(
     else:
         logits_processor = LogitsProcessorList([])
 
+    agree_list = []
+
+    # according mixture_ratio, ramdom replace token_ids with buffer_sample
+    nums_replace = max(1, int(token_ids.size(0) * buffer_mixture_ratio))
+
+    # main loop
     for i in range(max_len + 1):
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
@@ -104,6 +113,7 @@ def generate_and_return_termination_logprob(
                 # 应用 logits processor
                 results = logits_processor(state, modified_logits, prompt_length=prompt_len)
                 modified_logits = results["masked_logits"]
+                agree_list.append(results["acceptance"])
                 if i < min_len:
                     modified_logits[:, termination_token_id] = -torch.inf
 
@@ -117,6 +127,15 @@ def generate_and_return_termination_logprob(
                 # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
 
+                if use_buffer_sample:
+                    if i < buffer_sample.size(-1):
+                        if i >= max_len:
+                            token_ids[:nums_replace, :] = termination_token_id
+                        else:
+                            token_ids[:nums_replace, :] = buffer_sample[:, i].unsqueeze(-1)
+                    else:
+                        token_ids[:nums_replace, :] = termination_token_id
+
         else:
             if i >= action_seq.size(-1):
                 token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
@@ -124,6 +143,9 @@ def generate_and_return_termination_logprob(
                 )
             else:
                 token_ids = action_seq[:, prompt_len - 1 + i].unsqueeze(-1)
+                agree_list.append(
+                    vocab_nice_mask.unsqueeze(0).repeat(token_ids.size(0), 1).to(token_ids.device)
+                )
 
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
@@ -173,6 +195,7 @@ def generate_and_return_termination_logprob(
             vocab_naughty_mask=vocab_naughty_mask,
             naughty_vocab_alpha=naughty_vocab_alpha,
             invalid_vocab_alpha=invalid_vocab_alpha,
+            agree_list=torch.stack(agree_list, dim=0),
         )
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized
@@ -217,7 +240,7 @@ def modified_subtb_loss(
         # Accumulate total weight for normalization
         total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
     # Normalize the loss by the total weight
-    batch_loss /= total_lambda + 1e-9
+    batch_loss /= total_lambda
     return batch_loss
 
 

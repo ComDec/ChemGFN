@@ -2,7 +2,7 @@ import os
 import random
 import sys
 from functools import partial
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -77,6 +77,17 @@ class ChemGFNModule(LightningModule):
             reward_config["reward_temp_end"] - reward_config["reward_temp_start"]
         ) * min(1, step / reward_config["reward_temp_horizon"])
 
+        # set use buffer sample at certain step
+        self.get_use_buffer_sample_at_step = lambda step: (
+            training_mixed_config["use_buffer_sample_start_prob"]
+            - (
+                training_mixed_config["use_buffer_sample_start_prob"]
+                - training_mixed_config["use_buffer_sample_end_prob"]
+            )
+            * min(1, step / training_mixed_config["buffer_sample_steps"])
+        )
+        self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
+
         self.reward = reward
         self.reward_buffer = reward_buffer
         self.reward_buffer.set_termination_token_id(self.end_of_sentence_token_id)
@@ -101,7 +112,11 @@ class ChemGFNModule(LightningModule):
             self.string_grammar = StringRecognizer(
                 parsed_grammar.grammar_encoding, parsed_grammar.symbol_table["root"]
             )
-            self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
+            try:
+                self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
+            except:
+                self.grammar = None
+                print("Grammar parsing failed with current tokenizer, disable general processor")
             self.grammar_processor = GrammarLimitedOneTimeLogitsProcessor(
                 parsed_grammar,
                 tokenizer=self.tokenizer,
@@ -161,6 +176,9 @@ class ChemGFNModule(LightningModule):
         pf_temperature=1.0,
         reward_temperature=1.0,
         action_seq=None,
+        use_buffer_sample: bool = False,
+        buffer_sample: Optional[torch.Tensor] = None,
+        buffer_mixture_ratio: float = 0.5,
     ):
         if encoded_prompt.ndim != 1:
             # remove batch dimension
@@ -200,12 +218,16 @@ class ChemGFNModule(LightningModule):
             vocab_naughty_mask=self.illegal_tokens_mask,
             naughty_vocab_alpha=self.naughty_vocab_alpha,
             invalid_vocab_alpha=self.invalid_vocab_alpha,
+            use_buffer_sample=use_buffer_sample,
+            buffer_sample=buffer_sample,
+            buffer_mixture_ratio=buffer_mixture_ratio,
         )
 
         return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
 
     def training_step(self, item, batch_idx) -> torch.Tensor:
         encoded_prompt = item["encoded_prompt"]
+        buffer_sample = item["buffer_encoded_sample"]
         # Sample a sentence and get the reward
 
         if (
@@ -224,9 +246,16 @@ class ChemGFNModule(LightningModule):
                 :, : generated_text.shape[1] - len(encoded_prompt)
             ]  # Undo padding from buffer
             log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
+            pf_temp = 1.0
 
         else:
             # Using the forward policy
+
+            if random.random() < self.get_use_buffer_sample_at_step(self.global_step):
+                use_buffer_sample = True
+            else:
+                use_buffer_sample = False
+
             if random.random() < self.training_mixed_config.pf_temp_prob:  # With tempering
                 pf_temp = (
                     random.random()
@@ -239,15 +268,20 @@ class ChemGFNModule(LightningModule):
             else:  # Without tempering
                 pf_temp = 1.0
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                encoded_prompt, pf_temperature=pf_temp, reward_temperature=self.reward.temperature
+                encoded_prompt,
+                pf_temperature=pf_temp,
+                reward_temperature=self.reward.temperature,
+                use_buffer_sample=use_buffer_sample,
+                buffer_sample=buffer_sample,
+                buffer_mixture_ratio=self.buffer_mixture_ratio,
             )
+
             self.reward_buffer.add_batch(
                 prompt=encoded_prompt,
                 sentences=generated_text[:, len(encoded_prompt) :],
                 logrewards=log_r * self.reward.temperature,  # undo the effect of reward tempering
                 tokenizer=self.tokenizer,
             )
-
         # Get the GFN loss
         loss = modified_subtb_loss(
             log_pf=log_pf,
@@ -287,12 +321,13 @@ class ChemGFNModule(LightningModule):
                         text.append(self.tokenizer.decode(t))
                     else:
                         break
-                self.train_samples.append(",".join(text))
+                self.train_samples.append(",".join(text) + f": pf_temp={pf_temp:.2f}")
             else:
                 self.train_samples.append(
                     self.tokenizer.decode(
                         generated_text[0, encoded_prompt.shape[-1] :], skip_special_tokens=True
                     )
+                    + f": pf_temp={pf_temp:.2f}"
                 )
 
         self.log(

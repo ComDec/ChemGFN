@@ -2,31 +2,30 @@ _target_: chemgfn.models.gfn.ChemGFNModule
 
 lora_config:
   _target_: peft.LoraConfig
+  # target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
   target_modules: ["q_proj", "k_proj"]
   r: 16
-  task_type: "CAUSAL_LM"
-  lora_alpha: 16
+  lora_alpha: 32
   lora_dropout: 0.1
-  inference_mode: false
   bias: "none"
-  fan_in_fan_out: true
+  fan_in_fan_out: false
 
 # bnb_config:
 #   _target_: transformers.BitsAndBytesConfig
 #   load_in_8bit: true
 
 net_config:
-  pretrained_model_name_or_path: "EleutherAI/gpt-j-6b"
+  pretrained_model_name_or_path: "meta-llama/Llama-3.2-3B"
 
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 0.001
+  lr: 0.0001
   weight_decay: 0.01
 
 tokenizer:
   _target_: transformers.AutoTokenizer.from_pretrained
-  pretrained_model_name_or_path: "EleutherAI/gpt-j-6b"
+  pretrained_model_name_or_path: "meta-llama/Llama-3.2-3B"
 
 scheduler:
   _target_: torch.optim.lr_scheduler.PolynomialLR
@@ -60,7 +59,7 @@ constraint_config:
   grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
   apply_grammar: true
   processor_type: "prefix"
-  legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_gptj_6B_token
+  legal_tokens: ${paths.assets_dir}/token_list/SMILES/pre_defined_token_v1
   naughty_vocab_alpha: -50
   parse_mode: "limited"
 
@@ -71,5 +70,9 @@ training_mixed_config:
   pf_temp_prob: 0.666
   use_buffer_prob: 0.25
   n_samples: 8
+  use_buffer_sample_start_prob: 0.8
+  use_buffer_sample_end_prob: 0.1
+  buffer_sample_steps: 20000
+  buffer_mixture_ratio: 0.5
 
 compile: false
