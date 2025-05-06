@@ -513,12 +513,14 @@ class SMILESFrozenModelSentenceGivenPrompt:
         valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
+        sa_threshold: float = 5.0,
     ):
         self.temperature = temperature
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
+        self.sa_threshold = sa_threshold
 
     def score(
         self,
@@ -570,7 +572,7 @@ class SMILESFrozenModelSentenceGivenPrompt:
                 # generate linear incresement part for the rest of the sequence
                 # rectify using SA Scores
                 seq = torch.linspace(
-                    start=start_values[i] * ((10 - sa[i]) / 5),
+                    start=start_values[i] * ((10 - sa[i]) / self.sa_threshold),
                     end=end_values[i],
                     steps=reward.shape[1],
                     device=reward.device,

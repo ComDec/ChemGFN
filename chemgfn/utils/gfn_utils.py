@@ -115,7 +115,10 @@ def generate_and_return_termination_logprob(
                 modified_logits = results["masked_logits"]
                 agree_list.append(results["acceptance"])
                 if i < min_len:
-                    modified_logits[:, termination_token_id] = -torch.inf
+                    # if model generate eos normally but we don't reach the min_len
+                    # then we get full nan probability
+                    non_eos_only = torch.where(results["acceptance"].sum(dim=1) != 1)[0]
+                    modified_logits[non_eos_only, termination_token_id] = -torch.inf
 
                 elif i >= max_len:
                     mask = torch.ones_like(modified_logits, dtype=torch.bool)
@@ -123,16 +126,18 @@ def generate_and_return_termination_logprob(
                     modified_logits[mask] = -torch.inf
 
                 prob = (modified_logits / temperature).softmax(dim=-1)
-
-                # Use efficient sampling methods
                 token_ids = torch.multinomial(prob, num_samples=1)
 
+                # print(f"prob: {prob}\n state: {state}\n token_ids: {token_ids}")
                 if use_buffer_sample:
+                    # Use efficient sampling methods
                     if i < buffer_sample.size(-1):
                         if i >= max_len:
                             token_ids[:nums_replace, :] = termination_token_id
                         else:
-                            token_ids[:nums_replace, :] = buffer_sample[:, i].unsqueeze(-1)
+                            token_ids[:nums_replace, :] = buffer_sample[
+                                :nums_replace, i
+                            ].unsqueeze(-1)
                     else:
                         token_ids[:nums_replace, :] = termination_token_id
 

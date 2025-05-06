@@ -331,6 +331,13 @@ class ChemGFNModule(LightningModule):
                 )
 
         self.log(
+            "" "train/buffer_ratio",
+            self.get_use_buffer_sample_at_step(self.global_step),
+            sync_dist=True,
+            on_step=True,
+        )
+
+        self.log(
             "train/loss",
             loss,
             on_step=True,

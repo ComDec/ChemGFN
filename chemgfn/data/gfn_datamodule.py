@@ -6,6 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 from lightning import LightningDataModule
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
@@ -24,6 +25,7 @@ class SMILESDataPipe(Dataset):
         add_prompt: bool = False,
         buffer_sample: list = None,
         allowed_vocab: list = None,
+        n_samples: int = 4,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -37,6 +39,7 @@ class SMILESDataPipe(Dataset):
         self.prompts = random.choices(prompts, k=self.total_size)
         self.buffer_sample = buffer_sample
         self.allowed_vocab = allowed_vocab
+        self.n_samples = n_samples
 
     def __len__(self):
         return len(self.prompts)
@@ -90,22 +93,34 @@ class SMILESDataPipe(Dataset):
         else:
             encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
 
+        sampled_buffers = []
+        buffer_encoded_samples = []
         if self.buffer_sample is not None:
-            sampled_buffer = random.sample(self.buffer_sample, 1)[0]
+            sampled_buffer = random.sample(self.buffer_sample, self.n_samples)
             if self.allowed_vocab is not None:
-                sampled_buffer = self.merge_chars_fast(sampled_buffer, self.allowed_vocab)
-            else:
-                sampled_buffer = list(sampled_buffer)
+                for i in range(len(sampled_buffer)):
+                    sampled_buffers.append(
+                        self.merge_chars_fast(sampled_buffer[i], self.allowed_vocab)
+                    )
+                    buffer_encoded_sample = torch.tensor(
+                        [self.tokenizer.encode(x) for x in sampled_buffers[i]]
+                    ).reshape(-1)
+                    buffer_encoded_samples.append(buffer_encoded_sample)
 
-            buffer_encoded_sample = torch.tensor(
-                [self.tokenizer.encode(x) for x in sampled_buffer]
-            ).reshape(1, -1)
+                buffer_encoded_samples = pad_sequence(
+                    buffer_encoded_samples,
+                    batch_first=True,
+                    padding_value=self.tokenizer.eos_token_id,
+                )
+            else:
+                sampled_buffers = list(sampled_buffer)
+
         else:
-            buffer_encoded_sample = None
+            buffer_encoded_samples = None
 
         return {
             "encoded_prompt": encoded_prompt,
-            "buffer_encoded_sample": buffer_encoded_sample,
+            "buffer_encoded_sample": buffer_encoded_samples,
         }
 
 
@@ -122,6 +137,7 @@ class SMILESDataModule(LightningDataModule):
         pin_memory: bool = True,
         add_prompt: bool = False,
         allowed_vocab_path: Optional[str] = None,
+        n_samples: int = 4,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -133,6 +149,7 @@ class SMILESDataModule(LightningDataModule):
 
         self.prompt_size = prompt_size
         self.total_size = total_size
+        self.n_samples = n_samples
 
         self.num_workers = num_workers
         self.pin_memory = pin_memory
@@ -165,6 +182,7 @@ class SMILESDataModule(LightningDataModule):
             add_prompt=self.add_prompt,
             buffer_sample=self.buffer_sample,
             allowed_vocab=self.allowed_tokens,
+            n_samples=self.n_samples,
         )
         self.val_data = SMILESDataPipe(
             prompts,
