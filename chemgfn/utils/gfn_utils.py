@@ -90,6 +90,7 @@ def generate_and_return_termination_logprob(
     if grammar_processor is not None:
         try:
             grammar_processor.reset()
+            grammar_processor.set_prompt_length(prompt_len)
         except:
             pass
         logits_processor = LogitsProcessorList([grammar_processor])
@@ -110,10 +111,16 @@ def generate_and_return_termination_logprob(
         if action_seq is None:
             with torch.no_grad():
                 modified_logits = logits.clone().detach()
-                # 应用 logits processor
-                results = logits_processor(state, modified_logits, prompt_length=prompt_len)
+                # apply logits processor
+                results = logits_processor(state, modified_logits)
                 modified_logits = results["masked_logits"]
                 agree_list.append(results["acceptance"])
+
+                ## debug block ##
+                # print(f"\nacceptance: {results['acceptance'].sum(dim=-1)}\n")
+                # print(f"state: {state}")
+                # print(f"token_ids: {token_ids}")
+
                 if i < min_len:
                     # if model generate eos normally but we don't reach the min_len
                     # then we get full nan probability
@@ -124,6 +131,8 @@ def generate_and_return_termination_logprob(
                     mask = torch.ones_like(modified_logits, dtype=torch.bool)
                     mask[:, termination_token_id] = False  # EOS token保留
                     modified_logits[mask] = -torch.inf
+                    # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
+                    modified_logits[:, termination_token_id] = 0
 
                 prob = (modified_logits / temperature).softmax(dim=-1)
                 token_ids = torch.multinomial(prob, num_samples=1)
@@ -201,6 +210,7 @@ def generate_and_return_termination_logprob(
             naughty_vocab_alpha=naughty_vocab_alpha,
             invalid_vocab_alpha=invalid_vocab_alpha,
             agree_list=torch.stack(agree_list, dim=0),
+            termination_token_id=termination_token_id,
         )
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized

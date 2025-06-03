@@ -362,3 +362,219 @@ class ParenthesesDataModule(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
         )
+
+
+class BufferDataPipe(Dataset):
+    def __init__(
+        self,
+        prompts,
+        tokenizer: AutoTokenizer,
+        total_size: int = 10000,
+        is_instruct: bool = False,
+        add_prompt: bool = False,
+        buffer_sample: list = None,
+        allowed_vocab: list = None,
+        n_samples: int = 4,
+        buffer_tokenization: bool = False,
+    ) -> None:
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+        self.total_size = total_size
+
+        self.is_instruct = is_instruct
+        self.add_prompt = add_prompt
+        self.buffer_tokenization = buffer_tokenization
+
+        # Generate prompts by randomly sampling with replacement
+        self.prompts = random.choices(prompts, k=self.total_size)
+        self.buffer_sample = buffer_sample
+        self.allowed_vocab = allowed_vocab
+        self.n_samples = n_samples
+
+    def __len__(self):
+        return len(self.prompts)
+
+    @staticmethod
+    def merge_chars_fast(chars, vocab_list):
+        merged = []
+        i = 0
+        n = len(chars)
+
+        while i < n:
+            if i + 1 < n and (chars[i] + chars[i + 1]) in vocab_list:
+                merged.append(chars[i] + chars[i + 1])
+                i += 2
+            else:
+                merged.append(chars[i])
+                i += 1
+
+        return merged
+
+    def generate_message(self, question):
+        return [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. You are an expert on cheminformatics and helpful assistant. You are here to help the user generate valid molecules representation.",
+            },
+            {"role": "user", "content": f"{question}"},
+        ]
+
+    def __getitem__(self, index):
+        if self.add_prompt:
+            _prompt = (
+                SMILES_PROMPTS_AHEAD
+                + self.prompts[index]
+                + BASE_PROMPTS_EXAMPLES
+                + SMILES_PROMPTS_BEHIND
+            )
+        else:
+            _prompt = self.prompts[index]
+
+        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
+        # _prompt = self.prompts[index]
+
+        if False:
+            message = self.generate_message(_prompt)
+            encoded_prompt = self.tokenizer.apply_chat_template(
+                message,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+        else:
+            encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
+
+        sampled_buffers = []
+        buffer_encoded_samples = []
+        if self.buffer_sample is not None:
+            sampled_buffer = random.sample(self.buffer_sample, self.n_samples)
+            if self.allowed_vocab is not None:
+                for i in range(len(sampled_buffer)):
+                    if self.buffer_tokenization:
+                        buffer_encoded_sample = torch.tensor(
+                            self.tokenizer.encode(sampled_buffer[i], add_special_tokens=False)
+                        ).reshape(-1)
+                    else:
+                        sampled_buffers.append(
+                            self.merge_chars_fast(sampled_buffer[i], self.allowed_vocab)
+                        )
+                        buffer_encoded_sample = torch.tensor(
+                            [
+                                self.tokenizer.encode(x, add_special_tokens=False)
+                                for x in sampled_buffers[i]
+                            ]
+                        ).reshape(-1)
+
+                    buffer_encoded_samples.append(buffer_encoded_sample)
+
+                buffer_encoded_samples = pad_sequence(
+                    buffer_encoded_samples,
+                    batch_first=True,
+                    padding_value=self.tokenizer.eos_token_id,
+                )
+            else:
+                sampled_buffers = list(sampled_buffer)
+
+        else:
+            buffer_encoded_samples = None
+
+        return {
+            "encoded_prompt": encoded_prompt,
+            "buffer_encoded_sample": buffer_encoded_samples,
+        }
+
+
+class BufferDataModule(LightningDataModule):
+    def __init__(
+        self,
+        data_path,
+        buffer_sample_path: Optional[str] = None,
+        tokenizer_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+        prompt_size: int = 1,
+        total_size: int = 10000,
+        train_size: float = 0.95,
+        num_workers: int = 8,
+        pin_memory: bool = True,
+        add_prompt: bool = False,
+        allowed_vocab_path: Optional[str] = None,
+        n_samples: int = 4,
+        buffer_tokenization: bool = False,
+    ):
+        """
+        Data module for handling buffer data, which includes prompts and optional buffer samples.
+        Args:
+            data_path: Path to the file containing prompts.
+            buffer_sample_path: Path to the buffer sample file.
+            buffer_tokenization: If True, tokenizes the buffer samples. Else, construct tokens from vocabulary list
+        """
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.data_path = data_path
+        self.train_size = train_size
+        self.train_data = None
+        self.val_data = None
+
+        self.prompt_size = prompt_size
+        self.total_size = total_size
+        self.n_samples = n_samples
+
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+
+        self.add_prompt = add_prompt
+        self.buffer_tokenization = buffer_tokenization
+        self.is_instruct = True if "Instruct" in tokenizer_name else False
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+        with open(allowed_vocab_path) as f:
+            self.allowed_tokens = f.readlines() if allowed_vocab_path else None
+
+        self.buffer_sample = torch.load(buffer_sample_path) if buffer_sample_path else None
+
+    def prepare_data(self) -> None:
+        pass
+
+    def setup(self, stage):
+        with open(self.data_path) as f:
+            prompts = f.readlines()
+
+        # strip all the \n
+        prompts = [prompt.strip() for prompt in prompts][: self.prompt_size]
+        num_train = int(self.total_size * self.train_size)
+
+        self.train_data = BufferDataPipe(
+            prompts,
+            self.tokenizer,
+            num_train,
+            is_instruct=self.is_instruct,
+            add_prompt=self.add_prompt,
+            buffer_sample=self.buffer_sample,
+            allowed_vocab=self.allowed_tokens,
+            n_samples=self.n_samples,
+            buffer_tokenization=self.buffer_tokenization,
+        )
+        self.val_data = BufferDataPipe(
+            prompts,
+            self.tokenizer,
+            self.total_size - num_train,
+            is_instruct=self.is_instruct,
+            add_prompt=self.add_prompt,
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_data,
+            shuffle=True,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_data,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )

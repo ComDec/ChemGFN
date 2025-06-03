@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 import torch.utils
@@ -130,7 +131,7 @@ class ChemGFNModule(LightningModule):
                     nice_token_ids_list=self.legal_token_ids_list,
                     execution_mode=self.constraint_config.parse_mode,
                 )
-            if self.constraint_config.processor_type == "partheseness":
+            if self.constraint_config.processor_type == "parenthese":
                 self.pre_grammar_processor = GrammarLogitsProcessorPartheseness(
                     parsed_grammar,
                     tokenizer=self.tokenizer,
@@ -165,6 +166,9 @@ class ChemGFNModule(LightningModule):
         self.train_sentence_length = []
         self.train_samples = []
 
+        # other
+        self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
+
     def set_probes(self, train_probes, val_probes):
         self.train_probes = train_probes
         self.val_probes = val_probes
@@ -188,7 +192,6 @@ class ChemGFNModule(LightningModule):
 
         # expand prompts to n_samples
         encoded_prompt = encoded_prompt.unsqueeze(0).expand(n_samples, -1)
-
         reward_fn = partial(
             self.reward.score,
             prompt_length=encoded_prompt.shape[1],
@@ -506,20 +509,20 @@ class ChemGFNModule(LightningModule):
         self.train_samples.clear()
         self.train_sentence_length.clear()
 
-    # def on_train_epoch_start(self, ):
-    #     # Log scheduled quantities
-    #     self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
-    #     self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
+    def on_train_epoch_start(self):
+        # Log scheduled quantities
+        self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
+        self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
 
-    #     # Log probe samples
-    #     # There is no need to sample probes during training
-    #     # if (
-    #     #     self.train_probes is not None
-    #     #     and self.logger is not None
-    #     #     and self.trainer.current_epoch % 1 == 0
-    #     # ):
-    #     #     samples_table = self.sample_probes(self.train_probes)
-    #     #     self.logger.log_table("samples/train_probes", dataframe=samples_table)
+        # Log probe samples
+        # There is no need to sample probes during training
+        # if (
+        #     self.train_probes is not None
+        #     and self.logger is not None
+        #     and self.trainer.current_epoch % 1 == 0
+        # ):
+        #     samples_table = self.sample_probes(self.train_probes)
+        #     self.logger.log_table("samples/train_probes", dataframe=samples_table)
 
     def on_validation_epoch_start(self):
         # Log variance of (logR - logP(s)) using exploration, which should be 0.0
@@ -531,7 +534,7 @@ class ChemGFNModule(LightningModule):
         for idx, item in enumerate(self.trainer.datamodule.val_dataloader()):
             encoded_prompt = item["encoded_prompt"]
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                encoded_prompt.to(self.device), pf_temperature=2.0
+                encoded_prompt.to(self.device), pf_temperature=1.0
             )
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
@@ -566,53 +569,71 @@ class ChemGFNModule(LightningModule):
             )
 
     def on_train_start(self):
-        pass
-        # # Log baseline metrics
-        # val_data = self.trainer.datamodule.val_dataloader().dataset
+        if self.skip_baseline_sampling:
+            return
+        # Log baseline metrics
+        val_data = self.trainer.datamodule.val_dataloader().dataset
         # baseline_performance = None
-        # for prompt in val_data:
-        #     prompt = prompt[0]
-        #     samples = self.sample_baselines(prompt.to(self.device), n_samples=self.hparams.n_samples)
-        #     if baseline_performance is None:
-        #         baseline_performance = pd.DataFrame(
-        #             data=np.zeros((6, len(samples))),
-        #             columns=samples.keys(),
-        #             index=[
-        #                 "logP(s) (avg)",
-        #                 "logP(s) (max)",
-        #                 "logP(s) unpenalized (avg)",
-        #                 "logP(s) unpenalized (max)",
-        #                 self.diversity_metric_name,
-        #                 "sentence length",
-        #             ],
-        #         )
-        #     for baseline in samples:
-        #         baseline_performance.loc["logP(s) (avg)", baseline] += samples[baseline]["logP(s)"].mean().item() / len(
-        #             val_data
-        #         )
-        #         baseline_performance.loc["logP(s) (max)", baseline] += samples[baseline]["logP(s)"].max().item() / len(
-        #             val_data
-        #         )
-        #         baseline_performance.loc["logP(s) unpenalized (avg)", baseline] += samples[baseline][
-        #             "logP(s) unpenalized"
-        #         ].mean().item() / len(val_data)
-        #         baseline_performance.loc["logP(s) unpenalized (max)", baseline] += samples[baseline][
-        #             "logP(s) unpenalized"
-        #         ].max().item() / len(val_data)
-        #         if samples[baseline][self.diversity_metric_name] is None:
-        #             baseline_performance.loc[self.diversity_metric_name, baseline] = None
-        #         else:
-        #             baseline_performance.loc[self.diversity_metric_name, baseline] += samples[baseline][
-        #                 self.diversity_metric_name
-        #             ] / len(val_data)
-        #         baseline_performance.loc["sentence length", baseline] += samples[baseline][
-        #             "sentence length"
-        #         ].float().mean().item() / len(val_data)
+        samples = {}
+        for idx, prompt in enumerate(val_data):
+            prompt = prompt["encoded_prompt"]
+            samples_ = self.sample_baselines(prompt.to(self.device), n_samples=8)
+
+            for method, data in samples_.items():
+                if method in samples:
+                    samples[method]["sample"].extend(data["sample"])
+                else:
+                    samples[method] = data.copy()
+
+            if idx == 10:
+                break
+
+        pd.DataFrame(samples).T.to_csv(
+            os.path.join(
+                self.trainer.default_root_dir,
+                f"samples_baselines_{self.trainer.current_epoch}.csv",
+            ),
+            index=True,
+        )
+        # if baseline_performance is None:
+        # baseline_performance = pd.DataFrame(
+        #     data=np.zeros((5, len(samples))),
+        #     columns=samples.keys(),
+        #     index=[
+        #         "logP(s) (avg)",
+        #         "logP(s) (max)",
+        #         "logP(s) unpenalized (avg)",
+        #         "logP(s) unpenalized (max)",
+        #         "sentence length",
+        #     ],
+        # )
+        # for baseline in samples:
+        # baseline_performance.loc["logP(s) (avg)", baseline] += samples[baseline]["logP(s)"].mean().item() / len(
+        #     val_data
+        # )
+        # baseline_performance.loc["logP(s) (max)", baseline] += samples[baseline]["logP(s)"].max().item() / len(
+        #     val_data
+        # )
+        # baseline_performance.loc["logP(s) unpenalized (avg)", baseline] += samples[baseline][
+        #     "logP(s) unpenalized"
+        # ].mean().item() / len(val_data)
+        # baseline_performance.loc["logP(s) unpenalized (max)", baseline] += samples[baseline][
+        #     "logP(s) unpenalized"
+        # ].max().item() / len(val_data)
+        # if samples[baseline][self.diversity_metric_name] is None:
+        #     baseline_performance.loc[self.diversity_metric_name, baseline] = None
+        # else:
+        #     baseline_performance.loc[self.diversity_metric_name, baseline] += samples[baseline][
+        #         self.diversity_metric_name
+        #     ] / len(val_data)
+        # baseline_performance.loc["sentence length", baseline] += samples[baseline][
+        #     "sentence length"
+        # ].float().mean().item() / len(val_data)
         # baseline_performance = baseline_performance.reset_index(names="metric")
         # if self.logger is not None:
         #     self.logger.log_table("val/baseline performance", dataframe=baseline_performance)
 
-        # # Log baseline probes
+        # Log baseline probes
         # if self.hparams.val_probes is not None and self.logger is not None:
         #     samples_table = self.sample_probes_baselines(self.hparams.val_probes)
         #     self.logger.log_table("samples/val_probes (baselines)", dataframe=samples_table)
@@ -691,12 +712,18 @@ class ChemGFNModule(LightningModule):
     def sample_baselines(self, prompt, n_samples=4):
         # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationMixin.generate
         # https://huggingface.co/docs/transformers/v4.31.0/en/main_classes/text_generation#transformers.GenerationConfig
-        assert prompt.ndim == 1
-        prompt = prompt.unsqueeze(0)
+        assert prompt.ndim == 2
+        # prompt = prompt.unsqueeze(0)
 
         def generate(prompt, **kwargs):
             with torch.no_grad():
                 lora_to_base(self.net)
+
+                try:
+                    self.pre_grammar_processor.set_return_dict(False)
+                except AttributeError:
+                    self.pre_grammar_processor.return_dict = False
+
                 generated_text = self.net.generate(
                     prompt,
                     min_new_tokens=self.constraint_config.min_sentence_len,
@@ -705,32 +732,39 @@ class ChemGFNModule(LightningModule):
                     pad_token_id=self.tokenizer.eos_token_id,
                     forced_eos_token_id=self.end_of_sentence_token_id,
                     suppress_tokens=None,
+                    logits_processor=[self.pre_grammar_processor],
                     **kwargs,
                 )
                 base_to_lora(self.net)
 
-                log_r, log_r_unpenalized = self.reward.score(
-                    generated_text,
-                    prompt_length=prompt.shape[1],
-                    model=self.net,
-                    tokenizer=self.tokenizer,
-                )
-                (
-                    _,
-                    last_log_r,
-                    last_log_r_unpenalized,
-                    sentence_len,
-                ) = get_termination_vals(
-                    generated_text=generated_text,
-                    log_pf=None,
-                    log_pterm=None,
-                    log_r=log_r,
-                    log_r_unpenalized=log_r_unpenalized,
-                    termination_token_id=self.end_of_sentence_token_id,
-                    prompt_len=prompt.shape[1],
-                )
-                log_ps = last_log_r * self.reward.temperature
-                log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+                # restore the return_dict setting
+                try:
+                    self.pre_grammar_processor.set_return_dict(True)
+                except AttributeError:
+                    self.pre_grammar_processor.return_dict = True
+
+                # log_r, log_r_unpenalized = self.reward.score(
+                #     generated_text,
+                #     prompt_length=prompt.shape[1],
+                #     model=self.net,
+                #     tokenizer=self.tokenizer,
+                # )
+                # (
+                #     _,
+                #     last_log_r,
+                #     last_log_r_unpenalized,
+                #     sentence_len,
+                # ) = get_termination_vals(
+                #     generated_text=generated_text,
+                #     log_pf=None,
+                #     log_pterm=None,
+                #     log_r=log_r,
+                #     log_r_unpenalized=log_r_unpenalized,
+                #     termination_token_id=self.end_of_sentence_token_id,
+                #     prompt_len=prompt.shape[1],
+                # )
+                # log_ps = last_log_r * self.reward.temperature
+                # log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
 
             generated_text = generated_text[:, prompt.shape[1] :]
             generated_text = torch.where(
@@ -741,22 +775,18 @@ class ChemGFNModule(LightningModule):
             generated_text = self.tokenizer.batch_decode(generated_text)
             generated_text = [text.replace(".", "") for text in generated_text]
 
-            if len(generated_text) > 1:
-                diversity = self.diversity_metric(generated_text)
-            else:
-                diversity = None
+            # if len(generated_text) > 1:
+            #     diversity = self.diversity_metric(generated_text)
+            # else:
+            #     diversity = None
 
-            if len(generated_text) == 1:
-                generated_text = generated_text * n_samples
-                log_ps = log_ps.expand(n_samples, -1)
-                log_ps_unpenalized = log_ps_unpenalized.expand(n_samples, -1)
+            # if len(generated_text) == 1:
+            #     generated_text = generated_text * n_samples
+            #     log_ps = log_ps.expand(n_samples, -1)
+            #     log_ps_unpenalized = log_ps_unpenalized.expand(n_samples, -1)
 
             return {
                 "sample": generated_text,
-                "logP(s)": log_ps,
-                "logP(s) unpenalized": log_ps_unpenalized,
-                "sentence length": sentence_len,
-                self.diversity_metric_name: diversity,
             }
 
         samples = {}
@@ -778,6 +808,7 @@ class ChemGFNModule(LightningModule):
         # Diverse beam search
         samples["diverse beam"] = generate(
             prompt=prompt,
+            do_sample=False,
             num_beams=n_samples * 5,
             num_beam_groups=n_samples,
             num_return_sequences=n_samples,
@@ -786,6 +817,7 @@ class ChemGFNModule(LightningModule):
         )
         samples["diverse beam [fair]"] = generate(
             prompt=prompt,
+            do_sample=False,
             num_beams=n_samples,
             num_beam_groups=n_samples,
             num_return_sequences=n_samples,
@@ -793,36 +825,36 @@ class ChemGFNModule(LightningModule):
             length_penalty=0.0,
         )
 
-        # Nucleaus sampling
-        samples["nucleus"] = generate(
-            prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
-            top_k=0,
-            top_p=0.95,
-        )
-
-        # LM
+        # LM greedy
         samples["LM"] = generate(
             prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
+            do_sample=False,
+            num_return_sequences=1,
             top_k=0,
         )
 
-        # LM with temperature
+        # LM with temperature greedy
         samples["LM tempered"] = generate(
             prompt=prompt,
-            do_sample=True,
-            num_return_sequences=n_samples,
+            do_sample=False,
+            num_return_sequences=1,
             top_k=0,
-            temperature=self.reward_config.temp_start,
+            temperature=2.0,
         )
 
         # Greedy
         samples["greedy"] = generate(
             prompt=prompt,
             do_sample=False,
+        )
+
+        # Nucleaus sampling greedy
+        samples["nucleus"] = generate(
+            prompt=prompt,
+            do_sample=False,
+            num_return_sequences=1,
+            top_k=0,
+            top_p=0.95,
         )
 
         return samples

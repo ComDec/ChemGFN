@@ -203,7 +203,10 @@ class RDKitValidator(SentenceValidator):
                     tokens = "".join(
                         tokenizer.decode(sentences[i, :j], skip_special_tokens=True).split()
                     )
-                    global_invalid[i] = sa_scorer(Chem.MolFromSmiles(tokens))
+                    try:
+                        global_invalid[i] = sa_scorer(Chem.MolFromSmiles(tokens))
+                    except:
+                        global_invalid[i] = 0.0
                     break  # Only unterminated sentences get a reward
                 tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
                 valid = verify_smiles(tokens)
@@ -610,21 +613,58 @@ class UniformModelSentenceGivenPrompt:
         termination_token_id: int = -1,
         agree_list: list[int] = None,
         termination_logits: torch.Tensor = None,
+        min_len: int = 10,
         **kwargs,
     ):
+        # P-terminal
+        # 1. base prob
         sum_along_D = agree_list.sum(dim=-1, keepdim=True)  # B*L*1
+        valid_mask = sum_along_D > 0
+        uniform_base = torch.where(agree_list, 1.0 / sum_along_D.clamp(min=1e-6), 0).detach()
 
-        psudo_logits = torch.where(agree_list, 1.0 / sum_along_D.clamp(min=1e-6), -torch.inf)
-        logprob = torch.log(psudo_logits.softmax(dim=-1) + 1e-6).permute(1, 0, 2)  # B*L*V
-        token_ids = input_batch[:, prompt_length:].unsqueeze(-1)
-        logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
-        logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
+        # 2. length exp increase for eos
+        first_position_counts = sum_along_D[0, :, :].squeeze(-1)  # [B]
 
-        reward = logprob[
-            :, :, termination_token_id
+        # log_start_for_first_pos.
+        log_start = torch.log((1 / first_position_counts).clamp(min=1e-6))  # [B]
+        seq_len = input_batch.size(1) - prompt_length
+        steps = torch.linspace(0, 1, seq_len + 1, device=input_batch.device)  # [L+1]
+        log_space = log_start[None, :] * (1 - steps[:, None])  # [L+1, B]
+        length_increase = torch.exp(log_space).unsqueeze(-1)  # [L+1, B, 1]
+
+        eos_mask = torch.zeros_like(agree_list)
+        eos_mask[..., termination_token_id] = agree_list[..., termination_token_id]
+
+        # P(seq) + P(eos) * length_increase
+        uniform_probs = uniform_base * (~eos_mask)
+        eos_probs = torch.log_softmax(uniform_base * eos_mask * length_increase, dim=-1)
+        logprob = torch.log_softmax(uniform_probs, dim=-1)
+
+        # global compensation
+
+        # if quality_scorer is not None:
+        #     # 获取完整序列质量分数 [B]
+        #     full_sequences = input_batch[:, prompt_length:]
+        #     quality_scores = quality_scorer(full_sequences)  # [B]
+
+        #     # 在终止位置加入质量补偿
+        #     quality_bonus = quality_scores.unsqueeze(-1) * torch.linspace(
+        #         0, 1, seq_len, device=input_batch.device
+        #     )  # [B, L]
+
+        #     # 将质量补偿映射到EOS位置
+        #     eos_positions = (input_batch[:, prompt_length:] == termination_token_id)
+        #     psudo_logits[..., termination_token_id] += (
+        #         quality_bonus.masked_fill(~eos_positions, 0)
+        #     )
+
+        token_ids = input_batch[:, prompt_length:].unsqueeze(-1)  # [B, L, 1]
+        logPF = logprob[1:].gather(-1, token_ids.transpose(0, 1)).squeeze(-1)  # [L-1, B]
+        logP = logPF.cumsum(dim=0)  # [L-1, B]
+        reward = eos_probs[
+            ..., termination_token_id
         ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
-
-        reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
+        reward[1:,] += logP  # logP(generated[:i] + term | prompt)
 
         non_term_mask = (input_batch != termination_token_id)[:, prompt_length:]
 
@@ -634,10 +674,23 @@ class UniformModelSentenceGivenPrompt:
                 non_term_mask,
             ),
             dim=-1,
-        )  # Start (i.e., empty) state has never terminated
+        )
 
-        reward[~non_term_mask] = 0.0
+        # before reach the min_len, the reward is -999
+        # reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -999, reward)
+
         reward_unpenalized = reward.clone()
+
+        # valid_eos_mask = (
+        #     input_batch[:, prompt_length:] == termination_token_id
+        # ) & valid_mask.squeeze(-1)
+
+        # # Eos based reward
+        # termination_logits = psudo_logits[..., termination_token_id]  # [B, L]
+        # reward = termination_logits * valid_eos_mask.float()
+        # length_penalty = -0.1 * torch.arange(1, seq_len + 1, device=reward.device).float().log()
+        # reward += length_penalty.unsqueeze(0)
+        # reward_unpenalized = reward.clone()
 
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
@@ -652,9 +705,6 @@ class UniformModelSentenceGivenPrompt:
 
             invalid_list = []
             for i in range(reward.shape[0]):
-                # prompt_len: large enough value
-                # prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
-
                 # generate linear incresement part for the rest of the sequence
                 seq = torch.linspace(
                     start=start_values[i],
@@ -666,6 +716,6 @@ class UniformModelSentenceGivenPrompt:
 
             invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
 
-            reward = torch.min(reward, invalid_value * invalid)
+            reward = torch.min(reward.permute(1, 0), invalid_value.permute(1, 0) * invalid)
 
-        return reward, reward_unpenalized
+        return reward, reward_unpenalized.permute(1, 0)
