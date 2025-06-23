@@ -25,10 +25,10 @@ from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
 from transformers_cfg.parser import parse_ebnf
 from transformers_cfg.recognizer import StringRecognizer
 
-from chemgfn.models.reward import number_accuracy
 from chemgfn.utils.gfn_utils import (
     base_to_lora,
     generate_and_return_termination_logprob,
+    generate_and_return_termination_logprob_for_sidechain_opt,
     get_termination_vals,
     lora_to_base,
     modified_subtb_loss,
@@ -167,6 +167,7 @@ class ChemGFNModule(LightningModule):
         self.train_samples = []
 
         # other
+        self.opt_task = self.training_mixed_config.get("opt_task", False)
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
 
     def set_probes(self, train_probes, val_probes):
@@ -175,7 +176,7 @@ class ChemGFNModule(LightningModule):
 
     def forward(
         self,
-        encoded_prompt,
+        encoded_data,
         n_samples=None,
         pf_temperature=1.0,
         reward_temperature=1.0,
@@ -184,49 +185,49 @@ class ChemGFNModule(LightningModule):
         buffer_sample: Optional[torch.Tensor] = None,
         buffer_mixture_ratio: float = 0.5,
     ):
-        if encoded_prompt.ndim != 1:
-            # remove batch dimension
-            encoded_prompt = encoded_prompt.squeeze(0)
+        encoded_prompt = encoded_data["encoded_prompt"]
+        encoded_prompt = encoded_prompt.squeeze(0) if encoded_prompt.ndim != 1 else encoded_prompt
+        n_samples = n_samples or self.training_mixed_config.n_samples
+        encoded_prompt = encoded_prompt.expand(n_samples, -1)  # 批量扩展
 
-        n_samples = self.training_mixed_config.n_samples if n_samples is None else n_samples
+        # update encoded_data with the expanded prompt
+        encoded_data["encoded_prompt"] = encoded_prompt
 
-        # expand prompts to n_samples
-        encoded_prompt = encoded_prompt.unsqueeze(0).expand(n_samples, -1)
-        reward_fn = partial(
-            self.reward.score,
-            prompt_length=encoded_prompt.shape[1],
-            model=self.net,
-            tokenizer=self.tokenizer,
+        generation_config = {
+            "model": self.net,
+            "encoded_data": encoded_data,
+            "grammar_processor": self.pre_grammar_processor,
+            "reward_fn": partial(
+                self.reward.score,
+                prompt_length=encoded_prompt.shape[1],
+                model=self.net,
+                tokenizer=self.tokenizer,
+            ),
+            "termination_token_id": self.end_of_sentence_token_id,
+            "min_len": self.constraint_config.min_sentence_len,
+            "max_len": self.constraint_config.max_sentence_len,
+            "temperature": pf_temperature,
+            "reward_temperature": reward_temperature,
+            "skip_rewards": False,
+            "action_seq": action_seq,
+            "vocab_nice_mask": self.legal_tokens_mask,
+            "vocab_naughty_mask": self.illegal_tokens_mask,
+            "naughty_vocab_alpha": self.naughty_vocab_alpha,
+            "invalid_vocab_alpha": self.invalid_vocab_alpha,
+            "use_buffer_sample": use_buffer_sample,
+            "buffer_sample": buffer_sample,
+            "buffer_mixture_ratio": buffer_mixture_ratio,
+        }
+
+        generator = (
+            generate_and_return_termination_logprob_for_sidechain_opt
+            if self.opt_task
+            else generate_and_return_termination_logprob
         )
 
-        (
-            generated_text,
-            log_pf,
-            log_pterm,
-            log_r,
-            log_r_unpenalized,
-        ) = generate_and_return_termination_logprob(
-            self.net,
-            encoded_prompt,
-            grammar_processor=self.pre_grammar_processor,
-            reward_fn=reward_fn,
-            termination_token_id=self.end_of_sentence_token_id,
-            min_len=self.constraint_config.min_sentence_len,
-            max_len=self.constraint_config.max_sentence_len,
-            temperature=pf_temperature,
-            reward_temperature=reward_temperature,
-            skip_rewards=False,
-            action_seq=action_seq,
-            vocab_nice_mask=self.legal_tokens_mask,
-            vocab_naughty_mask=self.illegal_tokens_mask,
-            naughty_vocab_alpha=self.naughty_vocab_alpha,
-            invalid_vocab_alpha=self.invalid_vocab_alpha,
-            use_buffer_sample=use_buffer_sample,
-            buffer_sample=buffer_sample,
-            buffer_mixture_ratio=buffer_mixture_ratio,
-        )
+        result = generator(**generation_config)
 
-        return generated_text, log_pf, log_pterm, log_r, log_r_unpenalized
+        return result
 
     def training_step(self, item, batch_idx) -> torch.Tensor:
         encoded_prompt = item["encoded_prompt"]
@@ -243,7 +244,7 @@ class ChemGFNModule(LightningModule):
                 self.training_mixed_config.n_samples, encoded_prompt
             )
             generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                encoded_prompt, action_seq=action_seq
+                item, action_seq=action_seq
             )
             log_r = log_r[
                 :, : generated_text.shape[1] - len(encoded_prompt)
@@ -271,7 +272,7 @@ class ChemGFNModule(LightningModule):
             else:  # Without tempering
                 pf_temp = 1.0
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                encoded_prompt,
+                item,
                 pf_temperature=pf_temp,
                 reward_temperature=self.reward.temperature,
                 use_buffer_sample=use_buffer_sample,
@@ -334,8 +335,15 @@ class ChemGFNModule(LightningModule):
                 )
 
         self.log(
-            "" "train/buffer_ratio",
+            "train/buffer_ratio",
             self.get_use_buffer_sample_at_step(self.global_step),
+            sync_dist=True,
+            on_step=True,
+        )
+
+        self.log(
+            "train/reward_var",
+            log_r.var(dim=0).mean(),
             sync_dist=True,
             on_step=True,
         )
@@ -400,7 +408,7 @@ class ChemGFNModule(LightningModule):
         encoded_prompt = batch["encoded_prompt"]
         # Sample a sentence and get the reward
         generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-            encoded_prompt, reward_temperature=1.0, pf_temperature=1.0
+            batch, reward_temperature=1.0, pf_temperature=1.0
         )
 
         # Get the GFN loss
@@ -533,8 +541,11 @@ class ChemGFNModule(LightningModule):
         )
         for idx, item in enumerate(self.trainer.datamodule.val_dataloader()):
             encoded_prompt = item["encoded_prompt"]
+            for key, value in item.items():
+                if isinstance(value, torch.Tensor):
+                    item[key] = value.to(self.device)
             generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                encoded_prompt.to(self.device), pf_temperature=1.0
+                item, pf_temperature=1.0
             )
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
@@ -643,10 +654,12 @@ class ChemGFNModule(LightningModule):
         for probe in probes:
             encoded_prompt = probe["encoded_prompt"]
             probe_str = self.tokenizer.decode(encoded_prompt[0])
-
+            for key, value in probe.items():
+                if isinstance(value, torch.Tensor):
+                    probe[key] = value.to(self.device)
             with torch.no_grad():
                 generated_text, _, _, log_r, log_r_unpenalized = self.forward(
-                    encoded_prompt.to(self.device), n_samples=n_samples
+                    probe, n_samples=n_samples
                 )
 
             log_ps, log_ps_unpenalized = get_termination_vals(
@@ -661,6 +674,7 @@ class ChemGFNModule(LightningModule):
 
             log_ps *= self.reward.temperature
             log_ps_unpenalized *= self.reward.temperature
+
             generated_text = generated_text[:, len(encoded_prompt[0]) :]
             if self.constraint_config.processor_type == "number_only":
                 generated_text = [

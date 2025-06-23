@@ -1,5 +1,5 @@
 import random
-from typing import Literal
+from typing import Optional
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from rdkit import Chem, RDLogger
 from transformers import PreTrainedTokenizer
 
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
-from chemgfn.utils.rdkit_utils import sa_scorer, verify_smiles
+from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING, verify_smiles
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -137,11 +137,12 @@ class SentenceValidator:
 
 
 class RDKitValidator(SentenceValidator):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, scorer: str = "sa") -> None:
+        super().__init__(scorer)
+        self.scorer = scorer
+        self.score = FUNCTION_MAPPING[scorer]
 
-    @staticmethod
-    def smiles_accuracy(generated_tokens, tokenizer):
+    def smiles_accuracy(self, generated_tokens, tokenizer):
         smiles_list = []
 
         for batch in range(generated_tokens.shape[0]):
@@ -170,19 +171,21 @@ class RDKitValidator(SentenceValidator):
             except:
                 mol = None
 
-            avg_sa_score += sa_scorer(mol) if mol else 0
+            avg_sa_score += self.score(mol) if mol else 0
             correct += 1 if mol else 0
 
         return {
             "acc": correct / generated_tokens.shape[0],
             "strict_acc": strict_correct / generated_tokens.shape[0],
-            "avg_sa": avg_sa_score / generated_tokens.shape[0],
+            f"{self.scorer}": avg_sa_score / generated_tokens.shape[0],
         }
 
     def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
         return self.smiles_accuracy(sentences, tokenizer)
 
-    def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
+    def __call__(
+        self, sentences, tokenizer: PreTrainedTokenizer, target_molecule: Optional[str] = None
+    ):
         termination_token_id = tokenizer.eos_token_id
 
         invalid = torch.zeros(
@@ -192,7 +195,15 @@ class RDKitValidator(SentenceValidator):
         )
         invalid[:, 0] = 1  # Empty sentence is never valid
 
-        global_invalid = torch.zeros(
+        valid_score = torch.zeros(
+            sentences.shape[0],
+            sentences.shape[1] + 1,
+            device=sentences.device,
+        )
+
+        valid_score[:, 0] = 0
+
+        global_score = torch.zeros(
             sentences.shape[0],
             device=sentences.device,
         )
@@ -203,19 +214,28 @@ class RDKitValidator(SentenceValidator):
                     tokens = "".join(
                         tokenizer.decode(sentences[i, :j], skip_special_tokens=True).split()
                     )
+                    if target_molecule is not None:
+                        full_tokens = target_molecule.replace("*", tokens)
                     try:
-                        global_invalid[i] = sa_scorer(Chem.MolFromSmiles(tokens))
+                        global_score[i] = self.score(Chem.MolFromSmiles(full_tokens))
                     except:
-                        global_invalid[i] = 0.0
+                        global_score[i] = 0.0
                     break  # Only unterminated sentences get a reward
                 tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
-                valid = verify_smiles(tokens)
+                if target_molecule is not None:
+                    full_tokens = target_molecule.replace("*", tokens)
+
+                valid = verify_smiles(full_tokens)
+                valid_score[i, j + 1] = (
+                    self.score(Chem.MolFromSmiles(full_tokens)) if valid else 0.0
+                )
+
                 if valid:
                     invalid[i, j + 1] = 0
                 else:
                     invalid[i, j + 1] = 1
 
-        return {"invalid": invalid, "sa": global_invalid}
+        return {"invalid": invalid, "global_score": global_score, "valid_score": valid_score}
 
 
 def number_reward(sampled_numbers):
@@ -512,18 +532,19 @@ class SMILESFrozenModelSentenceGivenPrompt:
     def __init__(
         self,
         sentence_validator: SentenceValidator,
-        temperature=1.0,
         valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
-        sa_threshold: float = 5.0,
+        target_score_alpha: float = 0.1,
+        target_score_threshold: float = 5.0,
     ):
-        self.temperature = temperature
+        # reward = logP + alpha * reward_norm
+        self.target_score_alpha = target_score_alpha
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
-        self.sa_threshold = sa_threshold
+        self.target_score_threshold = target_score_threshold
 
     def score(
         self,
@@ -536,12 +557,13 @@ class SMILESFrozenModelSentenceGivenPrompt:
         vocab_naughty_mask=None,
         naughty_vocab_alpha=-99,
         invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
         **kwargs,
     ):
         # why lora_to_base?
         lora_to_base(model)
 
-        reward, reward_unpenalized = score_fast(
+        reference_logits, _ = score_fast(
             model=model,
             encoded_input=input_batch,
             termination_token_id=tokenizer.eos_token_id,
@@ -556,37 +578,515 @@ class SMILESFrozenModelSentenceGivenPrompt:
 
         if self.sentence_validator is not None:
             # use valid list instead of invalid list
-            validator_dict = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
             invalid = validator_dict["invalid"]
-            sa = validator_dict["sa"]
+            valid_score = validator_dict["valid_score"]
 
-            # v4
-            # 确保已经定义了prompt_len，例如：prompt_len = ...（某个整数）
-            reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
+            # global_score = validator_dict["global_score"]
+            # mean = global_score.mean()
+            # std = global_score.std(unbiased=False)
+            # global_score_norm = (global_score - mean) / (std + 1e-8)
+            # advantage = global_score - global_score.mean()
 
-            start_values = reward_min * self.invalid_start_ratio
-            end_values = reward_min * self.invalid_end_ratio
+            reference_logits_norm = torch.nn.functional.log_softmax(
+                reference_logits / reward_temperature, dim=-1
+            )
+            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
 
+            # import ipdb; ipdb.set_trace()
+            # # v5
+            # reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
+
+            # start_values = reward_min * (self.invalid_start_ratio + self.beta * global_score_norm)
+            # end_values = reward_min * (self.invalid_end_ratio + self.gamma * global_score_norm)
+
+            # # 生成invalid_value时结合全局reward
+            # seq = torch.linspace(
+            #     start=start_values[i],
+            #     end=end_values[i],
+            #     steps=reward.shape[1],
+            #     device=reward.device,
+            # )
+
+            # invalid_list = []
+            # for i in range(reward.shape[0]):
+            #     # prompt_len: large enough value
+            #     # prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
+
+            #     # generate linear incresement part for the rest of the sequence
+            #     # rectify using SA Scores
+            #     seq = torch.linspace(
+            #         start=start_values[i] * ((10 - sa[i]) / self.sa_threshold),
+            #         end=end_values[i],
+            #         steps=reward.shape[1],
+            #         device=reward.device,
+            #     )
+            #     invalid_list.append(seq)
+
+            # invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
+
+            # reward = torch.min(reward, invalid_value * invalid)
+
+        return reward_mixed, reward_mixed
+
+
+class Reference_Target_Score_Positive_Mixed:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator,
+        valid_sentence_alpha=None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        target_score_alpha: float = 0.1,
+        target_score_threshold: float = 5.0,
+    ):
+        # reward = logP + alpha * reward_norm
+        self.target_score_alpha = target_score_alpha
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.target_score_threshold = target_score_threshold
+
+        # temperature for the target score
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature=1.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        naughty_vocab_alpha=-99,
+        invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
+        **kwargs,
+    ):
+        lora_to_base(model)
+
+        reference_logits, _ = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+        )
+
+        base_to_lora(model)
+
+        if self.sentence_validator is not None:
+            # use valid list instead of invalid list
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            invalid = validator_dict["invalid"]
+            valid_score = validator_dict["valid_score"]
+
+            reference_logits_norm = torch.nn.functional.log_softmax(
+                reference_logits / reward_temperature, dim=-1
+            )
+            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+
+        return reward_mixed, reward_mixed
+
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator,
+        valid_sentence_alpha=None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        target_score_alpha: float = 0.1,
+        target_score_threshold: float = 5.0,
+    ):
+        # reward = logP + alpha * reward_norm
+        self.target_score_alpha = target_score_alpha
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.target_score_threshold = target_score_threshold
+
+        # temperature for the target score
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature=1.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        naughty_vocab_alpha=-99,
+        invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
+        **kwargs,
+    ):
+        lora_to_base(model)
+
+        reference_logits, _ = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+        )
+
+        base_to_lora(model)
+
+        if self.sentence_validator is not None:
+            # use valid list instead of invalid list
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            invalid = validator_dict["invalid"]
+            valid_score = validator_dict["valid_score"]
+            reference_logits_norm = torch.nn.functional.log_softmax(
+                reference_logits / reward_temperature, dim=-1
+            )
+            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+
+            # apply invalid mask
             invalid_list = []
-            for i in range(reward.shape[0]):
-                # prompt_len: large enough value
-                # prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
-
-                # generate linear incresement part for the rest of the sequence
-                # rectify using SA Scores
+            for i in range(reward_mixed.shape[0]):
+                # apply group advantage
+                start_values = -2 * self.invalid_start_ratio
+                end_values = -2 * self.invalid_end_ratio
                 seq = torch.linspace(
-                    start=start_values[i] * ((10 - sa[i]) / self.sa_threshold),
-                    end=end_values[i],
-                    steps=reward.shape[1],
-                    device=reward.device,
+                    start=start_values,
+                    end=end_values,
+                    steps=reward_mixed.shape[1],
+                    device=reward_mixed.device,
                 )
                 invalid_list.append(seq)
 
-            invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
+            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
 
-            reward = torch.min(reward, invalid_value * invalid)
+        return torch.min(reward_mixed, invalid_value), reward_mixed
 
-        return reward, reward_unpenalized
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask_Group:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator,
+        valid_sentence_alpha=None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        target_score_alpha: float = 0.3,
+        advantage_alpha: float = 0.5,
+        target_score_threshold: float = 5.0,
+    ):
+        # reward = logP + alpha * reward_norm + advantage * alpha_ad
+        self.advantage_alpha = advantage_alpha
+        self.target_score_alpha = target_score_alpha
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.target_score_threshold = target_score_threshold
+
+        # temperature for the target score
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature=1.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        naughty_vocab_alpha=-99,
+        invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
+        **kwargs,
+    ):
+        lora_to_base(model)
+
+        reference_logits, _ = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+        )
+
+        base_to_lora(model)
+
+        if self.sentence_validator is not None:
+            # use valid list instead of invalid list
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            invalid = validator_dict["invalid"]
+            valid_score = validator_dict["valid_score"]
+
+            # reference_logits_norm = torch.nn.functional.log_softmax(reference_logits / reward_temperature, dim=-1)
+            # reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            # reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+
+            with torch.no_grad():
+                valid_positions = ~invalid.bool()  # [B, L]
+                valid_logits = reference_logits[valid_positions]  # [B*L_valid]
+                logit_mean = valid_logits.mean()
+                logit_std = valid_logits.std()
+
+                # Reward scale to reference logits
+                score_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)  # [B]
+                rescaled_score = score_norm * logit_std + logit_mean  # [B]
+
+            advantage = rescaled_score - rescaled_score.mean(dim=0)
+
+            reward_mixed = (
+                (reference_logits / reward_temperature)
+                + self.advantage_alpha * advantage
+                + self.target_score_alpha * rescaled_score
+            )
+
+            # apply invalid mask
+            invalid_list = []
+            for i in range(reward_mixed.shape[0]):
+                # apply group advantage
+                min_value = torch.min(reward_mixed[i, :])
+                base_start = min_value * self.invalid_start_ratio
+                base_end = min_value * self.invalid_end_ratio
+                # dynamic_factor = 1.0 + 0.5 * (rescaled_score[i] - logit_mean) / (logit_std + 1e-8)
+                dynamic_factor = 1.0
+                start_values = base_start * dynamic_factor
+                end_values = base_end * dynamic_factor
+                seq = torch.linspace(
+                    start=start_values,
+                    end=end_values,
+                    steps=reward_mixed.shape[1],
+                    device=reward_mixed.device,
+                )
+                invalid_list.append(seq)
+
+            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
+
+        return torch.min(reward_mixed, invalid_value), reward_mixed
+
+
+class Reference_Target_Score_ZNorm_Positive_Mixed_Invalid_Mask_Group:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator,
+        valid_sentence_alpha=None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        target_score_alpha: float = 0.3,
+        advantage_alpha: float = 0.5,
+        target_score_threshold: float = 5.0,
+    ):
+        # reward = logP + alpha * reward_norm + advantage * alpha_ad
+        self.advantage_alpha = advantage_alpha
+        self.target_score_alpha = target_score_alpha
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.target_score_threshold = target_score_threshold
+
+        # temperature for the target score
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature=1.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        naughty_vocab_alpha=-99,
+        invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
+        **kwargs,
+    ):
+        lora_to_base(model)
+
+        reference_logits, _ = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+        )
+
+        base_to_lora(model)
+
+        if self.sentence_validator is not None:
+            # use valid list instead of invalid list
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            invalid = validator_dict["invalid"]
+            valid_score = validator_dict["valid_score"]
+
+            reference_logits_norm = torch.nn.functional.log_softmax(
+                reference_logits / reward_temperature, dim=-1
+            )
+            # reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            # reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+
+            score_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)  # [B]
+
+            advantage = score_norm - score_norm.mean(dim=0)
+
+            reward_mixed = (
+                reference_logits_norm
+                + self.advantage_alpha * advantage
+                + self.target_score_alpha * score_norm
+            )
+
+            # apply invalid mask
+            invalid_list = []
+            for i in range(reward_mixed.shape[0]):
+                # apply group advantage
+                min_value = torch.min(reward_mixed[i, :])
+                base_start = min_value * self.invalid_start_ratio
+                base_end = min_value * self.invalid_end_ratio
+                # dynamic_factor = 1.0 + 0.5 * (rescaled_score[i] - logit_mean) / (logit_std + 1e-8)
+                dynamic_factor = 1.0
+                start_values = base_start * dynamic_factor
+                end_values = base_end * dynamic_factor
+                seq = torch.linspace(
+                    start=start_values,
+                    end=end_values,
+                    steps=reward_mixed.shape[1],
+                    device=reward_mixed.device,
+                )
+                invalid_list.append(seq)
+
+            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
+
+        return torch.min(reward_mixed, invalid_value), reward_mixed
+
+
+class Reference_Target_Score_ZNorm_Positive_Mixed_Invalid_Mask_GroupAdvantage:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator,
+        valid_sentence_alpha=None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        target_score_alpha: float = 0.3,
+        advantage_alpha: float = 0.5,
+        target_score_threshold: float = 5.0,
+        decay_gamma: float = 1.0,
+    ):
+        # reward = logP + alpha * reward_norm + advantage * alpha_ad
+        self.advantage_alpha = advantage_alpha
+        self.target_score_alpha = target_score_alpha
+        self.sentence_validator = sentence_validator
+        self.valid_sentence_alpha = valid_sentence_alpha
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.target_score_threshold = target_score_threshold
+        self.decay_gamma = decay_gamma  # decay factor for position-based reward weighting
+
+        # temperature for the target score
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch,
+        prompt_length,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature=1.0,
+        vocab_nice_mask=None,
+        vocab_naughty_mask=None,
+        naughty_vocab_alpha=-99,
+        invalid_vocab_alpha=-99,
+        target_molecule: Optional[str] = None,
+        **kwargs,
+    ):
+        lora_to_base(model)
+
+        reference_logits, _ = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+        )
+
+        base_to_lora(model)
+
+        if self.sentence_validator is not None:
+            # use valid list instead of invalid list
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            invalid = validator_dict["invalid"]
+            valid_score = validator_dict["valid_score"]
+
+            reference_logits_norm = torch.nn.functional.log_softmax(
+                reference_logits / reward_temperature, dim=-1
+            )
+            # reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
+            # reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+
+            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)  # [B]
+            T = valid_score.shape[1]
+            positions = torch.arange(T, device=valid_score.device).expand_as(valid_score)  # [B, L]
+            decay_weights = self.decay_gamma ** (T - positions)  # [B, L]
+            reward_weighted = reward_norm * decay_weights  # [B, L]
+            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_weighted
+
+            # group advantage
+            reward_mixed = reward_mixed - reward_mixed.mean(dim=0)  # [B, L]
+            # apply invalid mask
+            invalid_list = []
+            for i in range(reward_mixed.shape[0]):
+                # apply group advantage
+                min_value = torch.min(reward_mixed[i, :])
+                base_start = min_value * self.invalid_start_ratio
+                base_end = min_value * self.invalid_end_ratio
+                # dynamic_factor = 1.0 + 0.5 * (rescaled_score[i] - logit_mean) / (logit_std + 1e-8)
+                dynamic_factor = 1.0
+                start_values = base_start * dynamic_factor
+                end_values = base_end * dynamic_factor
+                seq = torch.linspace(
+                    start=start_values,
+                    end=end_values,
+                    steps=reward_mixed.shape[1],
+                    device=reward_mixed.device,
+                )
+                invalid_list.append(seq)
+
+            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
+
+        return torch.min(reward_mixed, invalid_value), reward_mixed
 
 
 class UniformModelSentenceGivenPrompt:

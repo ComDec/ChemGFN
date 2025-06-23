@@ -60,7 +60,7 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
 
 def generate_and_return_termination_logprob(
     model,
-    encoded_prompt,
+    encoded_data,
     termination_token_id,
     reward_fn,
     grammar_processor=None,
@@ -79,6 +79,7 @@ def generate_and_return_termination_logprob(
     buffer_mixture_ratio=0.5,
 ):
     # generate and return the probability of terminating at every step
+    encoded_prompt = encoded_data["encoded_prompt"]
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
     prompt_len = encoded_prompt.size(1)
     state = encoded_prompt.clone()
@@ -211,6 +212,166 @@ def generate_and_return_termination_logprob(
             invalid_vocab_alpha=invalid_vocab_alpha,
             agree_list=torch.stack(agree_list, dim=0),
             termination_token_id=termination_token_id,
+        )
+    # add a termination token to the end of the sequence
+    return state, log_pf, log_pterm, log_r, log_r_unpenalized
+
+
+def generate_and_return_termination_logprob_for_sidechain_opt(
+    model,
+    encoded_data,
+    termination_token_id,
+    reward_fn,
+    grammar_processor=None,
+    vocab_nice_mask=None,
+    vocab_naughty_mask=None,
+    naughty_vocab_alpha=float("-inf"),
+    invalid_vocab_alpha=-50,
+    max_len=10,
+    min_len=0,
+    temperature=1.0,
+    reward_temperature=1.0,
+    action_seq=None,
+    skip_rewards=False,
+    use_buffer_sample=False,
+    buffer_sample=None,
+    buffer_mixture_ratio=0.5,
+):
+    # generate and return the probability of terminating at every step
+    encoded_prompt = encoded_data["encoded_prompt"]
+    target_molecule = encoded_data["molecule"]
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    prompt_len = encoded_prompt.size(1)
+    state = encoded_prompt.clone()
+    log_pf = []
+    log_pterm = []
+    token_ids = state  # For caching hidden states during generation
+    past_key_values = None  # For caching hidden states during generation
+    if grammar_processor is not None:
+        try:
+            grammar_processor.reset()
+            grammar_processor.set_prompt_length(prompt_len)
+        except:
+            pass
+        logits_processor = LogitsProcessorList([grammar_processor])
+    else:
+        logits_processor = LogitsProcessorList([])
+
+    agree_list = []
+
+    # according mixture_ratio, ramdom replace token_ids with buffer_sample
+    nums_replace = max(1, int(token_ids.size(0) * buffer_mixture_ratio))
+
+    # main loop
+    for i in range(max_len + 1):
+        output = model(input_ids=token_ids, past_key_values=past_key_values)
+        past_key_values = output.past_key_values
+        logits = output.logits[:, -1, :]
+
+        if action_seq is None:
+            with torch.no_grad():
+                modified_logits = logits.clone().detach()
+                # apply logits processor
+                results = logits_processor(state, modified_logits)
+                modified_logits = results["masked_logits"]
+                agree_list.append(results["acceptance"])
+
+                ## debug block ##
+                # print(f"\nacceptance: {results['acceptance'].sum(dim=-1)}\n")
+                # print(f"state: {state}")
+                # print(f"token_ids: {token_ids}")
+
+                if i < min_len:
+                    # if model generate eos normally but we don't reach the min_len
+                    # then we get full nan probability
+                    non_eos_only = torch.where(results["acceptance"].sum(dim=1) != 1)[0]
+                    modified_logits[non_eos_only, termination_token_id] = -torch.inf
+
+                elif i >= max_len:
+                    mask = torch.ones_like(modified_logits, dtype=torch.bool)
+                    mask[:, termination_token_id] = False  # EOS token保留
+                    modified_logits[mask] = -torch.inf
+                    # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
+                    modified_logits[:, termination_token_id] = 0
+
+                prob = (modified_logits / temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+
+                # print(f"prob: {prob}\n state: {state}\n token_ids: {token_ids}")
+                if use_buffer_sample:
+                    # Use efficient sampling methods
+                    if i < buffer_sample.size(-1):
+                        if i >= max_len:
+                            token_ids[:nums_replace, :] = termination_token_id
+                        else:
+                            token_ids[:nums_replace, :] = buffer_sample[
+                                :nums_replace, i
+                            ].unsqueeze(-1)
+                    else:
+                        token_ids[:nums_replace, :] = termination_token_id
+
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
+                    -1
+                )
+            else:
+                token_ids = action_seq[:, prompt_len - 1 + i].unsqueeze(-1)
+                agree_list.append(
+                    vocab_nice_mask.unsqueeze(0).repeat(token_ids.size(0), 1).to(token_ids.device)
+                )
+
+        token_ids = torch.where(
+            active_seqs.unsqueeze(-1),
+            token_ids,
+            termination_token_id,
+        )
+
+        logprob = logits.log_softmax(dim=-1)
+
+        # prob list for termination token by steps
+        log_pterm.append(
+            torch.where(
+                active_seqs,
+                logprob[:, termination_token_id],
+                0,
+            )
+        )
+        active_seqs = active_seqs * (token_ids != termination_token_id).squeeze(-1)
+
+        # prob list for the generated token by steps
+        log_pf.append(
+            torch.where(
+                active_seqs,
+                logprob.gather(-1, token_ids).squeeze(-1),
+                0,
+            )
+        )
+        # update the state, i.e., the sequence so far
+        state = torch.cat([state, token_ids], dim=-1)
+
+        # check if all sequences have terminated, apply when we need non-fixed length generation
+        # if torch.all(~active_seqs):
+        #     break
+
+    log_pf = torch.stack(log_pf, dim=1)
+    log_pterm = torch.stack(log_pterm, dim=1)
+
+    if skip_rewards:
+        log_r, log_r_unpenalized = None, None
+    else:
+        # Reward for all intermediate states (except the last one,
+        # which is guaranteed to be the termination token)
+        log_r, log_r_unpenalized = reward_fn(
+            state[:, :-1],
+            reward_temperature=reward_temperature,
+            vocab_nice_mask=vocab_nice_mask,
+            vocab_naughty_mask=vocab_naughty_mask,
+            naughty_vocab_alpha=naughty_vocab_alpha,
+            invalid_vocab_alpha=invalid_vocab_alpha,
+            agree_list=torch.stack(agree_list, dim=0),
+            termination_token_id=termination_token_id,
+            target_molecule=target_molecule,
         )
     # add a termination token to the end of the sequence
     return state, log_pf, log_pterm, log_r, log_r_unpenalized

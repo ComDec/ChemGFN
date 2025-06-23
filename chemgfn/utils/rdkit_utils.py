@@ -64,3 +64,21 @@ def sa_scorer(mol):
         return sascorer.calculateScore(mol)
     except:
         return 0
+
+
+def logP(mol):
+    """
+    Calculate the logP of a molecule.
+    """
+    if mol is None:
+        return -1
+    try:
+        return Descriptors.MolLogP(mol)
+    except:
+        return -1
+
+
+FUNCTION_MAPPING = {
+    "sa": sa_scorer,
+    "logP": logP,
+}

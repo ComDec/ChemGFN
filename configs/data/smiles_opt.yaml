@@ -1,0 +1,13 @@
+_target_: chemgfn.data.gfn_datamodule.MolOptDataModule
+tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
+data_path: ${paths.data_dir}SMILES/sidechain_prompts.json
+buffer_sample_path: ${paths.data_dir}SMILES/buffer_smiles_test.pt
+train_size: 0.95
+num_workers: 8
+pin_memory: True
+total_size: 10000
+prompt_size: 1
+add_prompt: False
+allowed_vocab_path: ${model.constraint_config.legal_tokens}
+n_samples: ${model.training_mixed_config.n_samples}
+buffer_tokenization: False
