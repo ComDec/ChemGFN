@@ -1174,7 +1174,7 @@ class Reference_Target_ZNorm_Positive_Mixed_Invalid_Mask_Group_Score_Advantage:
                         self.target_score_alpha_base, device=valid_score_scaled.device
                     ).expand_as(valid_score_scaled)
                     + advantage_alpha * valid_score_scaled
-                )
+                ).unsqueeze(-1)
                 * reward_norm
             )
 
