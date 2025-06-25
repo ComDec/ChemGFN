@@ -1,0 +1,52 @@
+# @package _global_
+
+# to execute this experiment run:
+# python train.py experiment=example
+
+defaults:
+  - override /data: smiles_opt
+  - override /model: llama3_smiles_opt_advantage_znorm_group
+  - override /callbacks: default
+  - override /trainer: default
+
+# all parameters below will be merged with parameters from default configurations set above
+# this allows you to overwrite only specified parameters
+
+tags: ["ChemGFN"]
+
+seed: 42
+
+trainer:
+  max_epochs: 50
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 4
+  default_root_dir: ${paths.output_dir}
+  precision: bf16-true
+  devices: 4
+
+model:
+  reward:
+    _target_: chemgfn.models.reward.Reference_Target_ZNorm_Positive_Mixed_Invalid_Mask_Group_Score_Advantage
+    valid_sentence_alpha: 1.0
+    invalid_start_ratio: 0.2
+    invalid_end_ratio: 1.2
+    target_score_alpha_base: 0.5
+    advantage_alpha: 0.2
+    sentence_validator:
+      _target_: chemgfn.models.reward.RDKitValidator
+      scorer: "logP_drug"
+
+  training_mixed_config:
+    n_samples: 32
+
+  reward_config:
+    reward_temp_start: 2
+    reward_temp_end: 0.8
+    reward_temp_horizon: 50000
+    invalid_vocab_alpha: -80
+    advantage_alpha_start: 0.01
+    advantage_alpha_end: 0.5
+    advantage_alpha_horizon: 50000
+
+data:
+  num_workers: 8

@@ -78,6 +78,12 @@ class ChemGFNModule(LightningModule):
             reward_config["reward_temp_end"] - reward_config["reward_temp_start"]
         ) * min(1, step / reward_config["reward_temp_horizon"])
 
+        self.get_advantage_alpha_at_step = lambda step: (
+            reward_config["advantage_alpha_start"]
+            - (reward_config["advantage_alpha_start"] - reward_config["advantage_alpha_end"])
+            * min(1, step / reward_config["advantage_alpha_horizon"])
+        )
+
         # set use buffer sample at certain step
         self.get_use_buffer_sample_at_step = lambda step: (
             training_mixed_config["use_buffer_sample_start_prob"]
@@ -180,6 +186,7 @@ class ChemGFNModule(LightningModule):
         n_samples=None,
         pf_temperature=1.0,
         reward_temperature=1.0,
+        advantage_alpha=0.01,
         action_seq=None,
         use_buffer_sample: bool = False,
         buffer_sample: Optional[torch.Tensor] = None,
@@ -208,6 +215,7 @@ class ChemGFNModule(LightningModule):
             "max_len": self.constraint_config.max_sentence_len,
             "temperature": pf_temperature,
             "reward_temperature": reward_temperature,
+            "advantage_alpha": advantage_alpha,
             "skip_rewards": False,
             "action_seq": action_seq,
             "vocab_nice_mask": self.legal_tokens_mask,
@@ -249,7 +257,7 @@ class ChemGFNModule(LightningModule):
             log_r = log_r[
                 :, : generated_text.shape[1] - len(encoded_prompt)
             ]  # Undo padding from buffer
-            log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
+            # log_r *= 1 / self.reward.temperature  # redo the effect of reward tempering
             pf_temp = 1.0
 
         else:
@@ -275,6 +283,7 @@ class ChemGFNModule(LightningModule):
                 item,
                 pf_temperature=pf_temp,
                 reward_temperature=self.reward.temperature,
+                advantage_alpha=self.get_advantage_alpha_at_step(self.global_step),
                 use_buffer_sample=use_buffer_sample,
                 buffer_sample=buffer_sample,
                 buffer_mixture_ratio=self.buffer_mixture_ratio,
@@ -484,8 +493,12 @@ class ChemGFNModule(LightningModule):
         self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
     ) -> None:
         reward_temp = self.get_reward_temp_at_step(self.global_step)
+        advantage_alpha = self.get_advantage_alpha_at_step(self.global_step)
         lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
+        self.reward.advantage_alpha = advantage_alpha
+
+        self.log("train/advantage_alpha", advantage_alpha, sync_dist=True, on_step=True)
         self.log("train/reward_temp", reward_temp, sync_dist=True, on_step=True)
 
         for pg in self.optimizers().param_groups:

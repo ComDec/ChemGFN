@@ -78,7 +78,20 @@ def logP(mol):
         return -1
 
 
+def logP_drug(mol):
+    """
+    Calculate the logP of a drug molecule, optimal range: 0-3.
+    """
+    if mol is None:
+        return -1
+    try:
+        return Descriptors.MolLogP(mol) if 0 <= Descriptors.MolLogP(mol) <= 3 else -1
+    except:
+        return -1
+
+
 FUNCTION_MAPPING = {
     "sa": sa_scorer,
     "logP": logP,
+    "logP_drug": logP_drug,
 }

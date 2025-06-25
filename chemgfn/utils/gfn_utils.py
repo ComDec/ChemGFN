@@ -231,6 +231,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     min_len=0,
     temperature=1.0,
     reward_temperature=1.0,
+    advantage_alpha=0.5,
     action_seq=None,
     skip_rewards=False,
     use_buffer_sample=False,
@@ -365,6 +366,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         log_r, log_r_unpenalized = reward_fn(
             state[:, :-1],
             reward_temperature=reward_temperature,
+            advantage_alpha=advantage_alpha,
             vocab_nice_mask=vocab_nice_mask,
             vocab_naughty_mask=vocab_naughty_mask,
             naughty_vocab_alpha=naughty_vocab_alpha,
