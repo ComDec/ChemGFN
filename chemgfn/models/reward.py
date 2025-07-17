@@ -178,6 +178,7 @@ class RDKitValidator(SentenceValidator):
             "acc": correct / generated_tokens.shape[0],
             "strict_acc": strict_correct / generated_tokens.shape[0],
             f"{self.scorer}": avg_sa_score / generated_tokens.shape[0],
+            f"{self.scorer}_filter": avg_sa_score / correct if correct > 0 else 0.0,
         }
 
     def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
@@ -708,7 +709,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
         target_score_alpha: float = 0.1,
-        target_score_threshold: float = 5.0,
+        **kwargs,
     ):
         # reward = logP + alpha * reward_norm
         self.target_score_alpha = target_score_alpha
@@ -716,7 +717,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
-        self.target_score_threshold = target_score_threshold
 
         # temperature for the target score
         self.temperature = 1.0
@@ -732,6 +732,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         vocab_naughty_mask=None,
         naughty_vocab_alpha=-99,
         invalid_vocab_alpha=-99,
+        advantage_alpha=0.5,
         target_molecule: Optional[str] = None,
         **kwargs,
     ):
@@ -760,15 +761,17 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             reference_logits_norm = torch.nn.functional.log_softmax(
                 reference_logits / reward_temperature, dim=-1
             )
+            # TODO: print reward/ vars
             reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
-            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
+            reward_mixed = reference_logits_norm + advantage_alpha * reward_norm
 
             # apply invalid mask
             invalid_list = []
             for i in range(reward_mixed.shape[0]):
                 # apply group advantage
-                start_values = -2 * self.invalid_start_ratio
-                end_values = -2 * self.invalid_end_ratio
+                min_value = torch.min(reward_mixed[i, :])
+                start_values = min_value * self.invalid_start_ratio
+                end_values = min_value * self.invalid_end_ratio
                 seq = torch.linspace(
                     start=start_values,
                     end=end_values,
@@ -898,6 +901,7 @@ class Reference_Target_Score_ZNorm_Positive_Mixed_Invalid_Mask_Group:
         target_score_alpha: float = 0.3,
         advantage_alpha: float = 0.5,
         target_score_threshold: float = 5.0,
+        **kwargs,
     ):
         # reward = logP + alpha * reward_norm + advantage * alpha_ad
         self.advantage_alpha = advantage_alpha
@@ -958,9 +962,10 @@ class Reference_Target_Score_ZNorm_Positive_Mixed_Invalid_Mask_Group:
 
             advantage = score_norm - score_norm.mean(dim=0)
 
+            # TODO: ReLU advantage;
             reward_mixed = (
                 reference_logits_norm
-                + self.advantage_alpha * advantage
+                + torch.nn.functional.relu(0.01 * advantage)
                 + self.target_score_alpha * score_norm
             )
 

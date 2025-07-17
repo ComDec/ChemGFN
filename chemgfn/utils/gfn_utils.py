@@ -14,7 +14,12 @@ from rdkit import Chem, RDLogger
 # from sentence_transformers import SentenceTransformer
 # from sentence_transformers.util import cos_sim
 from transformers import PreTrainedTokenizer
-from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation.logits_process import (
+    LogitsProcessorList,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -77,6 +82,8 @@ def generate_and_return_termination_logprob(
     use_buffer_sample=False,
     buffer_sample=None,
     buffer_mixture_ratio=0.5,
+    topk: int = 5,
+    topP: float = 0.8,
 ):
     # generate and return the probability of terminating at every step
     encoded_prompt = encoded_data["encoded_prompt"]
@@ -94,9 +101,13 @@ def generate_and_return_termination_logprob(
             grammar_processor.set_prompt_length(prompt_len)
         except:
             pass
-        logits_processor = LogitsProcessorList([grammar_processor])
+        logits_processor = grammar_processor
     else:
         logits_processor = LogitsProcessorList([])
+
+    default_processor = LogitsProcessorList(
+        [TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)]
+    )
 
     agree_list = []
 
@@ -111,7 +122,7 @@ def generate_and_return_termination_logprob(
 
         if action_seq is None:
             with torch.no_grad():
-                modified_logits = logits.clone().detach()
+                modified_logits = default_processor(logits.clone().detach())
                 # apply logits processor
                 results = logits_processor(state, modified_logits)
                 modified_logits = results["masked_logits"]
@@ -227,16 +238,18 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     vocab_naughty_mask=None,
     naughty_vocab_alpha=float("-inf"),
     invalid_vocab_alpha=-50,
-    max_len=10,
-    min_len=0,
-    temperature=1.0,
-    reward_temperature=1.0,
-    advantage_alpha=0.5,
+    max_len: int = 10,
+    min_len: int = 0,
+    temperature: float = 1.0,
+    reward_temperature: float = 1.0,
+    advantage_alpha: float = 0.5,
     action_seq=None,
-    skip_rewards=False,
-    use_buffer_sample=False,
+    skip_rewards: bool = False,
+    use_buffer_sample: bool = False,
     buffer_sample=None,
-    buffer_mixture_ratio=0.5,
+    buffer_mixture_ratio: float = 0.5,
+    topk: int = 5,
+    topP: float = 0.8,
 ):
     # generate and return the probability of terminating at every step
     encoded_prompt = encoded_data["encoded_prompt"]
@@ -254,10 +267,12 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
             grammar_processor.set_prompt_length(prompt_len)
         except:
             pass
-        logits_processor = LogitsProcessorList([grammar_processor])
+        logits_processor = grammar_processor
     else:
         logits_processor = LogitsProcessorList([])
 
+    # default_processor = LogitsProcessorList([TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)])
+    default_processor = LogitsProcessorList([])
     agree_list = []
 
     # according mixture_ratio, ramdom replace token_ids with buffer_sample
@@ -271,30 +286,24 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
 
         if action_seq is None:
             with torch.no_grad():
-                modified_logits = logits.clone().detach()
+                modified_logits = default_processor(state, logits.clone().detach())
                 # apply logits processor
-                results = logits_processor(state, modified_logits)
+                results = logits_processor(state, modified_logits, min_len)
                 modified_logits = results["masked_logits"]
                 agree_list.append(results["acceptance"])
-
                 ## debug block ##
                 # print(f"\nacceptance: {results['acceptance'].sum(dim=-1)}\n")
                 # print(f"state: {state}")
                 # print(f"token_ids: {token_ids}")
 
-                if i < min_len:
-                    # if model generate eos normally but we don't reach the min_len
-                    # then we get full nan probability
-                    non_eos_only = torch.where(results["acceptance"].sum(dim=1) != 1)[0]
-                    modified_logits[non_eos_only, termination_token_id] = -torch.inf
-
-                elif i >= max_len:
+                if i >= max_len:
                     mask = torch.ones_like(modified_logits, dtype=torch.bool)
                     mask[:, termination_token_id] = False  # EOS token保留
                     modified_logits[mask] = -torch.inf
                     # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
                     modified_logits[:, termination_token_id] = 0
 
+                # TODO: EOS fetching problem, temperature
                 prob = (modified_logits / temperature).softmax(dim=-1)
                 token_ids = torch.multinomial(prob, num_samples=1)
 
@@ -354,7 +363,6 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         # check if all sequences have terminated, apply when we need non-fixed length generation
         # if torch.all(~active_seqs):
         #     break
-
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
 
@@ -376,7 +384,15 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
             target_molecule=target_molecule,
         )
     # add a termination token to the end of the sequence
-    return state, log_pf, log_pterm, log_r, log_r_unpenalized
+
+    return {
+        "state": state,
+        "log_pf": log_pf,
+        "log_pterm": log_pterm,
+        "log_r": log_r,
+        "log_r_unpenalized": log_r_unpenalized,
+        "agree_list": agree_list,
+    }
 
 
 def modified_subtb_loss(

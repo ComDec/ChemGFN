@@ -18,6 +18,7 @@ from transformers_cfg.generation.logits_process import (
     GrammarConstrainedLogitsProcessor,
     GrammarIncrementalLogitsProcessorForNumberOnly,
     GrammarIncrementalLogitsProcessorGeneral,
+    GrammarIncrementalLogitsProcessorSampleEnhanced,
     GrammarLimitedOneTimeLogitsProcessor,
     GrammarLogitsProcessorPartheseness,
 )
@@ -137,7 +138,16 @@ class ChemGFNModule(LightningModule):
                     nice_token_ids_list=self.legal_token_ids_list,
                     execution_mode=self.constraint_config.parse_mode,
                 )
-            if self.constraint_config.processor_type == "parenthese":
+
+            elif self.constraint_config.processor_type == "prefix_enhanced":
+                self.pre_grammar_processor = GrammarIncrementalLogitsProcessorSampleEnhanced(
+                    parsed_grammar,
+                    tokenizer=self.tokenizer,
+                    nice_token_ids_list=self.legal_token_ids_list,
+                    execution_mode=self.constraint_config.parse_mode,
+                )
+
+            elif self.constraint_config.processor_type == "parenthese":
                 self.pre_grammar_processor = GrammarLogitsProcessorPartheseness(
                     parsed_grammar,
                     tokenizer=self.tokenizer,
@@ -251,9 +261,14 @@ class ChemGFNModule(LightningModule):
             action_seq, log_r = self.reward_buffer.sample(
                 self.training_mixed_config.n_samples, encoded_prompt
             )
-            generated_text, log_pf, log_pterm, _, log_r_unpenalized = self.forward(
-                item, action_seq=action_seq
-            )
+            result_dict = self.forward(item, action_seq=action_seq)
+            generated_text = result_dict["state"]
+            log_pf = result_dict["log_pf"]
+            log_pterm = result_dict["log_pterm"]
+            log_r = result_dict["log_r"]
+            log_r_unpenalized = result_dict["log_r_unpenalized"]
+            agree_list = result_dict["agree_list"]
+
             log_r = log_r[
                 :, : generated_text.shape[1] - len(encoded_prompt)
             ]  # Undo padding from buffer
@@ -279,7 +294,8 @@ class ChemGFNModule(LightningModule):
                 )
             else:  # Without tempering
                 pf_temp = 1.0
-            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
+
+            result_dict = self.forward(
                 item,
                 pf_temperature=pf_temp,
                 reward_temperature=self.reward.temperature,
@@ -289,12 +305,51 @@ class ChemGFNModule(LightningModule):
                 buffer_mixture_ratio=self.buffer_mixture_ratio,
             )
 
+            generated_text = result_dict["state"]
+            log_pf = result_dict["log_pf"]
+            log_pterm = result_dict["log_pterm"]
+            log_r = result_dict["log_r"]
+            log_r_unpenalized = result_dict["log_r_unpenalized"]
+            agree_list = result_dict["agree_list"]
+
             self.reward_buffer.add_batch(
                 prompt=encoded_prompt,
                 sentences=generated_text[:, len(encoded_prompt) :],
                 logrewards=log_r * self.reward.temperature,  # undo the effect of reward tempering
                 tokenizer=self.tokenizer,
             )
+
+        # sum of agree list
+        agree_sum = [torch.mean(x.sum(-1).float()).item() for x in agree_list]
+
+        self.log(
+            "train/agree_mean",
+            torch.tensor(agree_sum, device=self.device).mean(),
+            sync_dist=True,
+            on_step=True,
+        )
+
+        self.log(
+            "train/agree_start",
+            torch.tensor(agree_sum[0], device=self.device),
+            sync_dist=True,
+            on_step=True,
+        )
+
+        self.log(
+            "train/agree_midd",
+            torch.tensor(agree_sum[int(len(agree_sum) / 2)], device=self.device),
+            sync_dist=True,
+            on_step=True,
+        )
+
+        self.log(
+            "train/agree_end",
+            torch.tensor(agree_sum[-1], device=self.device),
+            sync_dist=True,
+            on_step=True,
+        )
+
         # Get the GFN loss
         loss = modified_subtb_loss(
             log_pf=log_pf,
@@ -416,9 +471,13 @@ class ChemGFNModule(LightningModule):
         # Should always be (1, prompt_len)
         encoded_prompt = batch["encoded_prompt"]
         # Sample a sentence and get the reward
-        generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-            batch, reward_temperature=1.0, pf_temperature=1.0
-        )
+        result_dict = self.forward(batch, reward_temperature=1.0, pf_temperature=1.0)
+        generated_text = result_dict["state"]
+        log_pf = result_dict["log_pf"]
+        log_pterm = result_dict["log_pterm"]
+        log_r = result_dict["log_r"]
+        log_r_unpenalized = result_dict["log_r_unpenalized"]
+        agree_list = result_dict["agree_list"]
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -557,9 +616,15 @@ class ChemGFNModule(LightningModule):
             for key, value in item.items():
                 if isinstance(value, torch.Tensor):
                     item[key] = value.to(self.device)
-            generated_text, log_pf, log_pterm, log_r, log_r_unpenalized = self.forward(
-                item, pf_temperature=1.0
-            )
+            result_dict = self.forward(item, pf_temperature=1.0)
+            generated_text = result_dict["state"]
+            log_pf = result_dict["log_pf"]
+            log_pterm = result_dict["log_pterm"]
+            log_r = result_dict["log_r"]
+            log_r_unpenalized = result_dict["log_r_unpenalized"]
+            agree_list = result_dict["agree_list"]
+
+            # Get the GFN loss
             log_pfs, log_r, _, _ = get_termination_vals(
                 generated_text=generated_text,
                 log_pf=log_pf,
@@ -671,9 +736,12 @@ class ChemGFNModule(LightningModule):
                 if isinstance(value, torch.Tensor):
                     probe[key] = value.to(self.device)
             with torch.no_grad():
-                generated_text, _, _, log_r, log_r_unpenalized = self.forward(
-                    probe, n_samples=n_samples
+                result_dict = self.forward(
+                    probe, n_samples=n_samples, pf_temperature=1.0, reward_temperature=1.0
                 )
+                generated_text = result_dict["state"]
+                log_r = result_dict["log_r"]
+                log_r_unpenalized = result_dict["log_r_unpenalized"]
 
             log_ps, log_ps_unpenalized = get_termination_vals(
                 generated_text=generated_text,
