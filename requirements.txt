@@ -28,3 +28,4 @@ spacy
 pandas
 rdkit
 peft
+matplotlib
