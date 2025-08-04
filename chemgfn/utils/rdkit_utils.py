@@ -1,3 +1,4 @@
+import partialsmiles as pa
 import rdkit
 from rdkit import Chem, DataStructs
 from rdkit.Chem import (
@@ -54,6 +55,14 @@ def verify_smiles(smiles: str):
         return False
 
 
+def verify_smiles_pa(smiles: str):
+    try:
+        pa.ParseSmiles(smiles)
+        return True
+    except Exception:
+        return False
+
+
 def sa_scorer(mol):
     """
     Calculate the synthetic accessibility score of a molecule.
@@ -90,8 +99,21 @@ def logP_drug(mol):
         return -1
 
 
+def logP_relative(mol):
+    """
+    Calculate the logP of a molecule.
+    """
+    if mol is None:
+        return -1
+    try:
+        return Descriptors.MolLogP(mol) - 0.8561999999999999
+    except:
+        return -1
+
+
 FUNCTION_MAPPING = {
     "sa": sa_scorer,
     "logP": logP,
     "logP_drug": logP_drug,
+    "logP_relative": logP_relative,
 }

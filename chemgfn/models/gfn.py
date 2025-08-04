@@ -477,7 +477,6 @@ class ChemGFNModule(LightningModule):
         log_pterm = result_dict["log_pterm"]
         log_r = result_dict["log_r"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
-        agree_list = result_dict["agree_list"]
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -642,17 +641,14 @@ class ChemGFNModule(LightningModule):
 
         log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
         self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
+
         # Log probe samples
-        if (
-            self.val_probes is not None
-            and self.logger is not None
-            and self.trainer.current_epoch % 2 == 0
-        ):
+        if self.val_probes is not None and self.logger is not None:
             samples_table = self.sample_probes(self.val_probes)
             samples_table.to_csv(
                 os.path.join(
                     self.trainer.default_root_dir,
-                    f"samples_val_probes_{self.trainer.current_epoch}.csv",
+                    f"samples_val_probes_{self.trainer.global_step}.csv",
                 ),
                 index=False,
             )
@@ -742,6 +738,9 @@ class ChemGFNModule(LightningModule):
                 generated_text = result_dict["state"]
                 log_r = result_dict["log_r"]
                 log_r_unpenalized = result_dict["log_r_unpenalized"]
+                log_pf = result_dict["log_pf"]
+                log_pterm = result_dict["log_pterm"]
+                log_pf_ref = result_dict.get("log_pf_ref", None)
 
             log_ps, log_ps_unpenalized = get_termination_vals(
                 generated_text=generated_text,
@@ -769,18 +768,22 @@ class ChemGFNModule(LightningModule):
                     self.tokenizer.decode(text, skip_special_tokens=False)
                     for text in generated_text
                 ]
+
+            if result_dict.get("full_tokens", None) is not None:
+                generated_text = result_dict["full_tokens"]
+
             for i in range(len(generated_text)):
                 samples.append(
                     {
                         "Sampled sentence": generated_text[i],
-                        "logP(s)": log_ps[i].item(),
-                        "logP(s) unpenalized": log_ps_unpenalized[i].item(),
+                        "logPf": log_pf[i].tolist(),
+                        "logPf_ref": log_pf_ref[i].tolist() if log_pf_ref is not None else [],
+                        "logPterm": log_pterm[i].tolist(),
                         "logR": log_r[i].tolist(),
                         "logR unpenalized": log_r_unpenalized[i].tolist(),
                     }
                 )
         samples = pd.DataFrame(samples)
-        samples = samples.sort_values(by=["logP(s)"], ascending=False)
         return samples
 
     def sample_probes_baselines(self, probes, n_samples=4):

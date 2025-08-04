@@ -6,9 +6,9 @@ defaults:
 
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "epoch_{epoch:03d}_loss_{val/acc:.4f}"
-  monitor: "val/validator_acc"
-  mode: "max"
+  filename: "epoch_{epoch:03d}"
+  every_n_epochs: 10
+  monitor: "val/loss"
   save_last: True
   auto_insert_metric_name: False
 

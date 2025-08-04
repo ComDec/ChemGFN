@@ -371,7 +371,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     else:
         # Reward for all intermediate states (except the last one,
         # which is guaranteed to be the termination token)
-        log_r, log_r_unpenalized = reward_fn(
+        reward_results = reward_fn(
             state[:, :-1],
             reward_temperature=reward_temperature,
             advantage_alpha=advantage_alpha,
@@ -383,6 +383,11 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
             termination_token_id=termination_token_id,
             target_molecule=target_molecule,
         )
+        log_r = reward_results["reward"]
+        log_r_unpenalized = reward_results["reward_unpenalized"]
+        log_pf_ref = reward_results.get("log_pf_ref", None)
+        full_tokens = reward_results.get("full_tokens", None)
+
     # add a termination token to the end of the sequence
 
     return {
@@ -392,6 +397,8 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         "log_r": log_r,
         "log_r_unpenalized": log_r_unpenalized,
         "agree_list": agree_list,
+        "log_pf_ref": log_pf_ref,
+        "full_tokens": full_tokens,
     }
 
 

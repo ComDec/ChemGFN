@@ -5,7 +5,7 @@
 
 defaults:
   - override /data: smiles_opt
-  - override /model: llama3_smiles_opt_advantage_znorm_group
+  - override /model: llama3_smiles_opt
   - override /callbacks: default
   - override /trainer: default
 
@@ -14,6 +14,7 @@ defaults:
 
 tags: ["ChemGFN"]
 
+exp_name: "debug"
 seed: 42
 
 trainer:
@@ -22,31 +23,34 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 4
+  devices: 1
 
 model:
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_ZNorm_Positive_Mixed_Invalid_Mask_Group_Score_Advantage
-    valid_sentence_alpha: 1.0
-    invalid_start_ratio: 0.2
-    invalid_end_ratio: 1.2
-    target_score_alpha_base: 0.5
-    advantage_alpha: 0.2
+    _target_: chemgfn.models.reward.Reference_Invalid_Mask
+    invalid_start_ratio: 3
+    invalid_end_ratio: 1.5
+    target_score_alpha: 0.8
     sentence_validator:
       _target_: chemgfn.models.reward.RDKitValidator
-      scorer: "logP_drug"
-
-  training_mixed_config:
-    n_samples: 32
-
+      scorer: "logP"
+      backend: "pa"
+  constraint_config:
+    min_sentence_len: 2
+    max_sentence_len: 5
+    grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
+    apply_grammar: true
+    processor_type: "prefix"
+    parse_mode: "full"  # can be "full" or "limited"
   reward_config:
-    reward_temp_start: 2
-    reward_temp_end: 0.8
-    reward_temp_horizon: 50000
-    invalid_vocab_alpha: -80
-    advantage_alpha_start: 0.01
+    advantage_alpha_start: 0.5
     advantage_alpha_end: 0.5
-    advantage_alpha_horizon: 50000
+    advantage_alpha_horizon: 500000
 
 data:
   num_workers: 8
+
+logger:
+  wandb:
+    project: "ChemGFN"
+    offline: false
