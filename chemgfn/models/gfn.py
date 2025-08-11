@@ -27,6 +27,7 @@ from transformers_cfg.parser import parse_ebnf
 from transformers_cfg.recognizer import StringRecognizer
 
 from chemgfn.utils.gfn_utils import (
+    ReplayBuffer,
     base_to_lora,
     generate_and_return_termination_logprob,
     generate_and_return_termination_logprob_for_sidechain_opt,
@@ -97,7 +98,7 @@ class ChemGFNModule(LightningModule):
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
         self.reward = reward
-        self.reward_buffer = reward_buffer
+        self.reward_buffer: ReplayBuffer = reward_buffer
         self.reward_buffer.set_termination_token_id(self.end_of_sentence_token_id)
         if os.path.exists(self.constraint_config.legal_tokens):
             (
@@ -251,15 +252,16 @@ class ChemGFNModule(LightningModule):
         encoded_prompt = item["encoded_prompt"]
         buffer_sample = item["buffer_encoded_sample"]
         # Sample a sentence and get the reward
-
         if (
             random.random() < self.training_mixed_config.use_buffer_prob
-            and self.reward_buffer.sample(self.training_mixed_config.n_samples, encoded_prompt)[0]
+            and self.reward_buffer.sample(
+                self.training_mixed_config.n_samples, encoded_prompt, self.tokenizer
+            )[0]
             is not None
         ):
             # Using a sample from the reward buffer
-            action_seq, log_r = self.reward_buffer.sample(
-                self.training_mixed_config.n_samples, encoded_prompt
+            action_seq, _ = self.reward_buffer.sample(
+                self.training_mixed_config.n_samples, encoded_prompt, self.tokenizer
             )
             result_dict = self.forward(item, action_seq=action_seq)
             generated_text = result_dict["state"]
@@ -277,7 +279,6 @@ class ChemGFNModule(LightningModule):
 
         else:
             # Using the forward policy
-
             if random.random() < self.get_use_buffer_sample_at_step(self.global_step):
                 use_buffer_sample = True
             else:
@@ -315,40 +316,42 @@ class ChemGFNModule(LightningModule):
             self.reward_buffer.add_batch(
                 prompt=encoded_prompt,
                 sentences=generated_text[:, len(encoded_prompt) :],
-                logrewards=log_r * self.reward.temperature,  # undo the effect of reward tempering
+                logrewards=log_r * self.reward.temperature,
                 tokenizer=self.tokenizer,
+                batch_invalid=result_dict["validator_dict"]["invalid"],
             )
 
         # sum of agree list
-        agree_sum = [torch.mean(x.sum(-1).float()).item() for x in agree_list]
+        if agree_list is not None:
+            agree_sum = [torch.mean(x.sum(-1).float()).item() for x in agree_list]
 
-        self.log(
-            "train/agree_mean",
-            torch.tensor(agree_sum, device=self.device).mean(),
-            sync_dist=True,
-            on_step=True,
-        )
+            self.log(
+                "train/agree_mean",
+                torch.tensor(agree_sum, device=self.device).mean(),
+                sync_dist=True,
+                on_step=True,
+            )
 
-        self.log(
-            "train/agree_start",
-            torch.tensor(agree_sum[0], device=self.device),
-            sync_dist=True,
-            on_step=True,
-        )
+            self.log(
+                "train/agree_start",
+                torch.tensor(agree_sum[0], device=self.device),
+                sync_dist=True,
+                on_step=True,
+            )
 
-        self.log(
-            "train/agree_midd",
-            torch.tensor(agree_sum[int(len(agree_sum) / 2)], device=self.device),
-            sync_dist=True,
-            on_step=True,
-        )
+            self.log(
+                "train/agree_midd",
+                torch.tensor(agree_sum[int(len(agree_sum) / 2)], device=self.device),
+                sync_dist=True,
+                on_step=True,
+            )
 
-        self.log(
-            "train/agree_end",
-            torch.tensor(agree_sum[-1], device=self.device),
-            sync_dist=True,
-            on_step=True,
-        )
+            self.log(
+                "train/agree_end",
+                torch.tensor(agree_sum[-1], device=self.device),
+                sync_dist=True,
+                on_step=True,
+            )
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -371,9 +374,10 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=len(encoded_prompt[0]),
         )
-
         validator_metric_dict = self.reward.sentence_validator.accuracy(
-            generated_text[:, encoded_prompt.shape[-1] :], self.tokenizer
+            generated_text[:, encoded_prompt.shape[-1] :],
+            self.tokenizer,
+            item.get("molecule", None),
         )
         self.train_sentence_length.append(sentence_len.detach().cpu())
 
@@ -396,6 +400,15 @@ class ChemGFNModule(LightningModule):
                         generated_text[0, encoded_prompt.shape[-1] :], skip_special_tokens=True
                     )
                     + f": pf_temp={pf_temp:.2f}"
+                )
+
+            replay_buffer_stats = self.reward_buffer.stat()
+            for key, value in replay_buffer_stats.items():
+                self.log(
+                    f"train/replay_buffer_{key}",
+                    value,
+                    sync_dist=True,
+                    on_step=True,
                 )
 
         self.log(
@@ -501,7 +514,9 @@ class ChemGFNModule(LightningModule):
         )
 
         validator_metric_dict = self.reward.sentence_validator.accuracy(
-            generated_text[:, encoded_prompt.shape[-1] :], self.tokenizer
+            generated_text[:, encoded_prompt.shape[-1] :],
+            self.tokenizer,
+            batch.get("molecule", None),
         )
 
         log_ps = last_log_r * self.reward.temperature
@@ -581,6 +596,15 @@ class ChemGFNModule(LightningModule):
         )
         plt.close()
 
+        self.reward_buffer.save_csv(
+            os.path.join(
+                self.trainer.default_root_dir,
+                "replay_buffer",
+                f"replay_{self.trainer.current_epoch}.csv",
+            ),
+            self.tokenizer,
+        )
+
         self.logger.log_table(
             "train/samples_latest",
             dataframe=df,
@@ -592,16 +616,6 @@ class ChemGFNModule(LightningModule):
         # Log scheduled quantities
         self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
         self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
-
-        # Log probe samples
-        # There is no need to sample probes during training
-        # if (
-        #     self.train_probes is not None
-        #     and self.logger is not None
-        #     and self.trainer.current_epoch % 1 == 0
-        # ):
-        #     samples_table = self.sample_probes(self.train_probes)
-        #     self.logger.log_table("samples/train_probes", dataframe=samples_table)
 
     def on_validation_epoch_start(self):
         # Log variance of (logR - logP(s)) using exploration, which should be 0.0
@@ -654,6 +668,21 @@ class ChemGFNModule(LightningModule):
             )
 
     def on_train_start(self):
+        # Sanity check probes
+        val_dataset = self.trainer.datamodule.val_dataloader().dataset
+        val_probes = torch.utils.data.Subset(
+            val_dataset, random.sample(range(len(val_dataset)), 10)
+        )
+        if val_probes is not None:
+            samples_table = self.sample_probes(self.val_probes)
+            samples_table.to_csv(
+                os.path.join(
+                    self.trainer.default_root_dir,
+                    f"samples_val_probes_wo_train_{self.trainer.global_step}.csv",
+                ),
+                index=False,
+            )
+
         if self.skip_baseline_sampling:
             return
         # Log baseline metrics
@@ -680,6 +709,7 @@ class ChemGFNModule(LightningModule):
             ),
             index=True,
         )
+
         # if baseline_performance is None:
         # baseline_performance = pd.DataFrame(
         #     data=np.zeros((5, len(samples))),

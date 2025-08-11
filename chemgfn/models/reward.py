@@ -45,7 +45,8 @@ def score_fast(
     # score the log probability of the input sequence while ignoring termination and padding tokens
     # if vocab_naughty_mask is not None:
     #     logits[:, :, vocab_naughty_mask] += naughty_vocab_alpha
-    logits[~agree_list.permute(1, 0, 2)] = -torch.inf
+    if agree_list is not None:
+        logits[~agree_list.permute(1, 0, 2)] = -torch.inf
     # Add reward temperature
     logits /= reward_temperature
     logprob = logits.log_softmax(-1)
@@ -89,8 +90,8 @@ class SentenceValidator:
 class RDKitValidator(SentenceValidator):
     def __init__(self, scorer: str = "sa", backend: Literal["rdkit", "pa"] = "rdkit") -> None:
         super().__init__(scorer)
-        self.scorer = scorer
-        self.score = FUNCTION_MAPPING[scorer]
+        self.score_function = FUNCTION_MAPPING[scorer]
+        self.scorer_name = scorer
         self.backend = backend
 
     @staticmethod
@@ -114,7 +115,7 @@ class RDKitValidator(SentenceValidator):
         except Exception:
             return False
 
-    def smiles_accuracy(self, generated_tokens, tokenizer):
+    def smiles_accuracy(self, generated_tokens, tokenizer, target_molecule: Optional[str] = None):
         smiles_list = []
 
         for batch in range(generated_tokens.shape[0]):
@@ -131,6 +132,8 @@ class RDKitValidator(SentenceValidator):
 
         for batch in range(generated_tokens.shape[0]):
             tokens = "".join(smiles_list[batch])
+            if target_molecule is not None:
+                tokens = target_molecule.replace("*", tokens)
             if self.backend == "rdkit":
                 valid = self.rdkit_validate(tokens)
             elif self.backend == "pa":
@@ -143,17 +146,19 @@ class RDKitValidator(SentenceValidator):
             else:
                 mol = Chem.MolFromSmiles(tokens)
 
-            avg_sa_score += self.score(mol) if mol else 0
+            avg_sa_score += self.score_function(mol) if mol else 0
             correct += 1 if mol else 0
 
         return {
             "acc": correct / generated_tokens.shape[0],
-            f"{self.scorer}": avg_sa_score / generated_tokens.shape[0],
-            f"{self.scorer}_filter": avg_sa_score / correct if correct > 0 else 0.0,
+            f"{self.scorer_name}": avg_sa_score / generated_tokens.shape[0],
+            f"{self.scorer_name}_filter": avg_sa_score / correct if correct > 0 else 0.0,
         }
 
-    def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
-        return self.smiles_accuracy(sentences, tokenizer)
+    def accuracy(
+        self, sentences, tokenizer: PreTrainedTokenizer, target_molecule: Optional[str] = None
+    ):
+        return self.smiles_accuracy(sentences, tokenizer, target_molecule)
 
     def __call__(
         self, sentences, tokenizer: PreTrainedTokenizer, target_molecule: Optional[str] = None
@@ -179,6 +184,7 @@ class RDKitValidator(SentenceValidator):
             sentences.shape[0],
             device=sentences.device,
         )
+
         full_tokens_list = []
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
@@ -203,7 +209,7 @@ class RDKitValidator(SentenceValidator):
                     else verify_smiles_pa(full_tokens)
                 )
                 valid_score[i, j + 1] = (
-                    self.score(Chem.MolFromSmiles(full_tokens)) if valid else 0.0
+                    self.score_function(Chem.MolFromSmiles(full_tokens)) if valid else -1
                 )
 
                 if valid:
@@ -619,7 +625,7 @@ class Reference_Invalid_Mask:
             invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
 
         return {
-            "reward": reward_mixed + invalid_value,
+            "reward": torch.min(reward_mixed, invalid_value),
             "reward_unpenalized": reward_mixed,
             "full_tokens": validator_dict.get("full_tokens", None),
             "log_pf_ref": reference_logits,
@@ -703,10 +709,11 @@ class Reference_Invalid_Mask_Z_score:
             invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
 
         return {
-            "reward": reward_mixed + invalid_value,
+            "reward": torch.min(reward_mixed, invalid_value),
             "reward_unpenalized": reward_mixed,
             "full_tokens": validator_dict.get("full_tokens", None),
             "log_pf_ref": reference_logits,
+            "validator_dict": validator_dict,
         }
 
 
@@ -771,7 +778,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
 
             # TODO: print reward/ vars
             reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
-            reward_mixed = reference_logits_norm + reward_norm
+            reward_mixed = reference_logits_norm + advantage_alpha * reward_norm
 
             # apply invalid mask
             invalid_list = []
@@ -795,6 +802,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             "reward_unpenalized": reward_mixed,
             "full_tokens": validator_dict.get("full_tokens", None),
             "log_pf_ref": reference_logits,
+            "validator_dict": validator_dict,
         }
 
 

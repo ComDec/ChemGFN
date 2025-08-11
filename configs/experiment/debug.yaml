@@ -36,6 +36,12 @@ model:
       _target_: chemgfn.models.reward.RDKitValidator
       scorer: "logP"
       backend: "pa"
+
+  reward_buffer:
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+    buffer_size: 200
+    sim_tolerance: 0.75
+
   constraint_config:
     min_sentence_len: 2
     max_sentence_len: 2
@@ -43,10 +49,14 @@ model:
     apply_grammar: true
     processor_type: "prefix"
     parse_mode: "full"  # can be "full" or "limited"
+
   reward_config:
     advantage_alpha_start: 0.5
     advantage_alpha_end: 0.5
     advantage_alpha_horizon: 500000
+
+  training_mixed_config:
+    use_buffer_prob: 0.99
 
 data:
   num_workers: 8

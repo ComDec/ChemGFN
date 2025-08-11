@@ -27,7 +27,7 @@ trainer:
 
 model:
   reward:
-    _target_: chemgfn.models.reward.Reference_Invalid_Mask
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
     invalid_start_ratio: 3
     invalid_end_ratio: 1.5
     target_score_alpha: 0.8
@@ -35,6 +35,7 @@ model:
       _target_: chemgfn.models.reward.RDKitValidator
       scorer: "logP"
       backend: "pa"
+
   constraint_config:
     min_sentence_len: 2
     max_sentence_len: 5
@@ -42,10 +43,17 @@ model:
     apply_grammar: true
     processor_type: "prefix"
     parse_mode: "full"  # can be "full" or "limited"
-  reward_config:
-    advantage_alpha_start: 0.5
-    advantage_alpha_end: 0.5
-    advantage_alpha_horizon: 500000
+
+  reward_buffer:
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+    buffer_size: 200
+    sim_tolerance: 0.75
+
+  training_mixed_config:
+    use_buffer_prob: 0.25
+    pf_temp_high: 2.0
+    pf_temp_low: 0.5
+    pf_temp_prob: 0.666
 
 data:
   num_workers: 8
