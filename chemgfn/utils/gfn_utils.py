@@ -485,7 +485,7 @@ class ReplayBuffer:
     def reset(self):
         self._buffer = {}
 
-    def add(self, item, force_add=False):
+    def add(self, item, force_add=False, psudo_reward: float = 0):
         """
         add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
         """
@@ -497,7 +497,7 @@ class ReplayBuffer:
             return
 
         new_item = (
-            item["logreward"] + 10 if force_add else item["logreward"],
+            psudo_reward,
             item["str_sentence"],
             item["tensor_sentence"],
             item["tensor_answer"],
@@ -530,7 +530,7 @@ class ReplayBuffer:
             heapq.heappush(buffer, new_item)
             self._buffer[str_prompt]["exists"].add(item["str_sentence"])
 
-    def add_batch(self, prompt, sentences, logrewards, tokenizer, batch_invalid=None):
+    def add_batch(self, prompt, sentences, logrewards, tokenizer, result_dict=None):
         """
         add a batch of items to the buffer
         """
@@ -553,6 +553,7 @@ class ReplayBuffer:
             # str_sentence = token_sentences[i].replace(".", "").strip()
             # there is no such termination token in the SMILES
             str_sentence = token_sentences[i].strip()
+            batch_invalid = result_dict["validator_dict"]["invalid"]
             valid_state = (~batch_invalid.bool())[i][-1]
             self.add(
                 {
@@ -566,6 +567,7 @@ class ReplayBuffer:
                     "full_logrewards": logrewards[i, :],
                 },
                 force_add=valid_state,
+                psudo_reward=result_dict["validator_dict"]["global_score"][i].item(),
             )
 
     def sample(self, batch_size, prompt, tokenizer):

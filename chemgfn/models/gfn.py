@@ -318,7 +318,7 @@ class ChemGFNModule(LightningModule):
                 sentences=generated_text[:, len(encoded_prompt) :],
                 logrewards=log_r * self.reward.temperature,
                 tokenizer=self.tokenizer,
-                batch_invalid=result_dict["validator_dict"]["invalid"],
+                result_dict=result_dict,
             )
 
         # sum of agree list

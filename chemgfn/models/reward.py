@@ -195,7 +195,7 @@ class RDKitValidator(SentenceValidator):
                     if target_molecule is not None:
                         full_tokens = target_molecule.replace("*", tokens)
                     try:
-                        global_score[i] = self.score(Chem.MolFromSmiles(full_tokens))
+                        global_score[i] = self.score_function(Chem.MolFromSmiles(full_tokens))
                     except:
                         global_score[i] = 0.0
                     break  # Only unterminated sentences get a reward
