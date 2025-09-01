@@ -14,7 +14,7 @@ defaults:
 
 tags: ["ChemGFN"]
 
-exp_name: "R(invalid_30-50+logP)_M(llama3)_L(min2max5)_N8G4_(scaling_mix)"
+exp_name: "R(invalid_30-50)_M(llama3)_L(min2max5)_N8G4_(no_logP_bufferR)"
 seed: 42
 
 trainer:
@@ -23,7 +23,7 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 1
+  devices: 4
 
 model:
   reward:
@@ -45,20 +45,30 @@ model:
     parse_mode: "full"  # can be "full" or "limited"
 
   reward_buffer:
-    _target_: chemgfn.utils.gfn_utils.ReplayBufferNative
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
     sim_tolerance: 0.75
+
+  reward_config:
+    reward_temp_start: 2
+    reward_temp_end: 0.8
+    reward_temp_horizon: 50000
+    invalid_vocab_alpha: -80
+    advantage_alpha_start: 1.0
+    advantage_alpha_end: 1.0
+    advantage_alpha_horizon: 50000000
+    scaling_factor_start: 0
+    scaling_factor_end: 0
+    scaling_factor_horizon: 50000
 
   training_mixed_config:
     use_buffer_prob: 0.25
     pf_temp_high: 2.0
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
-
-  reward_config:
-    scaling_factor_start: 20
-    scaling_factor_end: 20
-    scaling_factor_horizon: 50000
+    use_buffer_sample_start_prob: 0.0
+    use_buffer_sample_end_prob: 0.0
+    buffer_sample_steps: 20000
 
 data:
   num_workers: 8

@@ -14,7 +14,7 @@ defaults:
 
 tags: ["ChemGFN"]
 
-exp_name: "debug"
+exp_name: "R(invalid_30-50+logP)_M(llama3)_L(min2max5)_N8G4_(scaling_mix_logP_bufferR)"
 seed: 42
 
 trainer:
@@ -23,13 +23,13 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 1
+  devices: 4
 
 model:
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
     invalid_start_ratio: 3
-    invalid_end_ratio: 1.5
+    invalid_end_ratio: 5.0
     target_score_alpha: 0.8
     sentence_validator:
       _target_: chemgfn.models.reward.RDKitValidator
@@ -57,6 +57,9 @@ model:
     advantage_alpha_start: 1.0
     advantage_alpha_end: 1.0
     advantage_alpha_horizon: 50000000
+    scaling_factor_start: 20
+    scaling_factor_end: 20
+    scaling_factor_horizon: 50000
 
   training_mixed_config:
     use_buffer_prob: 0.25

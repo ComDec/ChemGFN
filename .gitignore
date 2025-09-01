@@ -159,3 +159,6 @@ configs/local/default.yaml
 
 # archived
 **/archived/**
+
+*.slout
+*.slerr
