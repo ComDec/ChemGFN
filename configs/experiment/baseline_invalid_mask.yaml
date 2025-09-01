@@ -49,11 +49,23 @@ model:
     buffer_size: 200
     sim_tolerance: 0.75
 
+  reward_config:
+    reward_temp_start: 2
+    reward_temp_end: 0.8
+    reward_temp_horizon: 50000
+    invalid_vocab_alpha: -80
+    advantage_alpha_start: 1.0
+    advantage_alpha_end: 1.0
+    advantage_alpha_horizon: 50000000
+
   training_mixed_config:
     use_buffer_prob: 0.25
     pf_temp_high: 2.0
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
+    use_buffer_sample_start_prob: 0.0
+    use_buffer_sample_end_prob: 0.0
+    buffer_sample_steps: 20000
 
 data:
   num_workers: 8

@@ -28,24 +28,37 @@ trainer:
 model:
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
-    invalid_start_ratio: 0.5
-    invalid_end_ratio: 1.2
+    invalid_start_ratio: 3
+    invalid_end_ratio: 5.0
     target_score_alpha: 0.8
     sentence_validator:
       _target_: chemgfn.models.reward.RDKitValidator
       scorer: "logP"
       backend: "pa"
+
   constraint_config:
     min_sentence_len: 2
-    max_sentence_len: 10
+    max_sentence_len: 5
     grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     apply_grammar: true
     processor_type: "prefix"
     parse_mode: "full"  # can be "full" or "limited"
+
+  reward_buffer:
+    _target_: chemgfn.utils.gfn_utils.ReplayBufferNative
+    buffer_size: 200
+    sim_tolerance: 0.75
+
+  training_mixed_config:
+    use_buffer_prob: 0.25
+    pf_temp_high: 2.0
+    pf_temp_low: 0.5
+    pf_temp_prob: 0.666
+
   reward_config:
-    advantage_alpha_start: 0.5
-    advantage_alpha_end: 0.5
-    advantage_alpha_horizon: 500000
+    scaling_factor_start: 0
+    scaling_factor_end: 0
+    scaling_factor_horizon: 50000
 
 data:
   num_workers: 8

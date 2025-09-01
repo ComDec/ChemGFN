@@ -28,7 +28,7 @@ trainer:
 
 model:
   reward:
-    _target_: chemgfn.models.reward.Reference_Invalid_Mask_Z_score
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
     invalid_start_ratio: 3.0
     invalid_end_ratio: 5.0
     target_score_alpha: 0.8

@@ -748,7 +748,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         vocab_naughty_mask=None,
         naughty_vocab_alpha=-99,
         invalid_vocab_alpha=-99,
-        advantage_alpha=0.5,
+        scaling_factor=0.5,
         target_molecule: Optional[str] = None,
         agree_list=None,
         **kwargs,
@@ -775,16 +775,17 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             reference_logits_norm = (reference_logits - reference_logits.mean()) / (
                 reference_logits.std() + 1e-8
             )  # normalize logits
-
-            # TODO: print reward/ vars
-            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
-            reward_mixed = reference_logits_norm + advantage_alpha * reward_norm
+            # TODO: mean at which dim?
+            # valid_score * 1000 + reference_logits_norm
+            # non-buffer acc.
+            # no logP mixed with native reward to buffer cause model collapse
+            reward_mixed = reference_logits_norm + scaling_factor * valid_score
 
             # apply invalid mask
             invalid_list = []
 
             for i in range(reward_mixed.shape[0]):
-                min_value = -1
+                min_value = -10
                 start_values = min_value * self.invalid_start_ratio
                 end_values = min_value * self.invalid_end_ratio
                 seq = torch.linspace(

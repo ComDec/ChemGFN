@@ -29,6 +29,7 @@ from transformers_cfg.recognizer import StringRecognizer
 from chemgfn.utils.gfn_utils import (
     ReplayBuffer,
     base_to_lora,
+    calculate_diversity,
     generate_and_return_termination_logprob,
     generate_and_return_termination_logprob_for_sidechain_opt,
     get_termination_vals,
@@ -84,6 +85,12 @@ class ChemGFNModule(LightningModule):
             reward_config["advantage_alpha_start"]
             - (reward_config["advantage_alpha_start"] - reward_config["advantage_alpha_end"])
             * min(1, step / reward_config["advantage_alpha_horizon"])
+        )
+
+        self.get_scaling_factor_at_step = lambda step: (
+            reward_config["scaling_factor_start"]
+            - (reward_config["scaling_factor_start"] - reward_config["scaling_factor_end"])
+            * min(1, step / reward_config["scaling_factor_horizon"])
         )
 
         # set use buffer sample at certain step
@@ -182,6 +189,7 @@ class ChemGFNModule(LightningModule):
         # metrics
         self.train_sentence_length = []
         self.train_samples = []
+        self.val_samples = []
 
         # other
         self.opt_task = self.training_mixed_config.get("opt_task", False)
@@ -198,6 +206,7 @@ class ChemGFNModule(LightningModule):
         pf_temperature=1.0,
         reward_temperature=1.0,
         advantage_alpha=0.01,
+        scaling_factor=50,
         action_seq=None,
         use_buffer_sample: bool = False,
         buffer_sample: Optional[torch.Tensor] = None,
@@ -227,6 +236,7 @@ class ChemGFNModule(LightningModule):
             "temperature": pf_temperature,
             "reward_temperature": reward_temperature,
             "advantage_alpha": advantage_alpha,
+            "scaling_factor": scaling_factor,
             "skip_rewards": False,
             "action_seq": action_seq,
             "vocab_nice_mask": self.legal_tokens_mask,
@@ -253,7 +263,7 @@ class ChemGFNModule(LightningModule):
         buffer_sample = item["buffer_encoded_sample"]
         # Sample a sentence and get the reward
         if (
-            random.random() < self.training_mixed_config.use_buffer_prob
+            random.random() < self.get_use_buffer_sample_at_step(self.global_step)
             and self.reward_buffer.sample(
                 self.training_mixed_config.n_samples, encoded_prompt, self.tokenizer
             )[0]
@@ -279,10 +289,13 @@ class ChemGFNModule(LightningModule):
 
         else:
             # Using the forward policy
-            if random.random() < self.get_use_buffer_sample_at_step(self.global_step):
-                use_buffer_sample = True
-            else:
-                use_buffer_sample = False
+            # if random.random() < self.get_use_buffer_sample_at_step(self.global_step):
+            #     use_buffer_sample = True
+            # else:
+            #     use_buffer_sample = False
+
+            # disabled
+            use_buffer_sample = False
 
             if random.random() < self.training_mixed_config.pf_temp_prob:  # With tempering
                 pf_temp = (
@@ -300,7 +313,7 @@ class ChemGFNModule(LightningModule):
                 item,
                 pf_temperature=pf_temp,
                 reward_temperature=self.reward.temperature,
-                advantage_alpha=self.get_advantage_alpha_at_step(self.global_step),
+                scaling_factor=self.get_scaling_factor_at_step(self.global_step),
                 use_buffer_sample=use_buffer_sample,
                 buffer_sample=buffer_sample,
                 buffer_mixture_ratio=self.buffer_mixture_ratio,
@@ -320,6 +333,14 @@ class ChemGFNModule(LightningModule):
                 tokenizer=self.tokenizer,
                 result_dict=result_dict,
             )
+
+        # log buffer prob
+        self.log(
+            "buffer_prob",
+            torch.tensor(self.get_use_buffer_sample_at_step(self.global_step), device=self.device),
+            on_step=True,
+            sync_dist=True,
+        )
 
         # sum of agree list
         if agree_list is not None:
@@ -490,6 +511,7 @@ class ChemGFNModule(LightningModule):
         log_pterm = result_dict["log_pterm"]
         log_r = result_dict["log_r"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
+        self.val_samples.extend(generated_text[:, len(encoded_prompt[0]) :].tolist())
 
         # Get the GFN loss
         loss = modified_subtb_loss(
@@ -566,12 +588,12 @@ class ChemGFNModule(LightningModule):
         self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
     ) -> None:
         reward_temp = self.get_reward_temp_at_step(self.global_step)
-        advantage_alpha = self.get_advantage_alpha_at_step(self.global_step)
+        scaling_factor = self.get_scaling_factor_at_step(self.global_step)
         lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
-        self.reward.advantage_alpha = advantage_alpha
+        self.reward.scaling_factor = scaling_factor
 
-        self.log("train/advantage_alpha", advantage_alpha, sync_dist=True, on_step=True)
+        self.log("train/scaling_factor", scaling_factor, sync_dist=True, on_step=True)
         self.log("train/reward_temp", reward_temp, sync_dist=True, on_step=True)
 
         for pg in self.optimizers().param_groups:
@@ -666,6 +688,13 @@ class ChemGFNModule(LightningModule):
                 ),
                 index=False,
             )
+
+        self.val_samples = []
+
+    def on_validation_epoch_end(self):
+        diversity = calculate_diversity(torch.tensor(self.val_samples))
+        self.log("val/diversity", diversity, sync_dist=True, on_epoch=True)
+        self.val_samples = []
 
     def on_train_start(self):
         # Sanity check probes

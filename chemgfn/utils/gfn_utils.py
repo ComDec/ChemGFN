@@ -63,6 +63,41 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
     return legal_token_mask, illegal_token_mask, legal_tokens
 
 
+import numpy as np
+import torch
+
+
+def calculate_diversity(token_id_list):
+    """
+    Calculate diversity of LLM sampling results using average per-position entropy.
+
+    Args:
+        token_id_list: torch.Tensor of shape (num_samples, seq_len) containing token IDs
+
+    Returns:
+        float: Average entropy across all sequence positions (higher = more diverse)
+    """
+    # Convert to tensor and validate dimensions
+    num_samples, seq_len = token_id_list.shape
+
+    if num_samples == 1:
+        return 0.0  # Only one sample = zero diversity
+
+    total_entropy = 0.0
+
+    for pos in range(seq_len):
+        # Get token distribution at current position
+        tokens = token_id_list[:, pos]
+        unique_tokens, counts = torch.unique(tokens, return_counts=True)
+        probs = counts.float() / num_samples
+
+        # Calculate entropy: -sum(p * log(p))
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10))  # Add epsilon to avoid log(0)
+        total_entropy += entropy.item()
+
+    return total_entropy / seq_len
+
+
 def generate_and_return_termination_logprob(
     model,
     encoded_data,
@@ -243,6 +278,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     temperature: float = 1.0,
     reward_temperature: float = 1.0,
     advantage_alpha: float = 0.5,
+    scaling_factor: float = 50,
     action_seq=None,
     skip_rewards: bool = False,
     use_buffer_sample: bool = False,
@@ -377,6 +413,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
             state[:, :-1],
             reward_temperature=reward_temperature,
             advantage_alpha=advantage_alpha,
+            scaling_factor=scaling_factor,
             vocab_nice_mask=vocab_nice_mask,
             vocab_naughty_mask=vocab_naughty_mask,
             naughty_vocab_alpha=naughty_vocab_alpha,
@@ -498,6 +535,187 @@ class ReplayBuffer:
 
         new_item = (
             psudo_reward,
+            item["str_sentence"],
+            item["tensor_sentence"],
+            item["tensor_answer"],
+            item["full_logrewards"],
+            force_add,
+        )
+        buffer = self._buffer[str_prompt]["sentences"]
+
+        for buffer_item in list(buffer):  # Iterate over a copy
+            existing_answer = [
+                x for x in buffer_item[3].tolist() if x != self.termination_token_id
+            ]
+            new_answer = [
+                x for x in item["tensor_answer"].tolist() if x != self.termination_token_id
+            ]
+            if (
+                editdistance.eval(new_answer, existing_answer)
+                < (len(new_answer) + len(existing_answer)) * self.sim_tolerance
+            ):
+                if buffer_item[0] >= psudo_reward and not force_add:
+                    return
+
+        # Critical fix: Only add to 'exists' AFTER successful heap insertion
+        if len(buffer) >= self.buffer_size:
+            # Push off the smallest item if buffer is full
+            popped = heapq.heappop(buffer)
+            # self._buffer[str_prompt]["exists"].remove(popped[1])
+            self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+        else:
+            heapq.heappush(buffer, new_item)
+            self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+
+    def add_batch(self, prompt, sentences, logrewards, tokenizer, result_dict=None):
+        """
+        add a batch of items to the buffer
+        """
+        str_prompt = " ".join(
+            [str(x) for x in tokenizer.batch_decode(prompt, skip_special_tokens=True)]
+        )
+        if str_prompt not in self._buffer:
+            self._buffer[str_prompt] = {
+                "tensor_prompt": prompt,
+                "sentences": [],
+                "exists": set(),
+            }
+        sentences[
+            (sentences == self.termination_token_id).cumsum(dim=-1) >= 1
+        ] = self.termination_token_id
+        token_sentences = tokenizer.batch_decode(sentences)
+        prompt_len = prompt.shape[1]
+
+        for i in range(sentences.size(0)):
+            # str_sentence = token_sentences[i].replace(".", "").strip()
+            # there is no such termination token in the SMILES
+            str_sentence = token_sentences[i].strip()
+            batch_invalid = result_dict["validator_dict"]["invalid"]
+            valid_state = (~batch_invalid.bool())[i][-1]
+            self.add(
+                {
+                    "logreward": logrewards[
+                        i, (sentences[i][prompt_len - 1 :] != self.termination_token_id).sum()
+                    ].item(),
+                    "str_prompt": str_prompt,
+                    "str_sentence": str_sentence,
+                    "tensor_answer": sentences[i][prompt_len - 1 :],
+                    "tensor_sentence": sentences[i],
+                    "full_logrewards": logrewards[i, :],
+                },
+                force_add=valid_state,
+                psudo_reward=result_dict["validator_dict"]["global_score"][i].item(),
+            )
+
+    def sample(self, batch_size, prompt, tokenizer):
+        """
+        uniformly sample a batch of items from the buffer,
+        and return a stacked tensor
+        """
+        str_prompt = " ".join(
+            [str(x) for x in tokenizer.batch_decode(prompt, skip_special_tokens=True)]
+        )
+        if str_prompt not in self._buffer:
+            return None, None
+        prompt_buffer = self._buffer[str_prompt]["sentences"]
+        idx = np.random.choice(
+            len(prompt_buffer),
+            batch_size,
+            replace=True,
+        )
+        return torch.nn.utils.rnn.pad_sequence(
+            [prompt_buffer[i][2] for i in idx],
+            batch_first=True,
+            padding_value=self.termination_token_id,
+        ), torch.nn.utils.rnn.pad_sequence(
+            [prompt_buffer[i][3] for i in idx],
+            batch_first=True,
+            padding_value=0,
+        )
+
+    def stat(self):
+        """
+        statistics of the buffer
+        """
+        stats = {}
+        for idx, key in enumerate(self._buffer):
+            total_buffer = len(self._buffer[key]["sentences"])
+            avg_logR = sum([item[0] for item in self._buffer[key]["sentences"]])
+            stats.update(
+                {
+                    f"prompt_{idx}_total_buffer": total_buffer,
+                    f"prompt_{idx}_avg_logR": avg_logR / total_buffer if total_buffer > 0 else 0,
+                }
+            )
+        return stats
+
+    def print(self):
+        for key in self._buffer:
+            print(key)
+            for item in self._buffer[key]["sentences"]:
+                print(item[1])
+            print("")
+
+    def save(self, path):
+        with gzip.open(path, "wb") as f:
+            pickle.dump(self._buffer, f)
+
+    def save_csv(self, path, tokenizer):
+        """
+        Save the buffer to a CSV file.
+        Each row contains: str_prompt, str_sentence, logreward, tensor_sentence, tensor_answer
+        """
+        dirname = os.path.dirname(path)
+        if not os.path.exists(dirname):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("logr_sum,tensor_answer,answer_logR,answer,force_add\n")
+            for key in self._buffer:
+                for item in self._buffer[key]["sentences"]:
+                    answer_tokens = item[-3].tolist()
+                    answer = "".join(
+                        [
+                            str(x)
+                            for x in tokenizer.batch_decode(
+                                answer_tokens, skip_special_tokens=False
+                            )
+                        ]
+                    )
+                    force_add = item[-1].item()
+                    f.write(
+                        f"{item[0]},{answer_tokens},{item[-2].tolist()},{answer},{force_add}\n"
+                    )
+
+
+class ReplayBufferNative(ReplayBuffer):
+    """
+    A relay buffer that uses a heap to keep the max_size items with the highest reward
+    """
+
+    def __init__(self, buffer_size, sim_tolerance=0.25):
+        self.buffer_size = buffer_size
+        self.sim_tolerance = sim_tolerance
+        self.reset()
+
+    def set_termination_token_id(self, termination_token_id):
+        self.termination_token_id = termination_token_id
+
+    def reset(self):
+        self._buffer = {}
+
+    def add(self, item, force_add=False, psudo_reward: float = 0):
+        """
+        add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
+        """
+        # if item is already in the buffer, skip it
+        str_prompt = item["str_prompt"]
+
+        # Hashable string for prompt+answer
+        if item["str_sentence"] in self._buffer[str_prompt]["exists"]:
+            return
+
+        new_item = (
+            item["logreward"],
             item["str_sentence"],
             item["tensor_sentence"],
             item["tensor_answer"],
