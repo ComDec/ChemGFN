@@ -37,17 +37,19 @@ class NumberDataSet(Dataset):
         self.tokenizer = tokenizer
         self.numbers_list = numbers_list
 
+        # Pre-tokenize the constant prompt once to avoid repeated work
+        prompt = (
+            "Generate a list of numbers that follow the rule: even number followed by "
+            "odd number and odd number followed by even number and between 0 and 20: "
+        )
+        self.encoded_prompt = self.tokenizer(prompt, return_tensors="pt")["input_ids"]
+
     def __len__(self):
         return len(self.numbers_list)
 
     def __getitem__(self, index):
-        prompts = "Generate a list of numbers that follow the rule: even number followed by odd number and odd number followed by even number and between 0 and 20: "
-        encoded_prompt = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-        )
         return {
-            "encoded_prompt": encoded_prompt["input_ids"],
+            "encoded_prompt": self.encoded_prompt.clone(),
             "numbers_list": torch.tensor(self.numbers_list[index]),
         }
 
@@ -91,6 +93,8 @@ class NumberDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
     def val_dataloader(self):
@@ -99,6 +103,8 @@ class NumberDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
 
@@ -106,24 +112,20 @@ class ParenthesesDataSet(Dataset):
     def __init__(self, prompts, tokenizer, total_size: int = 10000) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.prompts = prompts
         self.total_size = total_size
 
         # Generate prompts by randomly sampling with replacement
-        self.prompts = random.choices(prompts, k=self.total_size)
+        sampled_prompts = random.choices(prompts, k=self.total_size)
+        # Pre-tokenize all prompts to avoid doing it in __getitem__
+        self.encoded_prompts = [
+            self.tokenizer(p, return_tensors="pt")["input_ids"] for p in sampled_prompts
+        ]
 
     def __len__(self):
         return self.total_size
 
     def __getitem__(self, index):
-        prompts = self.prompts[index]
-        encoded_prompt = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-        )
-        return {
-            "encoded_prompt": encoded_prompt["input_ids"],
-        }
+        return {"encoded_prompt": self.encoded_prompts[index].clone()}
 
 
 class ParenthesesDataModule(LightningDataModule):
@@ -174,6 +176,8 @@ class ParenthesesDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
     def val_dataloader(self):
@@ -182,6 +186,8 @@ class ParenthesesDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
 
@@ -200,18 +206,34 @@ class BufferDataPipe(Dataset):
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.prompts = prompts
         self.total_size = total_size
 
         self.is_instruct = is_instruct
         self.add_prompt = add_prompt
         self.buffer_tokenization = buffer_tokenization
 
-        # Generate prompts by randomly sampling with replacement
-        self.prompts = random.choices(prompts, k=self.total_size)
+        # Generate prompts by randomly sampling with replacement and pre-tokenize
+        sampled_prompts = random.choices(prompts, k=self.total_size)
+        if add_prompt:
+            sampled_prompts = [
+                SMILES_PROMPTS_AHEAD + p + BASE_PROMPTS_EXAMPLES + SMILES_PROMPTS_BEHIND
+                for p in sampled_prompts
+            ]
+        self.encoded_prompts = [
+            self.tokenizer(p, return_tensors="pt")["input_ids"] for p in sampled_prompts
+        ]
         self.buffer_sample = buffer_sample
         self.allowed_vocab = allowed_vocab
         self.n_samples = n_samples
+
+        # Pre-tokenize buffer samples if needed
+        if self.buffer_sample is not None and self.buffer_tokenization:
+            self.buffer_sample = [
+                torch.tensor(
+                    self.tokenizer.encode(x, add_special_tokens=False)
+                ).reshape(-1)
+                for x in self.buffer_sample
+            ]
 
     def __len__(self):
         return len(self.prompts)
@@ -242,28 +264,7 @@ class BufferDataPipe(Dataset):
         ]
 
     def __getitem__(self, index):
-        if self.add_prompt:
-            _prompt = (
-                SMILES_PROMPTS_AHEAD
-                + self.prompts[index]
-                + BASE_PROMPTS_EXAMPLES
-                + SMILES_PROMPTS_BEHIND
-            )
-        else:
-            _prompt = self.prompts[index]
-
-        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
-        # _prompt = self.prompts[index]
-
-        if False:
-            message = self.generate_message(_prompt)
-            encoded_prompt = self.tokenizer.apply_chat_template(
-                message,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
+        encoded_prompt = self.encoded_prompts[index]
 
         sampled_buffers = []
         buffer_encoded_samples = []
@@ -272,9 +273,7 @@ class BufferDataPipe(Dataset):
             if self.allowed_vocab is not None:
                 for i in range(len(sampled_buffer)):
                     if self.buffer_tokenization:
-                        buffer_encoded_sample = torch.tensor(
-                            self.tokenizer.encode(sampled_buffer[i], add_special_tokens=False)
-                        ).reshape(-1)
+                        buffer_encoded_sample = sampled_buffer[i]
                     else:
                         sampled_buffers.append(
                             self.merge_chars_fast(sampled_buffer[i], self.allowed_vocab)
@@ -390,6 +389,8 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
     def val_dataloader(self):
@@ -398,6 +399,8 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
 
@@ -416,18 +419,39 @@ class MolOptDataPipe(Dataset):
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.prompts = prompts
         self.total_size = total_size
 
         self.is_instruct = is_instruct
         self.add_prompt = add_prompt
         self.buffer_tokenization = buffer_tokenization
 
-        # Generate prompts by randomly sampling with replacement
-        self.prompts = random.choices(prompts, k=self.total_size)
+        # Generate prompts by randomly sampling with replacement and pre-tokenize
+        sampled_prompts = random.choices(prompts, k=self.total_size)
+        if add_prompt:
+            final_prompts = [
+                SMILES_PROMPTS_AHEAD
+                + p["prompt"]
+                + BASE_PROMPTS_EXAMPLES
+                + SMILES_PROMPTS_BEHIND
+                for p in sampled_prompts
+            ]
+        else:
+            final_prompts = [p["prompt"] for p in sampled_prompts]
+        self.encoded_prompts = [
+            self.tokenizer(p, return_tensors="pt")["input_ids"] for p in final_prompts
+        ]
+        self.molecules = [p.get("molecule") for p in sampled_prompts]
         self.buffer_sample = buffer_sample
         self.allowed_vocab = allowed_vocab
         self.n_samples = n_samples
+
+        if self.buffer_sample is not None and self.buffer_tokenization:
+            self.buffer_sample = [
+                torch.tensor(
+                    self.tokenizer.encode(x, add_special_tokens=False)
+                ).reshape(-1)
+                for x in self.buffer_sample
+            ]
 
     def __len__(self):
         return len(self.prompts)
@@ -442,28 +466,7 @@ class MolOptDataPipe(Dataset):
         ]
 
     def __getitem__(self, index):
-        if self.add_prompt:
-            _prompt = (
-                SMILES_PROMPTS_AHEAD
-                + self.prompts[index]["prompt"]
-                + BASE_PROMPTS_EXAMPLES
-                + SMILES_PROMPTS_BEHIND
-            )
-        else:
-            _prompt = self.prompts[index]["prompt"]
-
-        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
-        # _prompt = self.prompts[index]
-
-        if False:
-            message = self.generate_message(_prompt)
-            encoded_prompt = self.tokenizer.apply_chat_template(
-                message,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
+        encoded_prompt = self.encoded_prompts[index]
 
         sampled_buffers = []
         buffer_encoded_samples = []
@@ -472,9 +475,7 @@ class MolOptDataPipe(Dataset):
             if self.allowed_vocab is not None:
                 for i in range(len(sampled_buffer)):
                     if self.buffer_tokenization:
-                        buffer_encoded_sample = torch.tensor(
-                            self.tokenizer.encode(sampled_buffer[i], add_special_tokens=False)
-                        ).reshape(-1)
+                        buffer_encoded_sample = sampled_buffer[i]
                     else:
                         sampled_buffers.append(
                             merge_chars_fast(sampled_buffer[i], self.allowed_vocab)
@@ -502,7 +503,7 @@ class MolOptDataPipe(Dataset):
         return {
             "encoded_prompt": encoded_prompt,
             "buffer_encoded_sample": buffer_encoded_samples,
-            "molecule": self.prompts[index]["molecule"],
+            "molecule": self.molecules[index],
         }
 
 
@@ -594,6 +595,8 @@ class MolOptDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
 
     def val_dataloader(self):
@@ -602,4 +605,6 @@ class MolOptDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2,
         )
