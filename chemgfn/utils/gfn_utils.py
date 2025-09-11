@@ -7,6 +7,7 @@ import editdistance
 import numpy as np
 import spacy
 import torch
+import torch.nn.functional as F
 
 # slient the warning
 from rdkit import Chem, RDLogger
@@ -16,7 +17,6 @@ from rdkit import Chem, RDLogger
 from transformers import PreTrainedTokenizer
 from transformers.generation.logits_process import (
     LogitsProcessorList,
-    TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
@@ -63,10 +63,6 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
     return legal_token_mask, illegal_token_mask, legal_tokens
 
 
-import numpy as np
-import torch
-
-
 def calculate_diversity(token_id_list):
     """
     Calculate diversity of LLM sampling results using average per-position entropy.
@@ -83,19 +79,11 @@ def calculate_diversity(token_id_list):
     if num_samples == 1:
         return 0.0  # Only one sample = zero diversity
 
-    total_entropy = 0.0
-
-    for pos in range(seq_len):
-        # Get token distribution at current position
-        tokens = token_id_list[:, pos]
-        unique_tokens, counts = torch.unique(tokens, return_counts=True)
-        probs = counts.float() / num_samples
-
-        # Calculate entropy: -sum(p * log(p))
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10))  # Add epsilon to avoid log(0)
-        total_entropy += entropy.item()
-
-    return total_entropy / seq_len
+    vocab_size = int(token_id_list.max().item()) + 1
+    one_hot = F.one_hot(token_id_list, num_classes=vocab_size).float()
+    probs = one_hot.mean(dim=0)
+    entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
+    return entropy.mean().item()
 
 
 def generate_and_return_termination_logprob(
@@ -125,10 +113,11 @@ def generate_and_return_termination_logprob(
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
     prompt_len = encoded_prompt.size(1)
     state = encoded_prompt.clone()
-    log_pf = []
-    log_pterm = []
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
+    batch_size = token_ids.size(0)
+    log_pf = torch.empty(batch_size, max_len + 1, device=state.device)
+    log_pterm = torch.empty(batch_size, max_len + 1, device=state.device)
 
     if grammar_processor is not None:
         try:
@@ -140,14 +129,12 @@ def generate_and_return_termination_logprob(
     else:
         logits_processor = LogitsProcessorList([])
 
-    default_processor = LogitsProcessorList(
-        [TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)]
-    )
+    default_processor = LogitsProcessorList([TopKLogitsWarper(topk), TopPLogitsWarper(topP)])
 
     agree_list = []
 
     # according mixture_ratio, ramdom replace token_ids with buffer_sample
-    nums_replace = max(1, int(token_ids.size(0) * buffer_mixture_ratio))
+    nums_replace = max(1, int(batch_size * buffer_mixture_ratio))
 
     # main loop
     for i in range(max_len + 1):
@@ -157,7 +144,7 @@ def generate_and_return_termination_logprob(
 
         if action_seq is None:
             with torch.no_grad():
-                modified_logits = default_processor(logits.clone().detach())
+                modified_logits = default_processor(state, logits.detach())
                 # apply logits processor
                 results = logits_processor(state, modified_logits)
                 modified_logits = results["masked_logits"]
@@ -181,7 +168,7 @@ def generate_and_return_termination_logprob(
                     # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
                     modified_logits[:, termination_token_id] = 0
 
-                prob = (modified_logits / temperature).softmax(dim=-1)
+                prob = torch.softmax(modified_logits / temperature, dim=-1)
                 token_ids = torch.multinomial(prob, num_samples=1)
 
                 # print(f"prob: {prob}\n state: {state}\n token_ids: {token_ids}")
@@ -214,25 +201,21 @@ def generate_and_return_termination_logprob(
             termination_token_id,
         )
 
-        logprob = logits.log_softmax(dim=-1)
+        logprob = F.log_softmax(logits, dim=-1)
 
         # prob list for termination token by steps
-        log_pterm.append(
-            torch.where(
-                active_seqs,
-                logprob[:, termination_token_id],
-                0,
-            )
+        log_pterm[:, i] = torch.where(
+            active_seqs,
+            logprob[:, termination_token_id],
+            torch.zeros_like(logprob[:, termination_token_id]),
         )
         active_seqs = active_seqs * (token_ids != termination_token_id).squeeze(-1)
 
         # prob list for the generated token by steps
-        log_pf.append(
-            torch.where(
-                active_seqs,
-                logprob.gather(-1, token_ids).squeeze(-1),
-                0,
-            )
+        log_pf[:, i] = torch.where(
+            active_seqs,
+            logprob.gather(-1, token_ids).squeeze(-1),
+            torch.zeros_like(logprob[:, 0]),
         )
         # update the state, i.e., the sequence so far
         state = torch.cat([state, token_ids], dim=-1)
@@ -240,9 +223,6 @@ def generate_and_return_termination_logprob(
         # check if all sequences have terminated, apply when we need non-fixed length generation
         # if torch.all(~active_seqs):
         #     break
-
-    log_pf = torch.stack(log_pf, dim=1)
-    log_pterm = torch.stack(log_pterm, dim=1)
 
     if skip_rewards:
         log_r, log_r_unpenalized = None, None
@@ -293,10 +273,11 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
     prompt_len = encoded_prompt.size(1)
     state = encoded_prompt.clone()
-    log_pf = []
-    log_pterm = []
     token_ids = state  # For caching hidden states during generation
     past_key_values = None  # For caching hidden states during generation
+    batch_size = token_ids.size(0)
+    log_pf = torch.empty(batch_size, max_len + 1, device=state.device)
+    log_pterm = torch.empty(batch_size, max_len + 1, device=state.device)
     if grammar_processor is not None:
         try:
             grammar_processor.reset()
@@ -307,12 +288,10 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     else:
         logits_processor = LogitsProcessorList([])
 
-    # default_processor = LogitsProcessorList([TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)])
-    default_processor = LogitsProcessorList([])
     agree_list = []
 
-    # according mixture_ratio, ramdom replace token_ids with buffer_sample
-    nums_replace = max(1, int(token_ids.size(0) * buffer_mixture_ratio))
+    # according mixture_ratio, random replace token_ids with buffer_sample
+    nums_replace = max(1, int(batch_size * buffer_mixture_ratio))
 
     # main loop
     for i in range(max_len + 1):
@@ -322,7 +301,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
 
         if action_seq is None:
             with torch.no_grad():
-                modified_logits = default_processor(state, logits.clone().detach())
+                modified_logits = logits.detach()
                 # apply logits processor
                 results = logits_processor(state, modified_logits, min_len)
                 modified_logits = results["masked_logits"]
@@ -340,7 +319,7 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
                     modified_logits[:, termination_token_id] = 0
 
                 # TODO: EOS fetching problem, temperature
-                prob = (modified_logits / temperature).softmax(dim=-1)
+                prob = torch.softmax(modified_logits / temperature, dim=-1)
                 token_ids = torch.multinomial(prob, num_samples=1)
 
                 # print(f"prob: {prob}\n state: {state}\n token_ids: {token_ids}")
@@ -373,25 +352,21 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
             termination_token_id,
         )
 
-        logprob = logits.log_softmax(dim=-1)
+        logprob = F.log_softmax(logits, dim=-1)
 
         # prob list for termination token by steps
-        log_pterm.append(
-            torch.where(
-                active_seqs,
-                logprob[:, termination_token_id],
-                0,
-            )
+        log_pterm[:, i] = torch.where(
+            active_seqs,
+            logprob[:, termination_token_id],
+            torch.zeros_like(logprob[:, termination_token_id]),
         )
         active_seqs = active_seqs * (token_ids != termination_token_id).squeeze(-1)
 
         # prob list for the generated token by steps
-        log_pf.append(
-            torch.where(
-                active_seqs,
-                logprob.gather(-1, token_ids).squeeze(-1),
-                0,
-            )
+        log_pf[:, i] = torch.where(
+            active_seqs,
+            logprob.gather(-1, token_ids).squeeze(-1),
+            torch.zeros_like(logprob[:, 0]),
         )
         # update the state, i.e., the sequence so far
         state = torch.cat([state, token_ids], dim=-1)
@@ -399,9 +374,6 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         # check if all sequences have terminated, apply when we need non-fixed length generation
         # if torch.all(~active_seqs):
         #     break
-    log_pf = torch.stack(log_pf, dim=1)
-    log_pterm = torch.stack(log_pterm, dim=1)
-
     if skip_rewards:
         log_r, log_r_unpenalized = None, None
     else:
@@ -543,7 +515,7 @@ class ReplayBuffer:
         )
         buffer = self._buffer[str_prompt]["sentences"]
 
-        for buffer_item in list(buffer):  # Iterate over a copy
+        for buffer_item in buffer:
             existing_answer = [
                 x for x in buffer_item[3].tolist() if x != self.termination_token_id
             ]
@@ -724,7 +696,7 @@ class ReplayBufferNative(ReplayBuffer):
         )
         buffer = self._buffer[str_prompt]["sentences"]
 
-        for buffer_item in list(buffer):  # Iterate over a copy
+        for buffer_item in buffer:
             existing_answer = [
                 x for x in buffer_item[3].tolist() if x != self.termination_token_id
             ]
