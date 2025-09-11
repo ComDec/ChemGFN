@@ -69,6 +69,11 @@ class ChemGFNModule(LightningModule):
         self.save_hyperparameters(ignore=["net"])
         model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
         self.net = get_peft_model(model, lora_config)
+        if getattr(net_config, "use_gradient_checkpointing", False):
+            # reduce activation memory to allow for larger effective batch sizes
+            self.net.gradient_checkpointing_enable()
+            if hasattr(self.net, "config"):
+                self.net.config.use_cache = False
         self.tokenizer = tokenizer
 
         self.reward_config = reward_config
