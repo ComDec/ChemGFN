@@ -68,6 +68,7 @@ import torch
 
 
 def calculate_diversity(token_id_list):
+    # TODO: uniqueness and novelty
     """
     Calculate diversity of LLM sampling results using average per-position entropy.
 

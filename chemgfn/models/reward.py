@@ -772,9 +772,10 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             )
             invalid = validator_dict["invalid"]
             valid_score = validator_dict["valid_score"]
-            reference_logits_norm = (reference_logits - reference_logits.mean()) / (
-                reference_logits.std() + 1e-8
-            )  # normalize logits
+            # reference_logits_norm = (reference_logits - reference_logits.mean()) / (
+            #     reference_logits.std() + 1e-8
+            # )  # normalize logits
+            reference_logits_norm = reference_logits
             # TODO: mean at which dim?
             # valid_score * 1000 + reference_logits_norm
             # non-buffer acc.
