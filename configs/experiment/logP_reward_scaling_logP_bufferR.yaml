@@ -66,8 +66,8 @@ model:
     pf_temp_high: 2.0
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
-    use_buffer_sample_start_prob: 0.0
-    use_buffer_sample_end_prob: 0.0
+    use_buffer_sample_start_prob: 0.8
+    use_buffer_sample_end_prob: 0.2
     buffer_sample_steps: 20000
 
 data:

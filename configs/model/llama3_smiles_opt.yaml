@@ -80,8 +80,8 @@ training_mixed_config:
   pf_temp_prob: 0.666
   use_buffer_prob: 0.25
   n_samples: 8
-  use_buffer_sample_start_prob: 0.0
-  use_buffer_sample_end_prob: 0.0
+  use_buffer_sample_start_prob: 0.8
+  use_buffer_sample_end_prob: 0.2
   buffer_sample_steps: 20000
   buffer_mixture_ratio: 0.5
   skip_baseline_sampling: true
