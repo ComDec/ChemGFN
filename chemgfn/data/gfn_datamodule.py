@@ -102,7 +102,7 @@ class NumberDataModule(LightningDataModule):
         )
 
 
-class ParenthesesDataSet(Dataset):
+class PromptDataSet(Dataset):
     def __init__(self, prompts, tokenizer, total_size: int = 10000) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -123,10 +123,11 @@ class ParenthesesDataSet(Dataset):
         )
         return {
             "encoded_prompt": encoded_prompt["input_ids"],
+            "buffer_encoded_sample": None,
         }
 
 
-class ParenthesesDataModule(LightningDataModule):
+class PromptDataModule(LightningDataModule):
     def __init__(
         self,
         data_path,
@@ -164,8 +165,8 @@ class ParenthesesDataModule(LightningDataModule):
 
         num_train = int(self.total_size * self.train_size)
 
-        self.train_data = ParenthesesDataSet(prompts, self.tokenizer, num_train)
-        self.val_data = ParenthesesDataSet(prompts, self.tokenizer, self.total_size - num_train)
+        self.train_data = PromptDataSet(prompts, self.tokenizer, num_train)
+        self.val_data = PromptDataSet(prompts, self.tokenizer, self.total_size - num_train)
 
     def train_dataloader(self):
         return DataLoader(

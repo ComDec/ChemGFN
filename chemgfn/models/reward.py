@@ -1,12 +1,16 @@
-import random
-from typing import Literal, Optional
+from __future__ import annotations
 
-import numpy as np
+import re
+from contextlib import contextmanager
+from fractions import Fraction
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+
 import partialsmiles as ps
 import torch
 
 # slient the warning
 from rdkit import Chem, RDLogger
+from torch import Tensor
 from transformers import PreTrainedTokenizer
 
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
@@ -14,89 +18,327 @@ from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING, verify_smiles, verify_sm
 
 RDLogger.DisableLog("rdApp.*")
 
+ScorePair = Tuple[Tensor, Tensor]
+
+
+# --------------------------------------------------------------------------- #
+# Utilities
+# --------------------------------------------------------------------------- #
+
+
+def _repeat_past_key_values(
+    past_key_values: tuple[tuple[Tensor, ...], ...], batch_size: int
+) -> tuple[tuple[Tensor, ...], ...]:
+    """Broadcast cached KV tensors to match the current batch size."""
+
+    return tuple(
+        tuple(value.repeat(batch_size, 1, 1, 1) for value in layer) for layer in past_key_values
+    )
+
+
+def _ensure_tensor_like(value: Any, reference: Tensor) -> Tensor:
+    if isinstance(value, Tensor):
+        return value
+    return torch.full(
+        (reference.shape[0],),
+        float(value),
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+
+
+def _build_penalty_ramp(
+    base_values: Tensor,
+    steps: int,
+    start_ratio: float,
+    end_ratio: float,
+    reference: Tensor,
+) -> Tensor:
+    increments = torch.linspace(
+        0,
+        1,
+        steps,
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    start = base_values * start_ratio
+    end = base_values * end_ratio
+    return start.unsqueeze(1) + (end - start).unsqueeze(1) * increments.unsqueeze(0)
+
+
+def _apply_invalid_penalty(
+    reward: Tensor,
+    invalid_mask: Tensor,
+    start_ratio: float,
+    end_ratio: float,
+    base_override: Any | None = None,
+) -> Tensor:
+    base_values = (
+        reward.min(dim=-1).values
+        if base_override is None
+        else _ensure_tensor_like(base_override, reward)
+    )
+    penalty = _build_penalty_ramp(
+        base_values,
+        reward.shape[1],
+        start_ratio,
+        end_ratio,
+        reward,
+    )
+    return torch.min(reward, penalty * invalid_mask)
+
+
+def _stack_if_not_empty(entries: Iterable[Tensor]) -> Tensor | None:
+    entries = list(entries)
+    if not entries:
+        return None
+    return torch.stack(entries, dim=0)
+
+
+def _decode_tokens_to_string(sequence: Tensor, tokenizer: PreTrainedTokenizer) -> str:
+    pieces = []
+    for token in sequence:
+        token_id = token.item()
+        if token_id == tokenizer.eos_token_id:
+            break
+        pieces.append(tokenizer.decode(token, skip_special_tokens=False))
+    return "".join("".join(pieces).split())
+
+
+def _merge_target(template: str | None, fragment: str) -> str:
+    return fragment if template is None else template.replace("*", fragment)
+
+
+@contextmanager
+def use_base_model(model) -> None:
+    """Temporarily swap LoRA adapters off to operate on the base model."""
+
+    lora_to_base(model)
+    try:
+        yield
+    finally:
+        base_to_lora(model)
+
+
+# --------------------------------------------------------------------------- #
+# Scoring helpers
+# --------------------------------------------------------------------------- #
+
 
 @torch.no_grad()
 def score_fast(
     model,
-    encoded_input,
-    termination_token_id,
-    skip_first,
-    reward_temperature=1.0,
-    agree_list=None,
-    prompt_cache=None,
-):
+    encoded_input: Tensor,
+    termination_token_id: int,
+    skip_first: int,
+    reward_temperature: float = 1.0,
+    naughty_vocab_mask: Tensor | None = None,
+    prompt_cache: tuple[Any, tuple[tuple[Tensor, ...], ...]] | None = None,
+    **_: Any,
+) -> ScorePair:
+    """Compute per-step log rewards for a batch of trajectories."""
+
     if prompt_cache is None:
         logits = model(encoded_input).logits
     else:
-        # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
-        batched_prompt_cache = tuple(
-            tuple(
-                [
-                    prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1)
-                    for j in range(len(prompt_cache[1][i]))
-                ]
-            )
-            for i in range(len(prompt_cache[1]))
-        )
-        logits = model(encoded_input, past_key_values=batched_prompt_cache).logits
+        batched_cache = _repeat_past_key_values(prompt_cache[1], encoded_input.shape[0])
+        logits = model(encoded_input, past_key_values=batched_cache).logits
 
-    # predict the logits of next tokens
     logits = logits.detach()[:, skip_first - 1 :]
-    # score the log probability of the input sequence while ignoring termination and padding tokens
-    # if vocab_naughty_mask is not None:
-    #     logits[:, :, vocab_naughty_mask] += naughty_vocab_alpha
-    if agree_list is not None:
-        logits[~agree_list.permute(1, 0, 2)] = -torch.inf
-    # Add reward temperature
+
+    if naughty_vocab_mask is not None:
+        logits = logits.clone()
+        logits[:, :, naughty_vocab_mask] = -torch.inf
+
     logits /= reward_temperature
     logprob = logits.log_softmax(-1)
     token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
 
-    # the last pos for logprob must be the termination token
-    logPF = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
-    logP = logPF.cumsum(dim=-1)  # logP(generated[:i+1] | prompt)
+    log_pf = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
+    log_p = log_pf.cumsum(dim=-1)
 
-    reward = logprob[
-        :, :, termination_token_id
-    ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
-
-    reward[:, 1:] += logP  # logP(generated[:i] + term | prompt)
+    reward = logprob[:, :, termination_token_id]
+    reward[:, 1:] += log_p
 
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
-
     non_term_mask = torch.cat(
         (
             non_term_mask.new_ones(non_term_mask.shape[0], 1),
             non_term_mask,
         ),
         dim=-1,
-    )  # Start (i.e., empty) state has never terminated
+    )
 
+    reward = reward.clone()
     reward[~non_term_mask] = 0.0
-    reward_unpenalized = reward.clone()
 
-    # reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -99, reward)
-    return reward, reward_unpenalized
+    return reward, reward.clone()
+
+
+# --------------------------------------------------------------------------- #
+# Validators
+# --------------------------------------------------------------------------- #
 
 
 class SentenceValidator:
     def __init__(self, termination_token_id: int = -1) -> None:
         self.termination_token_id = termination_token_id
 
-    def __call__(self, sentences, tokenizer):
-        pass
+    def __call__(self, sentences: Tensor, tokenizer: PreTrainedTokenizer, *args, **kwargs):
+        raise NotImplementedError
+
+
+class Expr24Validator(SentenceValidator):
+    """
+    24-points validator (CFG-guaranteed valid prefixes).
+    Format: d op d op d op d, where d ∈ {0..9}, op ∈ {+,-,*,/}, no parentheses.
+    Evaluation: standard precedence (*/ before +-). Equals 24 -> 1, else 0.
+    """
+
+    TOKEN_RE = re.compile(r"[0-9]|[+\-*/]")
+
+    def __init__(self, scorer: str = "hit24") -> None:
+        super().__init__(scorer)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _decode_expr(self, tokens: Tensor, tokenizer: PreTrainedTokenizer) -> str | None:
+        try:
+            decoded = _decode_tokens_to_string(tokens, tokenizer)
+        except Exception:
+            return None
+        decoded = decoded.strip()
+        return decoded or None
+
+    def expression_accuracy(
+        self,
+        generated_tokens: Tensor,
+        tokenizer: PreTrainedTokenizer,
+    ) -> dict[str, float]:
+        if generated_tokens is None or generated_tokens.ndim == 0:
+            return {"acc": 0.0}
+        total = generated_tokens.shape[0]
+        if total == 0:
+            return {"acc": 0.0}
+
+        hits = 0
+        for sample in generated_tokens:
+            expr = self._decode_expr(sample, tokenizer)
+            if expr is None:
+                continue
+            hits += self._eval_full_expr_to_01(expr)
+        return {"acc": hits / total}
+
+    def accuracy(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+        **kwargs,
+    ) -> dict[str, float]:
+        return self.expression_accuracy(sentences, tokenizer)
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        if sentences is None or sentences.ndim < 1:
+            return {
+                "invalid": torch.zeros(1, 1),
+                "global_score": torch.zeros(1),
+                "valid_score": torch.zeros(1, 1),
+                "full_tokens": [],
+            }
+
+        termination_token_id = tokenizer.eos_token_id
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        valid_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.zeros(batch_size, device=device)
+        full_tokens_list: list[str] = []
+
+        invalid[:, 0] = 1.0  # empty prefix
+
+        for i in range(batch_size):
+            for pos in range(seq_len):
+                if sentences[i, pos] == termination_token_id:
+                    break
+                invalid[i, pos + 1] = 0.0  # CFG guarantees valid prefixes
+
+            final_expr = self._decode_expr(sentences[i], tokenizer)
+            if final_expr is None:
+                full_tokens_list.append("")
+                continue
+            score = self._eval_full_expr_to_01(final_expr)
+            global_score[i] = float(score)
+            full_tokens_list.append(final_expr)
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,  # 0 or 1
+            "valid_score": valid_score,  # placeholder for future shaping
+            "full_tokens": full_tokens_list,
+        }
+
+    def _eval_full_expr_to_01(self, s: str) -> int:
+        s = s.replace("×", "*").replace("÷", "/")
+        s = "".join(s.split())
+        toks = self.TOKEN_RE.findall(s)
+        if "".join(toks) != s or len(toks) != 7:
+            return 0
+        for k, tk in enumerate(toks):
+            if k % 2 == 0:
+                if not (len(tk) == 1 and tk.isdigit()):
+                    return 0
+            else:
+                if tk not in "+-*/":
+                    return 0
+
+        nums = [Fraction(int(toks[i])) for i in (0, 2, 4, 6)]
+        ops = [toks[i] for i in (1, 3, 5)]
+
+        try:
+            v = nums[:]
+            o = ops[:]
+            i = 0
+            while i < len(o):
+                if o[i] in "*/":
+                    a, b = v[i], v[i + 1]
+                    if o[i] == "*":
+                        res = a * b
+                    else:
+                        if b == 0:
+                            return 0
+                        res = a / b
+                    v[i : i + 2] = [res]
+                    o.pop(i)
+                else:
+                    i += 1
+            acc = v[0]
+            for op, b in zip(o, v[1:]):
+                acc = acc + b if op == "+" else acc - b
+            return 1 if acc == 24 else 0
+        except Exception:
+            return 0
 
 
 class RDKitValidator(SentenceValidator):
     def __init__(self, scorer: str = "sa", backend: Literal["rdkit", "pa"] = "rdkit") -> None:
         super().__init__(scorer)
         self.score_function = FUNCTION_MAPPING[scorer]
-        self.scorer_name = scorer
         self.backend = backend
+        self.scorer_name = scorer
 
     @staticmethod
     def rdkit_validate(smiles: str) -> bool:
-        """Validate SMILES using RDKit."""
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return False
@@ -108,116 +350,105 @@ class RDKitValidator(SentenceValidator):
 
     @staticmethod
     def pa_validate(smiles: str) -> bool:
-        """Validate SMILES using PartialSMILES."""
         try:
             ps.ParseSmiles(smiles)
             return True
         except Exception:
             return False
 
-    def smiles_accuracy(self, generated_tokens, tokenizer, target_molecule: Optional[str] = None):
-        smiles_list = []
+    def _is_valid_smiles(self, smiles: str) -> bool:
+        if self.backend == "rdkit":
+            return self.rdkit_validate(smiles)
+        if self.backend == "pa":
+            return self.pa_validate(smiles)
+        raise ValueError(f"Unknown backend: {self.backend}")
 
-        for batch in range(generated_tokens.shape[0]):
-            string = []
-            for t in generated_tokens[batch]:
-                if t.item() != tokenizer.eos_token_id:
-                    string.append(tokenizer.decode(t))
-                else:
-                    break
-            smiles_list.append(string)
+    def _decode_batch(self, generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> list[str]:
+        return [_decode_tokens_to_string(sample, tokenizer) for sample in generated_tokens]
 
-        correct = 0
-        avg_sa_score = 0
+    def smiles_accuracy(
+        self,
+        generated_tokens: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+    ) -> dict[str, float]:
+        decoded = self._decode_batch(generated_tokens, tokenizer)
+        scores = []
+        valid_flags = []
 
-        for batch in range(generated_tokens.shape[0]):
-            tokens = "".join(smiles_list[batch])
-            if target_molecule is not None:
-                tokens = target_molecule.replace("*", tokens)
-            if self.backend == "rdkit":
-                valid = self.rdkit_validate(tokens)
-            elif self.backend == "pa":
-                valid = self.pa_validate(tokens)
+        for tokens in decoded:
+            candidate = _merge_target(target_molecule, tokens)
+            if self._is_valid_smiles(candidate):
+                mol = Chem.MolFromSmiles(candidate)
+                valid_flags.append(bool(mol))
+                scores.append(self.score_function(mol) if mol else 0.0)
             else:
-                raise ValueError(f"Unknown backend: {self.backend}")
+                valid_flags.append(False)
+                scores.append(0.0)
 
-            if not valid:
-                mol = None
-            else:
-                mol = Chem.MolFromSmiles(tokens)
-
-            avg_sa_score += self.score_function(mol) if mol else 0
-            correct += 1 if mol else 0
+        total_valid = sum(valid_flags)
+        num_samples = generated_tokens.shape[0]
+        avg_score = sum(scores) / num_samples if num_samples else 0.0
+        filtered_score = (
+            sum(score for score, flag in zip(scores, valid_flags) if flag) / total_valid
+            if total_valid
+            else 0.0
+        )
 
         return {
-            "acc": correct / generated_tokens.shape[0],
-            f"{self.scorer_name}": avg_sa_score / generated_tokens.shape[0],
-            f"{self.scorer_name}_filter": avg_sa_score / correct if correct > 0 else 0.0,
+            "acc": total_valid / num_samples if num_samples else 0.0,
+            f"{self.scorer_name}": avg_score,
+            f"{self.scorer_name}_filter": filtered_score,
         }
 
     def accuracy(
-        self, sentences, tokenizer: PreTrainedTokenizer, target_molecule: Optional[str] = None
-    ):
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+    ) -> dict[str, float]:
         return self.smiles_accuracy(sentences, tokenizer, target_molecule)
 
     def __call__(
-        self, sentences, tokenizer: PreTrainedTokenizer, target_molecule: Optional[str] = None
-    ):
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+    ) -> dict[str, Tensor]:
         termination_token_id = tokenizer.eos_token_id
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
 
-        invalid = torch.zeros(
-            sentences.shape[0],
-            sentences.shape[1] + 1,
-            device=sentences.device,
-        )
-        invalid[:, 0] = 1  # Empty sentence is never valid
-
-        valid_score = torch.zeros(
-            sentences.shape[0],
-            sentences.shape[1] + 1,
-            device=sentences.device,
-        )
-
-        valid_score[:, 0] = 0
-
-        global_score = torch.zeros(
-            sentences.shape[0],
-            device=sentences.device,
-        )
-
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        valid_score = torch.full((batch_size, seq_len + 1), -1.0, device=device)
+        valid_score[:, 0] = 0.0
+        global_score = torch.zeros(batch_size, device=device)
         full_tokens_list = []
-        for i in range(sentences.shape[0]):
-            for j in range(sentences.shape[1]):
-                if sentences[i, j] == termination_token_id:
-                    tokens = "".join(
-                        tokenizer.decode(sentences[i, :j], skip_special_tokens=True).split()
-                    )
-                    if target_molecule is not None:
-                        full_tokens = target_molecule.replace("*", tokens)
-                    try:
-                        global_score[i] = self.score_function(Chem.MolFromSmiles(full_tokens))
-                    except:
-                        global_score[i] = 0.0
-                    break  # Only unterminated sentences get a reward
-                tokens = "".join(tokenizer.decode(sentences[i, : j + 1]).split())
-                if target_molecule is not None:
-                    full_tokens = target_molecule.replace("*", tokens)
 
-                valid = (
-                    verify_smiles(full_tokens)
-                    if self.backend == "rdkit"
-                    else verify_smiles_pa(full_tokens)
-                )
-                valid_score[i, j + 1] = (
-                    self.score_function(Chem.MolFromSmiles(full_tokens)) if valid else -1
-                )
+        for batch_idx in range(batch_size):
+            for pos in range(seq_len):
+                if sentences[batch_idx, pos] == termination_token_id:
+                    break
+
+                prefix = _decode_tokens_to_string(sentences[batch_idx, : pos + 1], tokenizer)
+                candidate = _merge_target(target_molecule, prefix)
+                valid = self._is_valid_smiles(candidate)
 
                 if valid:
-                    invalid[i, j + 1] = 0
+                    mol = Chem.MolFromSmiles(candidate)
+                    valid_score[batch_idx, pos + 1] = self.score_function(mol) if mol else -1.0
+                    invalid[batch_idx, pos + 1] = 0.0
                 else:
-                    invalid[i, j + 1] = 1
+                    invalid[batch_idx, pos + 1] = 1.0
 
-            full_tokens_list.append(full_tokens)
+            final_tokens = _decode_tokens_to_string(sentences[batch_idx], tokenizer)
+            full_smiles = _merge_target(target_molecule, final_tokens)
+            try:
+                mol = Chem.MolFromSmiles(full_smiles)
+                global_score[batch_idx] = self.score_function(mol) if mol else 0.0
+            except Exception:
+                global_score[batch_idx] = 0.0
+            full_tokens_list.append(full_smiles)
 
         return {
             "invalid": invalid,
@@ -227,46 +458,34 @@ class RDKitValidator(SentenceValidator):
         }
 
 
-def number_reward(sampled_numbers):
-    # check if the list of numbers follow the rule: even number followed by odd number and odd number followed by even number and between 0 and 20.
-    # if any number larger than 20, return 0, else return 1.
-    # if number follow the rule, return 2, else return 1.
-    numbers = [int(number) for number in sampled_numbers]
-    if not all((numbers[i] % 2 != numbers[i + 1] % 2) for i in range(len(numbers) - 1)):
+def number_reward(sampled_numbers: Iterable[int | str]) -> int:
+    values = [int(number) for number in sampled_numbers]
+    if not all(values[i] % 2 != values[i + 1] % 2 for i in range(len(values) - 1)):
         return 0
-    else:
-        return 1
+    return 1
 
 
 class BracketValidator:
     def __init__(self, tokenizer: PreTrainedTokenizer):
-        # 定义括号映射关系（右括号 -> 左括号）
+        self.tokenizer = tokenizer
         self.bracket_map = {")": "(", "]": "[", ">": "<"}
         self.left_brackets = set(self.bracket_map.values())
         self.right_brackets = set(self.bracket_map.keys())
-        self.tokenizer = tokenizer
 
-    def preprocess(self, s: str) -> tuple[str, bool]:
-        decoded_list = []
-        # remove the eos token
-        total_length = len(s)
-        for idx, t in enumerate(s):
-            if t.item() != self.tokenizer.eos_token_id:
-                decoded_list.append(self.tokenizer.decode(t))
-            else:
+    def preprocess(self, tokens: Tensor) -> tuple[str, bool]:
+        decoded = []
+        total_length = len(tokens)
+        for idx, token in enumerate(tokens):
+            if token.item() == self.tokenizer.eos_token_id:
                 break
-
-        # think of "<<" due to bpe, we need to re-concatenate the tokens
-        decoded_string = "".join(decoded_list)
-
-        # if total_length > idx, it means the sentence is termiated
+            decoded.append(self.tokenizer.decode(token))
+        decoded_string = "".join(decoded)
         return decoded_string, total_length > idx
 
-    def is_valid(self, s: str) -> bool:
-        """验证完整括号匹配"""
-        s, early_terminated = self.preprocess(s)
+    def is_valid(self, tokens: Tensor) -> bool:
+        sequence, _ = self.preprocess(tokens)
         stack = []
-        for char in s:
+        for char in sequence:
             if char in self.left_brackets:
                 stack.append(char)
             elif char in self.right_brackets:
@@ -274,15 +493,13 @@ class BracketValidator:
                     return False
                 stack.pop()
             else:
-                return False  # 包含非括号字符
-        valid = not stack
-        return valid
+                return False
+        return not stack
 
-    def is_valid_prefix(self, s: str) -> bool:
-        """验证有效前缀"""
-        s, early_terminated = self.preprocess(s)
+    def is_valid_prefix(self, tokens: Tensor) -> bool:
+        sequence, _ = self.preprocess(tokens)
         stack = []
-        for char in s:
+        for char in sequence:
             if char in self.left_brackets:
                 stack.append(char)
             elif char in self.right_brackets:
@@ -290,47 +507,36 @@ class BracketValidator:
                     return False
                 stack.pop()
             else:
-                return False  # 包含非括号字符
+                return False
         return True
 
-    def has_multiple_nesting(self, s: str) -> bool:
-        """检查有效括号字符串是否存在至少两层的嵌套"""
-        s, early_terminated = self.preprocess(s)
+    def has_multiple_nesting(self, tokens: Tensor) -> bool:
+        sequence, _ = self.preprocess(tokens)
         stack = []
         has_nesting = False
-        for char in s:
+        for char in sequence:
             if char in self.left_brackets:
                 stack.append(char)
             elif char in self.right_brackets:
                 if not stack or stack[-1] != self.bracket_map[char]:
-                    return False  # 括号不匹配，结构无效
+                    return False
                 stack.pop()
-                # 检查闭合后栈的深度是否仍有未闭合的左括号
                 if len(stack) >= 1:
                     has_nesting = True
             else:
-                return False  # 包含非括号字符，结构无效
-        if stack:  # 检查是否所有括号已闭合
-            return False
-        return has_nesting
+                return False
+        return not stack and has_nesting
 
 
-def number_accuracy(generated_tokens, tokenizer):
-    numbers_list = []
-
-    for batch in range(generated_tokens.shape[0]):
-        number = []
-        for t in generated_tokens[batch]:
-            if t.item() != tokenizer.eos_token_id:
-                number.append(int(tokenizer.decode(t)))
-            else:
-                break
-        numbers_list.append(number)
-
+def number_accuracy(generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> float:
     correct = 0
-    for batch in range(generated_tokens.shape[0]):
-        correct += number_reward(numbers_list[batch])
-
+    for sample in generated_tokens:
+        decoded = []
+        for token in sample:
+            if token.item() == tokenizer.eos_token_id:
+                break
+            decoded.append(int(tokenizer.decode(token)))
+        correct += number_reward(decoded)
     return correct / generated_tokens.shape[0]
 
 
@@ -338,50 +544,58 @@ class NumberValidator(SentenceValidator):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-    def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
+    def accuracy(self, sentences: Tensor, tokenizer: PreTrainedTokenizer) -> dict[str, float]:
         return {"acc": number_accuracy(sentences, tokenizer)}
 
-    def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor]:
         termination_token_id = tokenizer.eos_token_id
-
         invalid = torch.zeros(
             sentences.shape[0],
             sentences.shape[1] + 1,
             device=sentences.device,
         )
-        invalid[:, 0] = 1  # Empty sentence is never valid
+        invalid[:, 0] = 1
 
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
                 if sentences[i, j] == termination_token_id:
-                    break  # Only unterminated sentences get a reward
+                    break
                 tokens = [tokenizer.decode(t) for t in sentences[i, : j + 1]]
                 numbers = [int(number) for number in tokens]
-                if number_reward(numbers):
-                    invalid[i, j + 1] = False
-                else:
-                    invalid[i, j + 1] = True
+                invalid[i, j + 1] = 0 if number_reward(numbers) else 1
 
-        return invalid
+        return {"invalid": invalid}
 
 
 class ParenthesesValidator(SentenceValidator):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-    def accuracy(self, sentences, tokenizer: PreTrainedTokenizer):
+    def accuracy(self, sentences: Tensor, tokenizer: PreTrainedTokenizer) -> dict[str, float]:
         validator = BracketValidator(tokenizer)
         correct = 0
-        nest = 0
-        for batch in range(sentences.shape[0]):
-            valid = validator.is_valid(sentences[batch])
-            nested = validator.has_multiple_nesting(sentences[batch])
+        nested = 0
+        for sample in sentences:
+            valid = validator.is_valid(sample)
             correct += valid
-            nest += int(nested)
+            nested += int(validator.has_multiple_nesting(sample))
 
-        return {"acc": correct / sentences.shape[0], "nest": nest / sentences.shape[0]}
+        total = sentences.shape[0]
+        return {"acc": correct / total, "nest": nested / total}
 
-    def __call__(self, sentences, tokenizer: PreTrainedTokenizer):
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor]:
         termination_token_id = tokenizer.eos_token_id
         validator = BracketValidator(tokenizer)
 
@@ -390,32 +604,31 @@ class ParenthesesValidator(SentenceValidator):
             sentences.shape[1] + 1,
             device=sentences.device,
         )
-        invalid[:, 0] = 1  # Empty sentence is never valid
+        invalid[:, 0] = 1
 
         for i in range(sentences.shape[0]):
             for j in range(sentences.shape[1]):
                 if sentences[i, j] == termination_token_id:
-                    break  # Only unterminated sentences get a reward
+                    break
+                invalid[i, j + 1] = 0 if validator.is_valid(sentences[i, : j + 1]) else 1
 
-                valid = validator.is_valid(sentences[i, : j + 1])
-                if valid:
-                    # current step is valid and yield eos now, so the model should terminate now.
-                    invalid[i, j + 1] = 0
-                else:
-                    invalid[i, j + 1] = 1
+        return {"invalid": invalid}
 
-        return invalid
+
+# --------------------------------------------------------------------------- #
+# Reward models
+# --------------------------------------------------------------------------- #
 
 
 class FrozenModelSentenceGivenPrompt:
     def __init__(
         self,
-        sentence_validator: SentenceValidator,
-        temperature=1.0,
+        sentence_validator: SentenceValidator | None,
+        temperature: float = 1.0,
         valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
-    ):
+    ) -> None:
         self.temperature = temperature
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
@@ -424,385 +637,124 @@ class FrozenModelSentenceGivenPrompt:
 
     def score(
         self,
-        input_batch,
-        prompt_length,
+        input_batch: Tensor,
+        prompt_length: int,
         model,
         tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
+        reward_temperature: float = 1.0,
         vocab_nice_mask=None,
         vocab_naughty_mask=None,
-        naughty_vocab_alpha=-99,
-        invalid_vocab_alpha=-99,
+        naughty_vocab_alpha: float = -99,
+        invalid_vocab_alpha: float = -99,
         **kwargs,
-    ):
-        # why lora_to_base?
-        lora_to_base(model)
-
-        reward, reward_unpenalized = score_fast(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            vocab_nice_mask=vocab_nice_mask,
-            vocab_naughty_mask=vocab_naughty_mask,
-            naughty_vocab_alpha=naughty_vocab_alpha,
-        )
-
-        # reward /= self.temperature
-        # reward_unpenalized /= self.temperature
-        base_to_lora(model)
+    ) -> ScorePair:
+        with use_base_model(model):
+            reward, reward_unpenalized = score_fast(
+                model=model,
+                encoded_input=input_batch,
+                termination_token_id=tokenizer.eos_token_id,
+                skip_first=prompt_length,
+                reward_temperature=reward_temperature,
+                vocab_nice_mask=vocab_nice_mask,
+                vocab_naughty_mask=vocab_naughty_mask,
+                naughty_vocab_alpha=naughty_vocab_alpha,
+            )
 
         if self.sentence_validator is not None:
-            # use valid list instead of invalid list
-            invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)["invalid"]
-
-            reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
-
-            start_values = reward_min * self.invalid_start_ratio
-            end_values = reward_min * self.invalid_end_ratio
-
-            invalid_list = []
-            for i in range(reward.shape[0]):
-                # prompt_len: large enough value
-                # prefix = torch.full((prompt_length,), start_values[i], device=reward.device)
-
-                # generate linear incresement part for the rest of the sequence
-                seq = torch.linspace(
-                    start=start_values[i],
-                    end=end_values[i],
-                    steps=reward.shape[1],
-                    device=reward.device,
-                )
-                invalid_list.append(seq)
-
-            invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
-
-            reward = torch.min(reward, invalid_value * invalid)
+            invalid_mask = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)[
+                "invalid"
+            ]
+            reward = _apply_invalid_penalty(
+                reward, invalid_mask, self.invalid_start_ratio, self.invalid_end_ratio
+            )
 
         return reward, reward_unpenalized
-
-
-class Reference_Target_Score_Positive_Mixed:
-    def __init__(
-        self,
-        sentence_validator: SentenceValidator,
-        valid_sentence_alpha=None,
-        invalid_start_ratio: float = 0.2,
-        invalid_end_ratio: float = 1.2,
-        target_score_alpha: float = 0.1,
-        target_score_threshold: float = 5.0,
-    ):
-        # reward = logP + alpha * reward_norm
-        self.target_score_alpha = target_score_alpha
-        self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
-        self.invalid_start_ratio = invalid_start_ratio
-        self.invalid_end_ratio = invalid_end_ratio
-        self.target_score_threshold = target_score_threshold
-
-        # temperature for the target score
-        self.temperature = 1.0
-
-    def score(
-        self,
-        input_batch,
-        prompt_length,
-        model,
-        tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
-        naughty_vocab_alpha=-99,
-        invalid_vocab_alpha=-99,
-        target_molecule: Optional[str] = None,
-        **kwargs,
-    ):
-        lora_to_base(model)
-
-        reference_logits, _ = score_fast(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            vocab_nice_mask=vocab_nice_mask,
-            vocab_naughty_mask=vocab_naughty_mask,
-            naughty_vocab_alpha=naughty_vocab_alpha,
-        )
-
-        base_to_lora(model)
-
-        if self.sentence_validator is not None:
-            # use valid list instead of invalid list
-            validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
-            )
-            invalid = validator_dict["invalid"]
-            valid_score = validator_dict["valid_score"]
-
-            reference_logits_norm = torch.nn.functional.log_softmax(
-                reference_logits / reward_temperature, dim=-1
-            )
-            reward_norm = (valid_score - valid_score.mean()) / (valid_score.std() + 1e-8)
-            reward_mixed = reference_logits_norm + self.target_score_alpha * reward_norm
-
-        return reward_mixed, reward_mixed
-
-
-class Reference_Invalid_Mask:
-    def __init__(
-        self,
-        sentence_validator: SentenceValidator,
-        valid_sentence_alpha=None,
-        invalid_start_ratio: float = 0.2,
-        invalid_end_ratio: float = 1.2,
-        target_score_alpha: float = 0.1,
-        **kwargs,
-    ):
-        # reward = logP + alpha * reward_norm
-        self.target_score_alpha = target_score_alpha
-        self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
-        self.invalid_start_ratio = invalid_start_ratio
-        self.invalid_end_ratio = invalid_end_ratio
-
-        # temperature for the target score
-        self.temperature = 1.0
-
-    def score(
-        self,
-        input_batch,
-        prompt_length,
-        model,
-        tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
-        naughty_vocab_alpha=-99,
-        invalid_vocab_alpha=-99,
-        advantage_alpha=0.5,
-        target_molecule: Optional[str] = None,
-        agree_list=None,
-        **kwargs,
-    ):
-        lora_to_base(model)
-        reference_logits, _ = score_fast(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            agree_list=agree_list,
-        )
-
-        base_to_lora(model)
-
-        if self.sentence_validator is not None:
-            # use valid list instead of invalid list
-            validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
-            )
-            invalid = validator_dict["invalid"]
-            reference_logits_norm = reference_logits / reward_temperature
-            reward_mixed = reference_logits_norm
-
-            # apply invalid mask
-            invalid_list = []
-            for i in range(reward_mixed.shape[0]):
-                # apply group advantage
-                min_value = torch.min(reward_mixed[i, :])
-                start_values = min_value * self.invalid_start_ratio
-                end_values = min_value * self.invalid_end_ratio
-                seq = torch.linspace(
-                    start=start_values,
-                    end=end_values,
-                    steps=reward_mixed.shape[1],
-                    device=reward_mixed.device,
-                )
-                invalid_list.append(seq)
-
-            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
-
-        return {
-            "reward": torch.min(reward_mixed, invalid_value),
-            "reward_unpenalized": reward_mixed,
-            "full_tokens": validator_dict.get("full_tokens", None),
-            "log_pf_ref": reference_logits,
-        }
-
-
-class Reference_Invalid_Mask_Z_score:
-    def __init__(
-        self,
-        sentence_validator: SentenceValidator,
-        valid_sentence_alpha=None,
-        invalid_start_ratio: float = 0.2,
-        invalid_end_ratio: float = 1.2,
-        target_score_alpha: float = 0.1,
-        **kwargs,
-    ):
-        # reward = logP + alpha * reward_norm
-        self.target_score_alpha = target_score_alpha
-        self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
-        self.invalid_start_ratio = invalid_start_ratio
-        self.invalid_end_ratio = invalid_end_ratio
-
-        # temperature for the target score
-        self.temperature = 1.0
-
-    def score(
-        self,
-        input_batch,
-        prompt_length,
-        model,
-        tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
-        naughty_vocab_alpha=-99,
-        invalid_vocab_alpha=-99,
-        advantage_alpha=0.5,
-        target_molecule: Optional[str] = None,
-        agree_list=None,
-        **kwargs,
-    ):
-        lora_to_base(model)
-        reference_logits, _ = score_fast(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            agree_list=agree_list,
-        )
-
-        base_to_lora(model)
-
-        if self.sentence_validator is not None:
-            # use valid list instead of invalid list
-            validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
-            )
-            invalid = validator_dict["invalid"]
-            reference_logits_norm = reference_logits_norm = (
-                reference_logits - reference_logits.mean()
-            ) / (reference_logits.std() + 1e-8)
-            reward_mixed = reference_logits_norm
-
-            # apply invalid mask
-            invalid_list = []
-            for i in range(reward_mixed.shape[0]):
-                # apply group advantage
-                min_value = torch.min(reward_mixed[i, :])
-                start_values = min_value * self.invalid_start_ratio
-                end_values = min_value * self.invalid_end_ratio
-                seq = torch.linspace(
-                    start=start_values,
-                    end=end_values,
-                    steps=reward_mixed.shape[1],
-                    device=reward_mixed.device,
-                )
-                invalid_list.append(seq)
-
-            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
-
-        return {
-            "reward": torch.min(reward_mixed, invalid_value),
-            "reward_unpenalized": reward_mixed,
-            "full_tokens": validator_dict.get("full_tokens", None),
-            "log_pf_ref": reference_logits,
-            "validator_dict": validator_dict,
-        }
 
 
 class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
     def __init__(
         self,
-        sentence_validator: SentenceValidator,
+        sentence_validator: SentenceValidator | None,
         valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
         target_score_alpha: float = 0.1,
+        disable_peft: bool = False,
         **kwargs,
-    ):
-        # reward = logP + alpha * reward_norm
-        self.target_score_alpha = target_score_alpha
+    ) -> None:
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
-
-        # temperature for the target score
+        self.target_score_alpha = target_score_alpha
+        self.disable_peft = disable_peft
         self.temperature = 1.0
 
     def score(
         self,
-        input_batch,
-        prompt_length,
+        input_batch: Tensor,
+        prompt_length: int,
         model,
         tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
+        reward_temperature: float = 1.0,
         vocab_nice_mask=None,
         vocab_naughty_mask=None,
-        naughty_vocab_alpha=-99,
-        invalid_vocab_alpha=-99,
-        scaling_factor=0.5,
-        target_molecule: Optional[str] = None,
-        agree_list=None,
+        naughty_vocab_alpha: float = -99,
+        scaling_factor: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
         **kwargs,
-    ):
-        lora_to_base(model)
-        reference_logits, _ = score_fast(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            agree_list=agree_list,
-        )
+    ) -> dict[str, Any]:
+        if self.disable_peft:
+            reference_logits, _ = score_fast(
+                model=model,
+                encoded_input=input_batch,
+                termination_token_id=tokenizer.eos_token_id,
+                skip_first=prompt_length,
+                reward_temperature=reward_temperature,
+                vocab_nice_mask=vocab_nice_mask,
+                vocab_naughty_mask=vocab_naughty_mask,
+                naughty_vocab_alpha=naughty_vocab_alpha,
+                agree_list=agree_list,
+            )
+        else:
+            with use_base_model(model):
+                reference_logits, _ = score_fast(
+                    model=model,
+                    encoded_input=input_batch,
+                    termination_token_id=tokenizer.eos_token_id,
+                    skip_first=prompt_length,
+                    vocab_nice_mask=vocab_nice_mask,
+                    naughty_vocab_mask=vocab_naughty_mask,
+                    naughty_vocab_alpha=naughty_vocab_alpha,
+                    reward_temperature=reward_temperature,
+                    agree_list=agree_list,
+                )
 
-        base_to_lora(model)
+        validator_dict = None
+        reward_mixed = reference_logits
 
         if self.sentence_validator is not None:
-            # use valid list instead of invalid list
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, target_molecule
             )
-            invalid = validator_dict["invalid"]
+            invalid_mask = validator_dict["invalid"]
             valid_score = validator_dict["valid_score"]
-            # reference_logits_norm = (reference_logits - reference_logits.mean()) / (
-            #     reference_logits.std() + 1e-8
-            # )  # normalize logits
-            reference_logits_norm = reference_logits
-            # TODO: mean at which dim?
-            # valid_score * 1000 + reference_logits_norm
-            # non-buffer acc.
-            # no logP mixed with native reward to buffer cause model collapse
-            reward_mixed = reference_logits_norm + scaling_factor * valid_score
-
-            # apply invalid mask
-            invalid_list = []
-
-            for i in range(reward_mixed.shape[0]):
-                min_value = -10
-                start_values = min_value * self.invalid_start_ratio
-                end_values = min_value * self.invalid_end_ratio
-                seq = torch.linspace(
-                    start=start_values,
-                    end=end_values,
-                    steps=reward_mixed.shape[1],
-                    device=reward_mixed.device,
-                )
-                invalid_list.append(seq)
-
-            invalid_value = torch.stack(invalid_list, dim=0) * invalid  # shape: [B, L]
+            reward_mixed = reference_logits + scaling_factor * valid_score
+            reward_penalized = _apply_invalid_penalty(
+                reward_mixed,
+                invalid_mask,
+                self.invalid_start_ratio,
+                self.invalid_end_ratio,
+                base_override=-10,
+            )
+        else:
+            reward_penalized = reward_mixed
 
         return {
-            "reward": torch.min(reward_mixed, invalid_value),
+            "reward": reward_penalized,
             "reward_unpenalized": reward_mixed,
-            "full_tokens": validator_dict.get("full_tokens", None),
+            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
             "log_pf_ref": reference_logits,
             "validator_dict": validator_dict,
         }
@@ -811,12 +763,12 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
 class UniformModelSentenceGivenPrompt:
     def __init__(
         self,
-        sentence_validator: SentenceValidator,
-        temperature=1.0,
+        sentence_validator: SentenceValidator | None,
+        temperature: float = 1.0,
         valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
-    ):
+    ) -> None:
         self.temperature = temperature
         self.sentence_validator = sentence_validator
         self.valid_sentence_alpha = valid_sentence_alpha
@@ -825,68 +777,44 @@ class UniformModelSentenceGivenPrompt:
 
     def score(
         self,
-        input_batch,
-        prompt_length,
+        input_batch: Tensor,
+        prompt_length: int,
         tokenizer: PreTrainedTokenizer,
-        reward_temperature=1.0,
+        reward_temperature: float = 1.0,
         termination_token_id: int = -1,
-        agree_list: list[int] = None,
-        termination_logits: torch.Tensor = None,
+        agree_list: Tensor | None = None,
+        termination_logits: Tensor | None = None,
         min_len: int = 10,
         **kwargs,
-    ):
-        # P-terminal
-        # 1. base prob
-        sum_along_D = agree_list.sum(dim=-1, keepdim=True)  # B*L*1
-        valid_mask = sum_along_D > 0
-        uniform_base = torch.where(agree_list, 1.0 / sum_along_D.clamp(min=1e-6), 0).detach()
+    ) -> ScorePair:
+        if agree_list is None:
+            raise ValueError("agree_list must be provided for uniform model scoring.")
 
-        # 2. length exp increase for eos
-        first_position_counts = sum_along_D[0, :, :].squeeze(-1)  # [B]
+        sum_along_dim = agree_list.sum(dim=-1, keepdim=True)
+        uniform_base = torch.where(agree_list, 1.0 / sum_along_dim.clamp(min=1e-6), 0).detach()
 
-        # log_start_for_first_pos.
-        log_start = torch.log((1 / first_position_counts).clamp(min=1e-6))  # [B]
+        first_position_counts = sum_along_dim[0, :, :].squeeze(-1)
+        log_start = torch.log((1 / first_position_counts).clamp(min=1e-6))
         seq_len = input_batch.size(1) - prompt_length
-        steps = torch.linspace(0, 1, seq_len + 1, device=input_batch.device)  # [L+1]
-        log_space = log_start[None, :] * (1 - steps[:, None])  # [L+1, B]
-        length_increase = torch.exp(log_space).unsqueeze(-1)  # [L+1, B, 1]
+        steps = torch.linspace(0, 1, seq_len + 1, device=input_batch.device)
+        log_space = log_start[None, :] * (1 - steps[:, None])
+        length_increase = torch.exp(log_space).unsqueeze(-1)
 
         eos_mask = torch.zeros_like(agree_list)
         eos_mask[..., termination_token_id] = agree_list[..., termination_token_id]
 
-        # P(seq) + P(eos) * length_increase
         uniform_probs = uniform_base * (~eos_mask)
         eos_probs = torch.log_softmax(uniform_base * eos_mask * length_increase, dim=-1)
         logprob = torch.log_softmax(uniform_probs, dim=-1)
 
-        # global compensation
+        token_ids = input_batch[:, prompt_length:].unsqueeze(-1)
+        log_pf = logprob[1:].gather(-1, token_ids.transpose(0, 1)).squeeze(-1)
+        log_p = log_pf.cumsum(dim=0)
 
-        # if quality_scorer is not None:
-        #     # 获取完整序列质量分数 [B]
-        #     full_sequences = input_batch[:, prompt_length:]
-        #     quality_scores = quality_scorer(full_sequences)  # [B]
-
-        #     # 在终止位置加入质量补偿
-        #     quality_bonus = quality_scores.unsqueeze(-1) * torch.linspace(
-        #         0, 1, seq_len, device=input_batch.device
-        #     )  # [B, L]
-
-        #     # 将质量补偿映射到EOS位置
-        #     eos_positions = (input_batch[:, prompt_length:] == termination_token_id)
-        #     psudo_logits[..., termination_token_id] += (
-        #         quality_bonus.masked_fill(~eos_positions, 0)
-        #     )
-
-        token_ids = input_batch[:, prompt_length:].unsqueeze(-1)  # [B, L, 1]
-        logPF = logprob[1:].gather(-1, token_ids.transpose(0, 1)).squeeze(-1)  # [L-1, B]
-        logP = logPF.cumsum(dim=0)  # [L-1, B]
-        reward = eos_probs[
-            ..., termination_token_id
-        ]  # logP(generated[i+1]=term | prompt + generated[:i+1])
-        reward[1:,] += logP  # logP(generated[:i] + term | prompt)
+        reward = eos_probs[..., termination_token_id]
+        reward[1:,] += log_p
 
         non_term_mask = (input_batch != termination_token_id)[:, prompt_length:]
-
         non_term_mask = torch.cat(
             (
                 non_term_mask.new_ones(non_term_mask.shape[0], 1),
@@ -895,46 +823,28 @@ class UniformModelSentenceGivenPrompt:
             dim=-1,
         )
 
-        # before reach the min_len, the reward is -999
-        # reward = torch.where(non_term_mask.cumsum(dim=-1) - 1 < min_len, -999, reward)
-
         reward_unpenalized = reward.clone()
 
-        # valid_eos_mask = (
-        #     input_batch[:, prompt_length:] == termination_token_id
-        # ) & valid_mask.squeeze(-1)
-
-        # # Eos based reward
-        # termination_logits = psudo_logits[..., termination_token_id]  # [B, L]
-        # reward = termination_logits * valid_eos_mask.float()
-        # length_penalty = -0.1 * torch.arange(1, seq_len + 1, device=reward.device).float().log()
-        # reward += length_penalty.unsqueeze(0)
-        # reward_unpenalized = reward.clone()
-
         if self.sentence_validator is not None:
-            # use valid list instead of invalid list
-            invalid = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)
+            invalid_mask = self.sentence_validator(input_batch[:, prompt_length:], tokenizer)[
+                "invalid"
+            ]
+            reward = reward.clone()
 
-            # v4
-            # 确保已经定义了prompt_len，例如：prompt_len = ...（某个整数）
-            reward_min = torch.min(reward, dim=-1).values  # 形状 [B]
-
+            reward_min = torch.min(reward, dim=-1).values
             start_values = reward_min * self.invalid_start_ratio
             end_values = reward_min * self.invalid_end_ratio
 
-            invalid_list = []
+            ramp = []
             for i in range(reward.shape[0]):
-                # generate linear incresement part for the rest of the sequence
                 seq = torch.linspace(
                     start=start_values[i],
                     end=end_values[i],
                     steps=reward.shape[1],
                     device=reward.device,
                 )
-                invalid_list.append(seq)
-
-            invalid_value = torch.stack(invalid_list, dim=0)  # shape: [B, L]
-
-            reward = torch.min(reward.permute(1, 0), invalid_value.permute(1, 0) * invalid)
+                ramp.append(seq)
+            invalid_value = torch.stack(ramp, dim=0)
+            reward = torch.min(reward.permute(1, 0), invalid_value.permute(1, 0) * invalid_mask)
 
         return reward, reward_unpenalized.permute(1, 0)

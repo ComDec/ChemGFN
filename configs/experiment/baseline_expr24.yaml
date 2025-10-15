@@ -23,9 +23,15 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 4
+  devices: 1
 
 model:
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.00001
+    weight_decay: 0.01
+
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
     invalid_start_ratio: 3
@@ -35,8 +41,8 @@ model:
       _target_: chemgfn.models.reward.Expr24Validator
 
   constraint_config:
-    min_sentence_len: 2
-    max_sentence_len: 5
+    min_sentence_len: 7
+    max_sentence_len: 7
     grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
     apply_grammar: true

@@ -44,8 +44,7 @@ reward:
   advantage_alpha: 0.2
   disable_peft: ${model.disable_peft}
   sentence_validator:
-    _target_: chemgfn.models.reward.RDKitValidator
-    scorer: "logP"
+    _target_: chemgfn.models.reward.Expr24Validator
 
 reward_config:
   reward_temp_start: 2
@@ -67,10 +66,10 @@ reward_buffer:
 constraint_config:
   min_sentence_len: 2
   max_sentence_len: 10
-  grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
+  grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
   apply_grammar: true
   processor_type: "prefix"
-  legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
+  legal_tokens: ${paths.assets_dir}/token_list/24_points/general
   naughty_vocab_alpha: -50
   parse_mode: "limited"
 
@@ -86,8 +85,8 @@ training_mixed_config:
   buffer_sample_steps: 20000
   buffer_mixture_ratio: 0.5
   skip_baseline_sampling: true
-  opt_task: true
+  opt_task: True
 
 compile: false
 
-disable_peft: false
+disable_peft: False

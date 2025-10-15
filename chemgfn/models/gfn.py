@@ -229,12 +229,17 @@ class ChemGFNModule(LightningModule):
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
         compile: bool,
+        disable_peft: bool = False,
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters(ignore=["net"])
         model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
-        self.net = get_peft_model(model, lora_config)
+        if not disable_peft:
+            self.net = get_peft_model(model, lora_config)
+        else:
+            self.net = model
+
         self.tokenizer = tokenizer
 
         self.reward_config = reward_config
