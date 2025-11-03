@@ -46,7 +46,7 @@ reward_config:
   reward_temp_start: 2
   reward_temp_end: 0.8
   reward_temp_horizon: 50000
-  invalid_vocab_alpha: -80
+  illegal_vocab_penalty: -80
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -60,7 +60,7 @@ constraint_config:
   apply_grammar: true
   processor_type: "prefix"
   legal_tokens: ${allowed_tokens_path}
-  naughty_vocab_alpha: -50
+  illegal_vocab_penalty: -50
   parse_mode: "limited"
 
 training_mixed_config:

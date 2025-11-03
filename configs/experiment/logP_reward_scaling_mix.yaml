@@ -30,7 +30,6 @@ model:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
     invalid_start_ratio: 3
     invalid_end_ratio: 5.0
-    target_score_alpha: 0.8
     sentence_validator:
       _target_: chemgfn.models.reward.RDKitValidator
       scorer: "logP"

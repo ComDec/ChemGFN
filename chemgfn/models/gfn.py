@@ -44,7 +44,12 @@ sys.setrecursionlimit(1500)
 
 
 class ChemGFNModule(LightningModule):
-    """Main Lightning module wrapping model, reward and optimisation logic."""
+    """Main Lightning module wrapping model, reward and optimisation logic.
+
+    This module implements a GFlowNet training loop for chemical molecule generation.
+    It handles autoregressive generation with grammar constraints, reward computation,
+    and SubTB loss optimization.
+    """
 
     # --------------------------------------------------------------------- #
     # Helpers
@@ -178,10 +183,24 @@ class ChemGFNModule(LightningModule):
         return random.random() * (pf_high - pf_low) + pf_low
 
     def _maybe_generate_from_buffer(self, item, encoded_prompt):
-        if random.random() >= self.get_use_buffer_sample_at_step(self.global_step):
+        """Optionally generate from replay buffer samples (Buffer 1).
+
+        Uses a dynamic probability schedule to decide whether to sample
+        from the replay buffer.
+
+        Args:
+            item: Data item dictionary.
+            encoded_prompt: Encoded prompt tensor.
+
+        Returns:
+            Tuple of (action_seq, result_dict) if buffer sampling is used, None otherwise.
+        """
+        # Use dynamic probability schedule for replay buffer
+        if random.random() >= self.get_use_replay_buffer_at_step(self.global_step):
             return None
 
         prompt_tensor = encoded_prompt if encoded_prompt.ndim == 2 else encoded_prompt.unsqueeze(0)
+        device = encoded_prompt.device
 
         buffer_sentences, _ = self.reward_buffer.sample(
             self.training_mixed_config.n_samples,
@@ -190,10 +209,9 @@ class ChemGFNModule(LightningModule):
         )
         if buffer_sentences is None:
             return None
-        buffer_sentences = buffer_sentences.to(encoded_prompt.device)
-        prompt_expanded = prompt_tensor.expand(buffer_sentences.size(0), -1).to(
-            encoded_prompt.device
-        )
+        # Ensure buffer samples are on the same device as prompt
+        buffer_sentences = buffer_sentences.to(device, non_blocking=True)
+        prompt_expanded = prompt_tensor.expand(buffer_sentences.size(0), -1)
         prompt_prefix = prompt_expanded[:, :-1]
         action_seq = torch.cat([prompt_prefix, buffer_sentences], dim=1)
         result_dict = self.forward(item, action_seq=action_seq)
@@ -252,21 +270,41 @@ class ChemGFNModule(LightningModule):
             reward_config["reward_temp_end"],
             reward_config["reward_temp_horizon"],
         )
-        self.get_advantage_alpha_at_step = self._build_linear_schedule(
-            reward_config["advantage_alpha_start"],
-            reward_config["advantage_alpha_end"],
-            reward_config["advantage_alpha_horizon"],
-        )
+
+        # Target reward scaling factor
         self.get_scaling_factor_at_step = self._build_linear_schedule(
             reward_config["scaling_factor_start"],
             reward_config["scaling_factor_end"],
             reward_config["scaling_factor_horizon"],
         )
-        self.get_use_buffer_sample_at_step = self._build_linear_schedule(
+
+        # Reference logits scale
+        self.get_reference_logits_scale_at_step = self._build_linear_schedule(
+            reward_config["reference_logits_scale_start"],
+            reward_config["reference_logits_scale_end"],
+            reward_config["reference_logits_scale_horizon"],
+        )
+
+        # Buffer 1: ReplayBuffer (from reward_buffer) - dynamic probability schedule
+        self.get_use_replay_buffer_at_step = self._build_linear_schedule(
+            training_mixed_config.get("use_replay_buffer_start_prob", 0.25),
+            training_mixed_config.get("use_replay_buffer_end_prob", 0.25),
+            training_mixed_config.get("replay_buffer_steps", 50000),
+        )
+
+        # Buffer 2: Dataset buffer (from dataloader) - dynamic probability schedule
+        self.get_use_dataset_buffer_at_step = self._build_linear_schedule(
             training_mixed_config["use_buffer_sample_start_prob"],
             training_mixed_config["use_buffer_sample_end_prob"],
             training_mixed_config["buffer_sample_steps"],
         )
+
+        self.get_balance_at_step = self._build_linear_schedule(
+            training_mixed_config["balance_start"],
+            training_mixed_config["balance_end"],
+            training_mixed_config["balance_horizon"],
+        )
+
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
         self.reward = reward
@@ -279,8 +317,16 @@ class ChemGFNModule(LightningModule):
         ) = self._load_token_masks()
         self._setup_grammar_processors()
 
-        self.naughty_vocab_alpha = float(self.constraint_config.naughty_vocab_alpha)
-        self.invalid_vocab_alpha = float(self.reward_config.invalid_vocab_alpha)
+        # Read illegal_vocab_penalty from constraint_config
+        self.illegal_vocab_penalty = float(
+            getattr(self.constraint_config, "illegal_vocab_penalty", -50)
+        )
+
+        # Read illegal_vocab_penalty from reward object
+        if hasattr(reward, "illegal_vocab_penalty"):
+            self.illegal_vocab_penalty = float(reward.illegal_vocab_penalty)
+        else:
+            self.illegal_vocab_penalty = -99
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -313,13 +359,29 @@ class ChemGFNModule(LightningModule):
         n_samples=None,
         pf_temperature=1.0,
         reward_temperature=1.0,
-        advantage_alpha=0.01,
-        scaling_factor=50,
+        scaling_factor=1,
+        reference_logits_scale=0.5,
         action_seq=None,
         use_buffer_sample: bool = False,
         buffer_sample: torch.Tensor | None = None,
         buffer_mixture_ratio: float = 0.5,
     ):
+        """Forward pass for generation and reward computation.
+
+        Args:
+            encoded_data: Dictionary containing encoded prompt and optional molecule.
+            n_samples: Number of samples to generate (default: from config).
+            pf_temperature: Temperature for forward policy sampling (default: 1.0).
+            reward_temperature: Temperature for reward computation (default: 1.0).
+            scaling_factor: Reward scaling factor (default: 50).
+            action_seq: Optional pre-computed action sequence.
+            use_buffer_sample: Whether to use buffer samples (default: False).
+            buffer_sample: Optional buffer samples tensor.
+            buffer_mixture_ratio: Ratio of samples to replace with buffer (default: 0.5).
+
+        Returns:
+            Dictionary with generation results (state, log_pf, log_pterm, log_r, etc.).
+        """
         encoded_prompt = encoded_data["encoded_prompt"]
         encoded_prompt = encoded_prompt.squeeze(0) if encoded_prompt.ndim != 1 else encoded_prompt
         n_samples = n_samples or self.training_mixed_config.n_samples
@@ -341,14 +403,13 @@ class ChemGFNModule(LightningModule):
             "max_len": self.constraint_config.max_sentence_len,
             "temperature": pf_temperature,
             "reward_temperature": reward_temperature,
-            "advantage_alpha": advantage_alpha,
             "scaling_factor": scaling_factor,
+            "reference_logits_scale": reference_logits_scale,
             "skip_rewards": False,
             "action_seq": action_seq,
             "vocab_nice_mask": self.legal_tokens_mask,
-            "vocab_naughty_mask": self.illegal_tokens_mask,
-            "naughty_vocab_alpha": self.naughty_vocab_alpha,
-            "invalid_vocab_alpha": self.invalid_vocab_alpha,
+            "vocab_invalid_mask": self.illegal_tokens_mask,
+            "illegal_vocab_penalty": self.illegal_vocab_penalty,
             "use_buffer_sample": use_buffer_sample,
             "buffer_sample": buffer_sample,
             "buffer_mixture_ratio": buffer_mixture_ratio,
@@ -369,20 +430,32 @@ class ChemGFNModule(LightningModule):
         encoded_prompt = item["encoded_prompt"]
         prompt_len = encoded_prompt.shape[-1]
         buffer_sample = item["buffer_encoded_sample"]
-        buffer_result = self._maybe_generate_from_buffer(item, encoded_prompt)
-        used_buffer = buffer_result is not None
 
-        if used_buffer:
+        # Buffer 1: Try to use replay buffer (fixed probability)
+        buffer_result = self._maybe_generate_from_buffer(item, encoded_prompt)
+        used_replay_buffer = buffer_result is not None
+
+        if used_replay_buffer:
+            # Using replay buffer, no need for dataset buffer
             _, result_dict = buffer_result
             pf_temp = 1.0
         else:
+            # Not using replay buffer, decide whether to use dataset buffer
             pf_temp = self._sample_pf_temperature()
+
+            # Buffer 2: Decide whether to use dataset buffer (dynamic probability schedule)
+            use_dataset_buffer = (
+                buffer_sample is not None
+                and random.random() < self.get_use_dataset_buffer_at_step(self.global_step)
+            )
+
             result_dict = self.forward(
                 item,
                 pf_temperature=pf_temp,
                 reward_temperature=self.reward.temperature,
                 scaling_factor=self.get_scaling_factor_at_step(self.global_step),
-                use_buffer_sample=False,
+                reference_logits_scale=self.get_reference_logits_scale_at_step(self.global_step),
+                use_buffer_sample=use_dataset_buffer,
                 buffer_sample=buffer_sample,
                 buffer_mixture_ratio=self.buffer_mixture_ratio,
             )
@@ -394,7 +467,7 @@ class ChemGFNModule(LightningModule):
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
 
-        if used_buffer:
+        if used_replay_buffer:
             log_r = model_log_r[:, : max(0, generated_text.shape[1] - prompt_len)]
         else:
             log_r = model_log_r
@@ -408,10 +481,20 @@ class ChemGFNModule(LightningModule):
 
         self._log_metrics(
             {
-                "buffer_prob": torch.tensor(
-                    self.get_use_buffer_sample_at_step(self.global_step),
+                "replay_buffer_prob": torch.tensor(
+                    self.get_use_replay_buffer_at_step(self.global_step),
                     device=self.device,
-                )
+                ),
+                "dataset_buffer_prob": torch.tensor(
+                    self.get_use_dataset_buffer_at_step(self.global_step),
+                    device=self.device,
+                ),
+                "target_scaling_ratio": torch.tensor(
+                    self.get_scaling_factor_at_step(self.global_step), device=self.device
+                ),
+                "reference_logits_scale": torch.tensor(
+                    self.get_reference_logits_scale_at_step(self.global_step), device=self.device
+                ),
             },
             on_step=True,
             sync_dist=True,
@@ -426,6 +509,7 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
             subtb_lambda=self.training_mixed_config.subtb_lambda,
+            balance=self.get_balance_at_step(self.global_step),
         )
 
         _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
@@ -449,7 +533,12 @@ class ChemGFNModule(LightningModule):
 
         if batch_idx % 10 == 0:
             decoded = self._decode_generated_tokens(generated_text[0, prompt_len:])
-            self.train_samples.append(f"{decoded}: pf_temp={pf_temp:.2f}")
+            acc = self.reward.sentence_validator.accuracy(
+                generated_text[0, prompt_len:], self.tokenizer, item.get("molecule", None)
+            )
+            self.train_samples.append(
+                f"{decoded}: pf_temp={pf_temp:.2f}, logP={log_ps[0].item():.2f}, valid={acc}"
+            )
 
             replay_buffer_stats = self.reward_buffer.stat()
             self._log_metrics(
@@ -463,8 +552,8 @@ class ChemGFNModule(LightningModule):
 
         self._log_metrics(
             {
-                "train/buffer_ratio": torch.tensor(
-                    self.get_use_buffer_sample_at_step(self.global_step),
+                "train/dataset_buffer_ratio": torch.tensor(
+                    self.get_use_dataset_buffer_at_step(self.global_step),
                     device=self.device,
                 ),
                 "train/reward_var": log_r.var(dim=0).mean(),
@@ -610,16 +699,19 @@ class ChemGFNModule(LightningModule):
         self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
 
     def on_validation_epoch_start(self):
+        """Compute validation metrics at the start of validation epoch."""
         log_rs, log_pfss = [], []
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
         self.val_probes = torch.utils.data.Subset(
             val_dataset, random.sample(range(len(val_dataset)), 10)
         )
+        device = self.device
         for idx, item in enumerate(self.trainer.datamodule.val_dataloader()):
             encoded_prompt = item["encoded_prompt"]
+            # Move all tensors to device in one pass
             for key, value in item.items():
                 if isinstance(value, torch.Tensor):
-                    item[key] = value.to(self.device)
+                    item[key] = value.to(device, non_blocking=True)
             result_dict = self.forward(item, pf_temperature=1.0)
             generated_text = result_dict["state"]
             log_pf = result_dict["log_pf"]
@@ -709,13 +801,24 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
 
     def sample_probes(self, probes, n_samples=4):
+        """Sample and decode probe sequences for logging.
+
+        Args:
+            probes: List of probe data items.
+            n_samples: Number of samples per probe (default: 4).
+
+        Returns:
+            DataFrame with sampled sequences and their metrics.
+        """
         samples = []
+        device = self.device
         for probe in probes:
             encoded_prompt = probe["encoded_prompt"]
             prompt_len = encoded_prompt.shape[-1]
+            # Move all tensors to device efficiently
             for key, value in probe.items():
                 if isinstance(value, torch.Tensor):
-                    probe[key] = value.to(self.device)
+                    probe[key] = value.to(device, non_blocking=True)
             with torch.no_grad():
                 result_dict = self.forward(
                     probe, n_samples=n_samples, pf_temperature=1.0, reward_temperature=1.0

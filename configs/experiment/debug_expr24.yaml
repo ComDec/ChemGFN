@@ -9,9 +9,9 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "baseline", "expr24"]
+tags: ["ChemGFN", "debug", "expr24"]
 
-exp_name: "baseline_expr24"
+exp_name: "debug_expr24"
 seed: 42
 
 # ============================================================================
@@ -23,6 +23,8 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
+  limit_train_batches: 50
+  limit_val_batches: 5
   devices: 1
 
 # ============================================================================
@@ -30,10 +32,7 @@ trainer:
 # ============================================================================
 model:
   optimizer:
-    _target_: torch.optim.AdamW
-    _partial_: true
     lr: 0.0001
-    weight_decay: 0.01
 
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
@@ -49,19 +48,14 @@ model:
     reward_temp_start: 2
     reward_temp_end: 0.8
     reward_temp_horizon: 50000
-    scaling_factor_start: 1
-    scaling_factor_end: 1
-    scaling_factor_horizon: 50000
-    reference_logits_scale_start: 1.0
-    reference_logits_scale_end: 0.0
-    reference_logits_scale_horizon: 50000
+    scaling_factor_start: 50
+    scaling_factor_end: 100
+    scaling_factor_horizon: 5000
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
     sim_tolerance: 0.25
-    strict_mode: false
-    buffer_aug_value: 0.0
 
   constraint_config:
     min_sentence_len: 1
@@ -79,18 +73,18 @@ model:
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
     # Replay buffer (Buffer 1) schedule
-    use_replay_buffer_start_prob: 0.1
-    use_replay_buffer_end_prob: 0.5
+    use_replay_buffer_start_prob: 0
+    use_replay_buffer_end_prob: 0
     replay_buffer_steps: 50000
     n_samples: 8
     # Dataset buffer (Buffer 2) schedule
-    use_buffer_sample_start_prob: 0.8
-    use_buffer_sample_end_prob: 0.1
-    buffer_sample_steps: 50000
-    buffer_mixture_ratio: 0.5
+    use_buffer_sample_start_prob: 1.0
+    use_buffer_sample_end_prob: 1.0
+    buffer_sample_steps: 20000
+    buffer_mixture_ratio: 1.0
     skip_baseline_sampling: true
     balance_start: 0.0
-    balance_end: 0.0
+    balance_end: 1.0
     balance_horizon: 50000
     opt_task: false
 
@@ -106,4 +100,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: false
+    offline: true

@@ -5,36 +5,52 @@ import pickle
 
 import editdistance
 import numpy as np
-import spacy
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 # slient the warning
 from rdkit import Chem, RDLogger
-
-# from sentence_transformers import SentenceTransformer
-# from sentence_transformers.util import cos_sim
 from transformers import PreTrainedTokenizer
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
+from transformers.generation.logits_process import LogitsProcessorList
 
 RDLogger.DisableLog("rdApp.*")
 
 
 def lora_to_base(model):
+    """Disable LoRA adapters and set model to eval mode for base model inference.
+
+    Args:
+        model: PEFT model with LoRA adapters.
+    """
     model.base_model.disable_adapter_layers()
     model.eval()
 
 
 def base_to_lora(model):
+    """Enable LoRA adapters and set model to train mode.
+
+    Args:
+        model: PEFT model with LoRA adapters.
+    """
     model.base_model.enable_adapter_layers()
     model.train()
 
 
 def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse: bool = False):
+    """Prepare token masks for legal and illegal vocabulary tokens.
+
+    Args:
+        tokenizer: Pre-trained tokenizer instance.
+        vocab_path: Path to file containing legal tokens (one per line).
+        reverse: If True, reverse the legal/illegal masks (default: False).
+
+    Returns:
+        Tuple of (legal_token_mask, illegal_token_mask, legal_token_ids_list):
+            - legal_token_mask: Boolean tensor of shape [vocab_size] marking legal tokens
+            - illegal_token_mask: Boolean tensor of shape [vocab_size] marking illegal tokens
+            - legal_token_ids_list: List of legal token IDs
+    """
     with open(vocab_path) as f:
         legal_tokens = f.readlines()
 
@@ -68,9 +84,10 @@ import torch
 
 
 def calculate_diversity(token_id_list):
-    # TODO: uniqueness and novelty
-    """
-    Calculate diversity of LLM sampling results using average per-position entropy.
+    """Calculate diversity of LLM sampling results using average per-position entropy.
+
+    Diversity is measured as the average entropy across all sequence positions.
+    Higher entropy indicates more diverse samples.
 
     Args:
         token_id_list: torch.Tensor of shape (num_samples, seq_len) containing token IDs
@@ -113,9 +130,8 @@ def generate_and_return_termination_logprob(
     reward_fn,
     grammar_processor=None,
     vocab_nice_mask=None,
-    vocab_naughty_mask=None,
-    naughty_vocab_alpha=float("-inf"),
-    invalid_vocab_alpha=-50,
+    vocab_invalid_mask=None,
+    illegal_vocab_penalty=float("-inf"),
     max_len=10,
     min_len=0,
     temperature=1.0,
@@ -125,10 +141,45 @@ def generate_and_return_termination_logprob(
     use_buffer_sample=False,
     buffer_sample=None,
     buffer_mixture_ratio=0.5,
-    topk: int = 5,
-    topP: float = 0.8,
     **kwargs,
 ):
+    """Generate sequences using the model and compute termination log probabilities.
+
+    This function performs autoregressive generation with grammar constraints and computes
+    forward policy log probabilities and termination probabilities at each step.
+
+    Args:
+        model: The language model to use for generation.
+        encoded_data: Dictionary containing 'encoded_prompt' tensor and optionally 'molecule'.
+        termination_token_id: Token ID that marks sequence termination (EOS).
+        reward_fn: Function to compute rewards for generated sequences.
+        grammar_processor: Optional grammar constraint processor for logits.
+        vocab_nice_mask: Optional mask for allowed vocabulary tokens.
+        vocab_invalid_mask: Optional mask for disallowed vocabulary tokens.
+        illegal_vocab_penalty: Penalty value for illegal tokens (default: -inf).
+        max_len: Maximum generation length (default: 10).
+        min_len: Minimum generation length before allowing termination (default: 0).
+        temperature: Sampling temperature for token selection (default: 1.0).
+        reward_temperature: Temperature for reward computation (default: 1.0).
+        action_seq: Optional pre-computed action sequence (for buffer sampling).
+        skip_rewards: If True, skip reward computation (default: False).
+        use_buffer_sample: Whether to use buffer samples for generation (default: False).
+        buffer_sample: Optional buffer samples tensor.
+        buffer_mixture_ratio: Ratio of samples to replace with buffer (default: 0.5).
+        **kwargs: Additional arguments passed to reward_fn.
+
+    Returns:
+        Dictionary containing:
+            - state: Generated sequences tensor [batch_size, seq_len]
+            - log_pf: Forward policy log probabilities [batch_size, max_len]
+            - log_pterm: Termination log probabilities [batch_size, max_len]
+            - log_r: Reward log probabilities [batch_size, max_len]
+            - log_r_unpenalized: Unpenalized reward log probabilities [batch_size, max_len]
+            - agree_list: List of agreement tensors from grammar processor
+            - log_pf_ref: Reference forward probabilities (if available)
+            - full_tokens: Decoded token strings (if available)
+            - validator_dict: Validator output dictionary (if available)
+    """
     encoded_prompt = encoded_data["encoded_prompt"]
     target_molecule = encoded_data.get("molecule")
     device = encoded_prompt.device
@@ -153,9 +204,6 @@ def generate_and_return_termination_logprob(
     else:
         logits_processor = LogitsProcessorList([])
 
-    # default_processor = LogitsProcessorList(
-    #     [TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)]
-    # )
     default_processor = LogitsProcessorList([])
 
     nums_replace = 0
@@ -190,7 +238,6 @@ def generate_and_return_termination_logprob(
 
             prob = (modified_logits / temperature).softmax(dim=-1)
             token_ids = torch.multinomial(prob, num_samples=1)
-
             if use_buffer_sample and buffer_sample is not None:
                 if step < buffer_sample.size(-1):
                     if step >= max_len:
@@ -253,12 +300,10 @@ def generate_and_return_termination_logprob(
         reward_results = reward_fn(
             state[:, :-1],
             reward_temperature=reward_temperature,
-            advantage_alpha=kwargs.get("advantage_alpha", 0.0),
             scaling_factor=kwargs.get("scaling_factor", 0.0),
-            vocab_nice_mask=vocab_nice_mask,
-            vocab_naughty_mask=vocab_naughty_mask,
-            naughty_vocab_alpha=naughty_vocab_alpha,
-            invalid_vocab_alpha=invalid_vocab_alpha,
+            reference_logits_scale=kwargs.get("reference_logits_scale", 0.0),
+            vocab_invalid_mask=vocab_invalid_mask,
+            illegal_vocab_penalty=illegal_vocab_penalty,
             agree_list=agree_tensor,
             termination_token_id=termination_token_id,
             target_molecule=target_molecule,
@@ -292,15 +337,13 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     termination_token_id,
     reward_fn,
     grammar_processor=None,
-    vocab_nice_mask=None,
-    vocab_naughty_mask=None,
-    naughty_vocab_alpha=float("-inf"),
-    invalid_vocab_alpha=-50,
+    vocab_nice_mask=None,  # Unused, kept for compatibility with generate_and_return_termination_logprob
+    vocab_invalid_mask=None,
+    illegal_vocab_penalty=float("-inf"),
     max_len: int = 10,
     min_len: int = 0,
     temperature: float = 1.0,
     reward_temperature: float = 1.0,
-    advantage_alpha: float = 0.5,
     scaling_factor: float = 50,
     action_seq=None,
     skip_rewards: bool = False,
@@ -328,7 +371,6 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
     else:
         logits_processor = LogitsProcessorList([])
 
-    # default_processor = LogitsProcessorList([TopKLogitsWarper(topk), TopPLogitsWarper(topP), TemperatureLogitsWarper(temperature)])
     default_processor = LogitsProcessorList([])
     agree_list = []
 
@@ -344,22 +386,19 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         if action_seq is None:
             with torch.no_grad():
                 modified_logits = logits.clone().detach()
-                modified_logits[:, vocab_naughty_mask] = -torch.inf
+                if vocab_invalid_mask is not None:
+                    modified_logits[:, vocab_invalid_mask] = -torch.inf
 
-                ## debug block ##
-                # print(f"\nacceptance: {results['acceptance'].sum(dim=-1)}\n")
-                # print(f"state: {state}")
-                # print(f"token_ids: {token_ids}")
-
-                if i > max_len:
+                if i >= max_len:
                     mask = torch.ones_like(modified_logits, dtype=torch.bool)
-                    mask[:, termination_token_id] = False  # EOS token保留
+                    mask[:, termination_token_id] = False
                     modified_logits[mask] = -torch.inf
                     # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
                     modified_logits[:, termination_token_id] = 1
                     acceptance = torch.zeros_like(modified_logits, dtype=torch.bool)
                     acceptance[:, termination_token_id] = True
                     agree_list.append(acceptance)
+                    token_ids = torch.ones_like(token_ids) * termination_token_id
 
                 else:
                     modified_logits = default_processor(state, modified_logits)
@@ -368,35 +407,40 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
                     modified_logits = results["masked_logits"]
                     agree_list.append(results["acceptance"])
 
-                # TODO: EOS fetching problem, temperature
-                prob = (modified_logits / temperature).softmax(dim=-1)
-                if torch.any(torch.isnan(prob)):
-                    raise ValueError("NaN detected in probabilities after softmax.")
-                token_ids = torch.multinomial(prob, num_samples=1)
+                    # TODO: EOS fetching problem, temperature
+                    prob = (modified_logits / temperature).softmax(dim=-1)
+                    if torch.any(torch.isnan(prob)):
+                        # Replace NaN probabilities with uniform distribution
+                        prob = torch.ones_like(prob) / prob.size(-1)
+                    token_ids = torch.multinomial(prob, num_samples=1)
 
-                # print(f"prob: {prob}\n state: {state}\n token_ids: {token_ids}")
-                if use_buffer_sample:  # Use efficient sampling methods
-                    if i < buffer_sample.size(-1):
-                        if i >= max_len:
-                            token_ids[:nums_replace, :] = termination_token_id
+                    if use_buffer_sample and buffer_sample is not None:
+                        if i < buffer_sample.size(-1):
+                            if i >= max_len:
+                                token_ids[:nums_replace, :] = termination_token_id
+                            else:
+                                token_ids[:nums_replace, :] = buffer_sample[
+                                    :nums_replace, i
+                                ].unsqueeze(-1)
                         else:
-                            token_ids[:nums_replace, :] = buffer_sample[
-                                :nums_replace, i
-                            ].unsqueeze(-1)
-                    else:
-                        token_ids[:nums_replace, :] = termination_token_id
+                            token_ids[:nums_replace, :] = termination_token_id
 
         else:
             if i >= max_len:
                 token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
                     -1
                 )
+                agree_list.append(
+                    torch.zeros_like(logits, dtype=torch.bool)
+                    .to(token_ids.device)
+                    .scatter_(1, token_ids, True)
+                )
             else:
                 token_ids = action_seq[:, prompt_len - 1 + i].unsqueeze(-1)
-                # agree_list.append(
-                #     vocab_nice_mask.unsqueeze(0).repeat(token_ids.size(0), 1).to(token_ids.device)
-                # )
-                agree_list = None
+                acceptance = torch.zeros_like(logits, dtype=torch.bool).to(token_ids.device)
+                # Set the acceptance for the current token
+                acceptance.scatter_(1, token_ids, True)
+                agree_list.append(acceptance)
 
         token_ids = torch.where(
             active_seqs.unsqueeze(-1),
@@ -427,9 +471,6 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         # update the state, i.e., the sequence so far
         state = torch.cat([state, token_ids], dim=-1)
 
-        # check if all sequences have terminated, apply when we need non-fixed length generation
-        # if torch.all(~active_seqs):
-        #     break
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
 
@@ -443,11 +484,9 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         reward_results = reward_fn(
             state[:, :-1],
             reward_temperature=reward_temperature,
-            advantage_alpha=advantage_alpha,
             scaling_factor=scaling_factor,
-            vocab_nice_mask=vocab_nice_mask,
-            vocab_naughty_mask=vocab_naughty_mask,
-            naughty_vocab_alpha=naughty_vocab_alpha,
+            vocab_invalid_mask=vocab_invalid_mask,
+            illegal_vocab_penalty=illegal_vocab_penalty,
             agree_list=agree_list,
             termination_token_id=termination_token_id,
             target_molecule=target_molecule,
@@ -479,6 +518,7 @@ def modified_subtb_loss(
     termination_token_id,
     prompt_len,
     subtb_lambda=1.0,
+    **kwargs,
 ):
     # Ensure the dimensions of log probabilities, rewards, and generated text match
     assert (
@@ -515,6 +555,117 @@ def modified_subtb_loss(
     return batch_loss
 
 
+def modified_subtb_balance_loss(
+    log_pf: torch.Tensor,  # [B, L]
+    log_r: torch.Tensor,  # [B, L]
+    log_pterm: torch.Tensor,  # [B, L]
+    generated_text: torch.Tensor,  # [B, prompt_len + L]
+    termination_token_id: int,
+    prompt_len: int,
+    subtb_lambda: float = 1.0,  # Original length decay weight
+    balance: float = 0.0,  # New: 0~1, controls token-level balancing degree
+    eps: float = 1e-8,
+):
+    """
+    Subtrajectory Balance (SubTB) with token-coverage balancing.
+
+    Args:
+        log_pf:        log P_F at each step (forward policy), shape [B, L]
+        log_r:         log reward prefix accumulator used in your SubTB, shape [B, L]
+        log_pterm:     log termination (or other TB buffers), shape [B, L]
+        generated_text: token ids incl. prompt, shape [B, prompt_len+L]
+        termination_token_id: EOS id to build mask
+        prompt_len:    length of prompt
+        subtb_lambda:  per-window-length weight, ^(len-1)
+        balance:       in [0,1]; 0 keeps original window-sum; 1 re-weights so each token contributes equally
+        eps:           numerical stabilizer
+    Returns:
+        scalar loss
+    """
+
+    # Basic checks
+    B, L = log_pf.shape
+    assert (
+        L == log_r.shape[1] == log_pterm.shape[1] == generated_text.shape[1] - prompt_len
+    ), "Shapes must match: [B, L] and generated_text len - prompt_len == L"
+    assert L > 1, "Need at least one transition before termination (L > 1)."
+
+    # ----- Standard SubTB core (unchanged) -----
+    # delta has length L-1 (per-step TB residuals)
+    delta = (
+        log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
+    )  # [B, L-1]
+
+    # prefix-sum trick to get window sums quickly
+    delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(
+        dim=1
+    )  # [B, L]
+
+    # mask out everything at/after first EOS inside the generated suffix (exclude last token)
+    # shape: [B, L-1]
+    mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(dim=-1) >= 1
+
+    # ---------- (A) Original design: window-wise accumulation ----------
+    loss_num_win = delta.new_zeros(())
+    loss_den_win = delta.new_zeros(())
+
+    # ---------- (B) New addition: token-coverage "amortized" accumulation ----------
+    # We amortize each window loss (sum(delta_i))^2 of length s evenly to the s delta positions it covers.
+    # Then average over all tokens (delta positions). This makes all tokens contribute more evenly to the loss.
+    # contributions: accumulated amortized loss for each sample and each delta position
+    contributions = torch.zeros(B, L - 1, device=delta.device, dtype=delta.dtype)
+    # denom_tokens: effective coverage count for each delta position (also amortized by 1/s)
+    denom_tokens = torch.zeros(B, L - 1, device=delta.device, dtype=delta.dtype)
+
+    for s in range(1, L):  # window length from 1..L-1
+        # Window sum: delta_cumsum[:, s:] - delta_cumsum[:, :-s]  -> [B, L-s]
+        window_sum = delta_cumsum[:, s:] - delta_cumsum[:, :-s]  # [B, L-s]
+        subtb_term = window_sum.pow(2)  # [B, L-s]
+
+        # Apply mask (at the window start index dimension)
+        # mask has shape [B, L-1], slice to [B, L-s]
+        m_slice = mask[:, s - 1 :]  # [B, L-s]
+        subtb_term = subtb_term.masked_fill(m_slice, 0.0)
+
+        # Original design accumulation (window-wise) with length weight subtb_lambda^(s-1)
+        w = subtb_lambda ** (s - 1)
+        loss_num_win = loss_num_win + w * subtb_term.sum()
+        loss_den_win = loss_den_win + w * (~m_slice).sum()
+
+        # ------- Amortize to token (delta index) level contribution -------
+        # Distribute each window value evenly to the s positions it covers (by 1/s):
+        # This is equivalent to a 1D transposed convolution on [B, 1, L-s] with an all-ones kernel of length s,
+        # resulting in [B, 1, (L-s) + s - 1] = [B, 1, L-1], then divide by s.
+        if balance > 0:
+            v = (w * subtb_term).unsqueeze(1)  # [B, 1, L-s]
+            k = torch.ones(1, 1, s, device=delta.device, dtype=delta.dtype)
+            contrib_add = F.conv_transpose1d(v, k)[:, 0, :] / float(s)  # [B, L-1]
+            contributions.add_(contrib_add)
+
+            # Coverage count denominator: use the same "transposed convolution" to compute how many
+            # windows of length s cover each token, amortized by 1/s with the same weight w.
+            cover = (~m_slice).to(dtype=delta.dtype).unsqueeze(1)  # [B, 1, L-s]
+            cover_add = F.conv_transpose1d(cover, k)[:, 0, :] / float(s)  # [B, L-1]
+            denom_tokens.add_(w * cover_add)
+
+    # Safety clamp
+    loss_den_win = torch.clamp(loss_den_win, min=eps)
+
+    # (A) Original window-wise loss
+    loss_win = loss_num_win / loss_den_win
+
+    if balance <= 0:
+        return loss_win
+
+    # (B) Token-balanced loss: average the contribution allocated to each token
+    denom_tokens = torch.clamp(denom_tokens, min=eps)
+    loss_tok = (contributions / denom_tokens).mean()
+
+    # Linear interpolation: balance=0 -> pure original design; balance=1 -> fully balanced to token
+    loss = (1.0 - balance) * loss_win + balance * loss_tok
+    return loss
+
+
 def get_termination_vals(
     generated_text,
     log_pf,
@@ -542,9 +693,17 @@ class ReplayBuffer:
     A relay buffer that uses a heap to keep the max_size items with the highest reward
     """
 
-    def __init__(self, buffer_size, sim_tolerance=0.25):
+    def __init__(
+        self,
+        buffer_size,
+        sim_tolerance=0.25,
+        strict_mode: bool = False,
+        buffer_aug_value: float = 0,
+    ):
         self.buffer_size = buffer_size
         self.sim_tolerance = sim_tolerance
+        self.strict_mode = strict_mode
+        self.buffer_aug_value = buffer_aug_value
         self.reset()
 
     def set_termination_token_id(self, termination_token_id):
@@ -585,9 +744,8 @@ class ReplayBuffer:
                 editdistance.eval(new_answer, existing_answer)
                 < (len(new_answer) + len(existing_answer)) * self.sim_tolerance
             ):
-                if buffer_item[0] >= psudo_reward and not force_add:
+                if buffer_item[0] >= psudo_reward and (not force_add):
                     return
-
         # Critical fix: Only add to 'exists' AFTER successful heap insertion
         if len(buffer) >= self.buffer_size:
             # Push off the smallest item if buffer is full
@@ -595,8 +753,20 @@ class ReplayBuffer:
             # self._buffer[str_prompt]["exists"].remove(popped[1])
             self._buffer[str_prompt]["exists"].add(item["str_sentence"])
         else:
-            heapq.heappush(buffer, new_item)
-            self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+            if force_add:
+                new_item = list(new_item)
+                # ensure validated items are preferred
+                new_item[-2] += self.buffer_aug_value
+                new_item = tuple(new_item)
+            if self.strict_mode:
+                if force_add:
+                    heapq.heappush(buffer, new_item)
+                    self._buffer[str_prompt]["exists"].add(item["str_sentence"])
+                else:
+                    return
+            else:
+                heapq.heappush(buffer, new_item)
+                self._buffer[str_prompt]["exists"].add(item["str_sentence"])
 
     def add_batch(self, prompt, sentences, logrewards, tokenizer, result_dict=None):
         """
@@ -621,8 +791,7 @@ class ReplayBuffer:
             # str_sentence = token_sentences[i].replace(".", "").strip()
             # there is no such termination token in the SMILES
             str_sentence = token_sentences[i].strip()
-            batch_invalid = result_dict["validator_dict"]["invalid"]
-            valid_state = (~batch_invalid.bool())[i][-1]
+            valid_state = (result_dict["validator_dict"]["valid_score"].bool())[i][-1]
             self.add(
                 {
                     "logreward": logrewards[
@@ -647,6 +816,8 @@ class ReplayBuffer:
             [str(x) for x in tokenizer.batch_decode(prompt, skip_special_tokens=True)]
         )
         if str_prompt not in self._buffer:
+            return None, None
+        if len(self._buffer[str_prompt]["sentences"]) < batch_size:
             return None, None
         prompt_buffer = self._buffer[str_prompt]["sentences"]
         idx = np.random.choice(
@@ -703,18 +874,10 @@ class ReplayBuffer:
             f.write("logr_sum,tensor_answer,answer_logR,answer,force_add\n")
             for key in self._buffer:
                 for item in self._buffer[key]["sentences"]:
-                    answer_tokens = item[-3].tolist()
-                    answer = "".join(
-                        [
-                            str(x)
-                            for x in tokenizer.batch_decode(
-                                answer_tokens, skip_special_tokens=False
-                            )
-                        ]
-                    )
+                    answer_tokens = item[2].tolist()
                     force_add = item[-1].item()
                     f.write(
-                        f"{item[0]},{answer_tokens},{item[-2].tolist()},{answer},{force_add}\n"
+                        f"{item[0]},{answer_tokens},{item[-2].tolist()},{item[1]},{force_add}\n"
                     )
 
 

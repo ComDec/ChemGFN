@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import warnings
 from typing import Optional
@@ -49,6 +50,7 @@ class NumberDataSet(Dataset):
         return {
             "encoded_prompt": encoded_prompt["input_ids"],
             "numbers_list": torch.tensor(self.numbers_list[index]),
+            "buffer_encoded_sample": None,
         }
 
 
@@ -91,6 +93,8 @@ class NumberDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
     def val_dataloader(self):
@@ -99,91 +103,13 @@ class NumberDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
 
-class PromptDataSet(Dataset):
-    def __init__(self, prompts, tokenizer, total_size: int = 10000) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.prompts = prompts
-        self.total_size = total_size
-
-        # Generate prompts by randomly sampling with replacement
-        self.prompts = random.choices(prompts, k=self.total_size)
-
-    def __len__(self):
-        return self.total_size
-
-    def __getitem__(self, index):
-        prompts = self.prompts[index]
-        encoded_prompt = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-        )
-        return {
-            "encoded_prompt": encoded_prompt["input_ids"],
-            "buffer_encoded_sample": None,
-        }
-
-
-class PromptDataModule(LightningDataModule):
-    def __init__(
-        self,
-        data_path,
-        tokenizer_name: str = "openai-community/gpt2",
-        prompt_size: int = 1,
-        total_size: int = 10000,
-        train_size: float = 0.95,
-        num_workers: int = 8,
-        pin_memory: bool = True,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.data_path = data_path
-        self.train_size = train_size
-        self.train_data = None
-        self.val_data = None
-
-        self.prompt_size = prompt_size
-        self.total_size = total_size
-        self.num_workers = num_workers
-        self.pin_memory = pin_memory
-
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-
-    def prepare_data(self) -> None:
-        pass
-
-    def setup(self, stage):
-        with open(self.data_path) as f:
-            prompts = f.readlines()
-
-        # strip all the \n
-        prompts = [prompt.strip() for prompt in prompts][: self.prompt_size]
-
-        num_train = int(self.total_size * self.train_size)
-
-        self.train_data = PromptDataSet(prompts, self.tokenizer, num_train)
-        self.val_data = PromptDataSet(prompts, self.tokenizer, self.total_size - num_train)
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_data,
-            shuffle=True,
-            batch_size=None,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_data,
-            batch_size=None,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-        )
+# Alias for backward compatibility - will be defined after BufferDataPipe
+# PromptDataSet = BufferDataPipe
 
 
 class BufferDataPipe(Dataset):
@@ -253,9 +179,6 @@ class BufferDataPipe(Dataset):
         else:
             _prompt = self.prompts[index]
 
-        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
-        # _prompt = self.prompts[index]
-
         if False:
             message = self.generate_message(_prompt)
             encoded_prompt = self.tokenizer.apply_chat_template(
@@ -266,39 +189,83 @@ class BufferDataPipe(Dataset):
         else:
             encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
 
-        sampled_buffers = []
-        buffer_encoded_samples = []
+        buffer_encoded_samples = None
+
+        # Process buffer samples if available
         if self.buffer_sample is not None:
-            sampled_buffer = random.sample(self.buffer_sample, self.n_samples)
-            if self.allowed_vocab is not None:
-                for i in range(len(sampled_buffer)):
-                    if self.buffer_tokenization:
-                        buffer_encoded_sample = torch.tensor(
-                            self.tokenizer.encode(sampled_buffer[i], add_special_tokens=False)
-                        ).reshape(-1)
+            # Sample from buffer based on its type
+            if isinstance(self.buffer_sample, torch.Tensor):
+                # For 2D tensor: randomly select n_samples rows
+                if self.buffer_sample.dim() == 2:
+                    num_samples = min(self.n_samples, len(self.buffer_sample))
+                    indices = torch.randperm(len(self.buffer_sample))[:num_samples]
+                    sampled_buffer = self.buffer_sample[indices]
+                    # Already tokenized tensor, return directly after potential padding
+                    buffer_encoded_samples = sampled_buffer
+                elif self.buffer_sample.dim() == 1:
+                    # 1D tensor, treat as a single sample
+                    buffer_encoded_samples = self.buffer_sample.unsqueeze(0)
+                else:
+                    # Unexpected tensor shape, skip
+                    buffer_encoded_samples = None
+            elif isinstance(self.buffer_sample, (list, tuple)):
+                # For list/tuple: use random.sample
+                num_samples = min(self.n_samples, len(self.buffer_sample))
+                sampled_buffer = random.sample(list(self.buffer_sample), num_samples)
+                buffer_encoded_samples = []
+
+                for sample in sampled_buffer:
+                    # Check if sample is already a tensor (token ids)
+                    if isinstance(sample, torch.Tensor):
+                        # Already tokenized, use directly
+                        buffer_encoded_sample = sample.reshape(-1)
+                    elif (
+                        isinstance(sample, (list, tuple))
+                        and len(sample) > 0
+                        and isinstance(sample[0], (int, torch.Tensor))
+                    ):
+                        # List of token ids
+                        buffer_encoded_sample = torch.tensor(sample).reshape(-1)
+                    elif isinstance(sample, str):
+                        # Pure text, need to process with allowed_vocab and merge_chars_fast
+                        if self.allowed_vocab is not None:
+                            if self.buffer_tokenization:
+                                # Use standard tokenization
+                                buffer_encoded_sample = torch.tensor(
+                                    self.tokenizer.encode(sample, add_special_tokens=False)
+                                ).reshape(-1)
+                            else:
+                                # Use merge_chars_fast with allowed_vocab
+                                merged_chars = self.merge_chars_fast(sample, self.allowed_vocab)
+                                buffer_encoded_sample = torch.tensor(
+                                    [
+                                        self.tokenizer.encode(x, add_special_tokens=False)
+                                        for x in merged_chars
+                                    ]
+                                ).reshape(-1)
+                        else:
+                            # No allowed_vocab, use standard tokenization
+                            buffer_encoded_sample = torch.tensor(
+                                self.tokenizer.encode(sample, add_special_tokens=False)
+                            ).reshape(-1)
                     else:
-                        sampled_buffers.append(
-                            self.merge_chars_fast(sampled_buffer[i], self.allowed_vocab)
-                        )
-                        buffer_encoded_sample = torch.tensor(
-                            [
-                                self.tokenizer.encode(x, add_special_tokens=False)
-                                for x in sampled_buffers[i]
-                            ]
-                        ).reshape(-1)
+                        # Unknown type, skip this sample
+                        continue
 
                     buffer_encoded_samples.append(buffer_encoded_sample)
 
-                buffer_encoded_samples = pad_sequence(
-                    buffer_encoded_samples,
-                    batch_first=True,
-                    padding_value=self.tokenizer.eos_token_id,
-                )
+                # Pad sequences if we have any valid samples
+                if buffer_encoded_samples:
+                    buffer_encoded_samples = pad_sequence(
+                        buffer_encoded_samples,
+                        batch_first=True,
+                        padding_value=self.tokenizer.eos_token_id,
+                    )
+                else:
+                    buffer_encoded_samples = None
             else:
-                sampled_buffers = list(sampled_buffer)
-
-        else:
-            buffer_encoded_samples = None
+                # Unknown buffer type, skip
+                buffer_encoded_samples = None
 
         return {
             "encoded_prompt": encoded_prompt,
@@ -319,7 +286,7 @@ class BufferDataModule(LightningDataModule):
         pin_memory: bool = True,
         add_prompt: bool = False,
         allowed_vocab_path: Optional[str] = None,
-        n_samples: int = 4,
+        n_samples: int = 8,
         buffer_tokenization: bool = False,
     ):
         """
@@ -349,10 +316,17 @@ class BufferDataModule(LightningDataModule):
         self.is_instruct = True if "Instruct" in tokenizer_name else False
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-        with open(allowed_vocab_path) as f:
-            self.allowed_tokens = f.readlines() if allowed_vocab_path else None
+        # Check if allowed_vocab_path exists and load it
+        self.allowed_tokens = None
+        if allowed_vocab_path and os.path.exists(allowed_vocab_path):
+            with open(allowed_vocab_path) as f:
+                self.allowed_tokens = f.readlines()
 
-        self.buffer_sample = torch.load(buffer_sample_path) if buffer_sample_path else None
+        # Check if buffer_sample_path exists and load it
+        if buffer_sample_path and os.path.exists(buffer_sample_path):
+            self.buffer_sample = torch.load(buffer_sample_path)
+        else:
+            self.buffer_sample = None
 
     def prepare_data(self) -> None:
         pass
@@ -391,6 +365,8 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
     def val_dataloader(self):
@@ -399,6 +375,8 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
 
@@ -452,9 +430,6 @@ class MolOptDataPipe(Dataset):
             )
         else:
             _prompt = self.prompts[index]["prompt"]
-
-        # _prompt = (self.prompts[index] + SMILES_PROMPTS_BEHIND)
-        # _prompt = self.prompts[index]
 
         if False:
             message = self.generate_message(_prompt)
@@ -595,6 +570,8 @@ class MolOptDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )
 
     def val_dataloader(self):
@@ -603,4 +580,6 @@ class MolOptDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else 2,
+            persistent_workers=True if self.num_workers > 0 else False,
         )

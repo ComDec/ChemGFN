@@ -110,14 +110,18 @@ def _merge_target(template: str | None, fragment: str) -> str:
 
 
 @contextmanager
-def use_base_model(model) -> None:
+def use_base_model(model, disable_peft: bool = False) -> None:
     """Temporarily swap LoRA adapters off to operate on the base model."""
 
-    lora_to_base(model)
-    try:
+    if disable_peft:
         yield
-    finally:
-        base_to_lora(model)
+        return
+    else:
+        lora_to_base(model)
+        try:
+            yield
+        finally:
+            base_to_lora(model)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +136,10 @@ def score_fast(
     termination_token_id: int,
     skip_first: int,
     reward_temperature: float = 1.0,
-    naughty_vocab_mask: Tensor | None = None,
+    invalid_vocab_mask: Tensor | None = None,
+    agree_list: list[Tensor] | None = None,
+    illegal_vocab_penalty: float = -99,
+    grammar_disagree_penalty: float = -99,
     prompt_cache: tuple[Any, tuple[tuple[Tensor, ...], ...]] | None = None,
     **_: Any,
 ) -> ScorePair:
@@ -145,10 +152,20 @@ def score_fast(
         logits = model(encoded_input, past_key_values=batched_cache).logits
 
     logits = logits.detach()[:, skip_first - 1 :]
-
-    if naughty_vocab_mask is not None:
+    if invalid_vocab_mask is not None:
         logits = logits.clone()
-        logits[:, :, naughty_vocab_mask] = -torch.inf
+        logits[:, :, invalid_vocab_mask] += illegal_vocab_penalty
+
+    if agree_list is not None:
+        # convert list of tensor to tensor
+        agree_tensor = _stack_if_not_empty(agree_list).permute(
+            1, 0, 2
+        )  # (batch_size, seq_len, vocab_size)
+        try:
+            logits[~agree_tensor] += grammar_disagree_penalty
+        except Exception as e:
+            # If shapes don't match, skip disagree penalty
+            pass
 
     logits /= reward_temperature
     logprob = logits.log_softmax(-1)
@@ -624,14 +641,11 @@ class FrozenModelSentenceGivenPrompt:
     def __init__(
         self,
         sentence_validator: SentenceValidator | None,
-        temperature: float = 1.0,
-        valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
+        **kwargs,
     ) -> None:
-        self.temperature = temperature
         self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
 
@@ -642,10 +656,8 @@ class FrozenModelSentenceGivenPrompt:
         model,
         tokenizer: PreTrainedTokenizer,
         reward_temperature: float = 1.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
-        naughty_vocab_alpha: float = -99,
-        invalid_vocab_alpha: float = -99,
+        vocab_invalid_mask=None,
+        illegal_vocab_penalty: float = -99,
         **kwargs,
     ) -> ScorePair:
         with use_base_model(model):
@@ -655,9 +667,8 @@ class FrozenModelSentenceGivenPrompt:
                 termination_token_id=tokenizer.eos_token_id,
                 skip_first=prompt_length,
                 reward_temperature=reward_temperature,
-                vocab_nice_mask=vocab_nice_mask,
-                vocab_naughty_mask=vocab_naughty_mask,
-                naughty_vocab_alpha=naughty_vocab_alpha,
+                invalid_vocab_mask=vocab_invalid_mask,
+                illegal_vocab_penalty=illegal_vocab_penalty,
             )
 
         if self.sentence_validator is not None:
@@ -675,18 +686,20 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
     def __init__(
         self,
         sentence_validator: SentenceValidator | None,
-        valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
-        target_score_alpha: float = 0.1,
         disable_peft: bool = False,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
         **kwargs,
     ) -> None:
+        """Initialize reward class with penalty values."""
         self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
-        self.target_score_alpha = target_score_alpha
         self.disable_peft = disable_peft
         self.temperature = 1.0
 
@@ -697,39 +710,25 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         model,
         tokenizer: PreTrainedTokenizer,
         reward_temperature: float = 1.0,
-        vocab_nice_mask=None,
-        vocab_naughty_mask=None,
-        naughty_vocab_alpha: float = -99,
+        vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
         target_molecule: str | None = None,
         agree_list: Tensor | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        if self.disable_peft:
+        with use_base_model(model, disable_peft=self.disable_peft):
             reference_logits, _ = score_fast(
                 model=model,
                 encoded_input=input_batch,
                 termination_token_id=tokenizer.eos_token_id,
                 skip_first=prompt_length,
                 reward_temperature=reward_temperature,
-                vocab_nice_mask=vocab_nice_mask,
-                vocab_naughty_mask=vocab_naughty_mask,
-                naughty_vocab_alpha=naughty_vocab_alpha,
+                invalid_vocab_mask=vocab_invalid_mask,
                 agree_list=agree_list,
+                illegal_vocab_penalty=self.illegal_vocab_penalty,
+                grammar_disagree_penalty=self.grammar_disagree_penalty,
             )
-        else:
-            with use_base_model(model):
-                reference_logits, _ = score_fast(
-                    model=model,
-                    encoded_input=input_batch,
-                    termination_token_id=tokenizer.eos_token_id,
-                    skip_first=prompt_length,
-                    vocab_nice_mask=vocab_nice_mask,
-                    naughty_vocab_mask=vocab_naughty_mask,
-                    naughty_vocab_alpha=naughty_vocab_alpha,
-                    reward_temperature=reward_temperature,
-                    agree_list=agree_list,
-                )
 
         validator_dict = None
         reward_mixed = reference_logits
@@ -740,13 +739,17 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             )
             invalid_mask = validator_dict["invalid"]
             valid_score = validator_dict["valid_score"]
-            reward_mixed = reference_logits + scaling_factor * valid_score
+            max_sum_logpf = torch.max(abs(reference_logits), dim=-1).values.unsqueeze(-1)
+            reward_mixed = (
+                reference_logits * reference_logits_scale
+                + scaling_factor * max_sum_logpf * valid_score
+            )
             reward_penalized = _apply_invalid_penalty(
                 reward_mixed,
                 invalid_mask,
                 self.invalid_start_ratio,
                 self.invalid_end_ratio,
-                base_override=-10,
+                base_override=float(torch.min(reference_logits).item()),
             )
         else:
             reward_penalized = reward_mixed
@@ -764,14 +767,11 @@ class UniformModelSentenceGivenPrompt:
     def __init__(
         self,
         sentence_validator: SentenceValidator | None,
-        temperature: float = 1.0,
-        valid_sentence_alpha=None,
         invalid_start_ratio: float = 0.2,
         invalid_end_ratio: float = 1.2,
+        **kwargs,
     ) -> None:
-        self.temperature = temperature
         self.sentence_validator = sentence_validator
-        self.valid_sentence_alpha = valid_sentence_alpha
         self.invalid_start_ratio = invalid_start_ratio
         self.invalid_end_ratio = invalid_end_ratio
 
@@ -783,7 +783,6 @@ class UniformModelSentenceGivenPrompt:
         reward_temperature: float = 1.0,
         termination_token_id: int = -1,
         agree_list: Tensor | None = None,
-        termination_logits: Tensor | None = None,
         min_len: int = 10,
         **kwargs,
     ) -> ScorePair:

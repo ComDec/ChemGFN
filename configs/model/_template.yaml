@@ -1,0 +1,123 @@
+# Model configuration template
+# This template shows all available parameters with their defaults and descriptions
+# Copy and modify this file to create new model configs
+
+_target_: chemgfn.models.gfn.ChemGFNModule
+
+# ============================================================================
+# LoRA Configuration
+# ============================================================================
+lora_config:
+  _target_: peft.LoraConfig
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+  r: 16                    # LoRA rank
+  lora_alpha: 16           # LoRA alpha (scaling factor)
+  lora_dropout: 0.1        # Dropout probability
+  bias: "none"             # Bias handling: "none", "all", "lora_only"
+  fan_in_fan_out: false
+
+# ============================================================================
+# Base Model Configuration
+# ============================================================================
+net_config:
+  pretrained_model_name_or_path: "meta-llama/Llama-3.2-1B"
+
+# ============================================================================
+# Optimizer Configuration
+# ============================================================================
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 0.0001
+  weight_decay: 0.01
+
+# ============================================================================
+# Tokenizer Configuration
+# ============================================================================
+tokenizer:
+  _target_: transformers.AutoTokenizer.from_pretrained
+  pretrained_model_name_or_path: ${model.net_config.pretrained_model_name_or_path}
+
+# ============================================================================
+# Learning Rate Scheduler
+# ============================================================================
+scheduler:
+  _target_: torch.optim.lr_scheduler.PolynomialLR
+  _partial_: true
+  total_iters: 100000      # Total number of iterations
+  power: 1.0               # Polynomial power (1.0 = linear)
+
+# ============================================================================
+# Reward Configuration
+# ============================================================================
+reward:
+  _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
+  invalid_start_ratio: 0.2               # Invalid penalty multiplier at sequence start
+  invalid_end_ratio: 1.2                 # Invalid penalty multiplier at sequence end
+  disable_peft: false                    # Whether to use full model as base (no LoRA switching)
+  illegal_vocab_penalty: -50             # Log penalty for illegal vocabulary tokens
+  grammar_disagree_penalty: -99          # Log penalty for grammar-disagreeing tokens
+  sentence_validator:                    # Validator for checking sequence validity
+    _target_: chemgfn.models.reward.RDKitValidator
+    scorer: "logP"                       # Molecular property to optimize
+    backend: "pa"                        # Backend: "rdkit" or "pa" (partialsmiles)
+
+# ============================================================================
+# Reward Scheduling Configuration
+# ============================================================================
+reward_config:
+  reward_temp_start: 2.0                 # Starting reward temperature
+  reward_temp_end: 0.8                   # Ending reward temperature
+  reward_temp_horizon: 50000             # Steps to reach end temperature
+  scaling_factor_start: 50               # Starting scaling factor for property scores
+  scaling_factor_end: 100                # Ending scaling factor
+  scaling_factor_horizon: 5000           # Steps to reach end scaling
+
+# ============================================================================
+# Replay Buffer Configuration
+# ============================================================================
+reward_buffer:
+  _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+  buffer_size: 200                       # Maximum number of sequences per prompt
+  sim_tolerance: 0.25                    # Edit distance tolerance for deduplication
+  strict_mode: false                     # If true, only validated samples added to non-full buffer
+  buffer_aug_value: 0.0                  # Bonus value for validated samples
+
+# ============================================================================
+# Generation Constraints Configuration
+# ============================================================================
+constraint_config:
+  min_sentence_len: 2                    # Minimum generation length
+  max_sentence_len: 10                   # Maximum generation length
+  grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
+  apply_grammar: true                    # Whether to apply grammar constraints
+  processor_type: "prefix"               # Grammar processor: "prefix", "prefix_enhanced", "general", etc.
+  legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
+  illegal_vocab_penalty: -50             # Log penalty for illegal vocabulary tokens
+  parse_mode: "limited"                  # Parse mode: "full" or "limited"
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training_mixed_config:
+  subtb_lambda: 1.0                      # SubTB lambda (length decay weight)
+  pf_temp_high: 2.0                      # High temperature for forward policy sampling
+  pf_temp_low: 0.5                       # Low temperature for forward policy sampling
+  pf_temp_prob: 0.666                    # Probability of using temperature sampling
+  use_buffer_prob: 0.25                  # Probability of using replay buffer samples
+  n_samples: 8                           # Number of sequences to generate per batch
+  use_buffer_sample_start_prob: 0.8      # Starting probability for buffer sample mixing
+  use_buffer_sample_end_prob: 0.2        # Ending probability for buffer sample mixing
+  buffer_sample_steps: 20000             # Steps to reach end probability
+  buffer_mixture_ratio: 0.5              # Ratio of sequences to replace with buffer
+  skip_baseline_sampling: true           # Skip baseline sampling at training start
+  balance_start: 0.0                     # Starting balance factor for token-level SubTB
+  balance_end: 1.0                       # Ending balance factor
+  balance_horizon: 50000                 # Steps to reach end balance
+  opt_task: false                        # Whether this is an optimization task (sidechain)
+
+# ============================================================================
+# Compilation and PEFT Settings
+# ============================================================================
+compile: false                           # Whether to use torch.compile
+disable_peft: false                      # Whether to disable PEFT entirely
