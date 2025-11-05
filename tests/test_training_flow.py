@@ -80,8 +80,8 @@ class TestTrainingStep:
         assert minimal_config is not None
         assert "training_mixed_config" in minimal_config
 
-    @patch("chemgfn.models.gfn.AutoModelForCausalLM.from_pretrained")
-    @patch("chemgfn.models.gfn.AutoTokenizer.from_pretrained")
+    @patch("transformers.AutoModelForCausalLM.from_pretrained")
+    @patch("transformers.AutoTokenizer.from_pretrained")
     def test_model_forward_basic(self, mock_tokenizer_cls, mock_model_cls, minimal_config):
         """Test basic forward pass (mocked)."""
         # Mock the tokenizer

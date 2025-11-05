@@ -321,7 +321,8 @@ class TestEarlyTermination:
     def test_immediate_termination(self):
         """Test when sequence terminates immediately after prompt."""
         batch_size = 4
-        seq_len = 5
+        # Need seq_len > 1 to avoid assertion error in modified_subtb_loss
+        seq_len = 3
         prompt_len = 2
         term_id = 0
 
@@ -330,12 +331,15 @@ class TestEarlyTermination:
         log_pterm = torch.randn(batch_size, seq_len)
         generated_text = torch.randint(1, 100, (batch_size, prompt_len + seq_len))
 
-        # First token after prompt is termination
+        # First token after prompt is termination, fill rest with term_id
         generated_text[:, prompt_len] = term_id
+        generated_text[:, prompt_len + 1 :] = term_id
 
         loss = modified_subtb_loss(log_pf, log_r, log_pterm, generated_text, term_id, prompt_len)
 
+        # When immediately terminating, mask should handle it and loss should be 0 or valid
         assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
         assert loss >= 0
 
 

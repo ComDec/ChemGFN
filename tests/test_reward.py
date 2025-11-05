@@ -144,7 +144,8 @@ class TestScoreFast:
             input_ids = args[0] if args else kwargs.get("input_ids")
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            vocab_size = 100
+            # Use GPT2 vocab_size (50257) to match tokenizer
+            vocab_size = 50257
 
             output = Mock()
             output.logits = torch.randn(batch_size, seq_len, vocab_size)
@@ -181,7 +182,7 @@ class TestScoreFast:
         seq_len = 10
         skip_first = 3
         termination_token_id = 0
-        vocab_size = 100
+        vocab_size = 50257  # GPT2 vocab_size
 
         encoded_input = torch.randint(1, vocab_size, (batch_size, seq_len))
         invalid_mask = torch.zeros(vocab_size, dtype=torch.bool)
@@ -232,7 +233,7 @@ class TestScoreFast:
         seq_len = 10
         skip_first = 3
         termination_token_id = 0
-        vocab_size = 100
+        vocab_size = 50257  # GPT2 vocab_size
 
         encoded_input = torch.randint(1, vocab_size, (batch_size, seq_len))
 
@@ -307,7 +308,8 @@ class TestFrozenModelSentenceGivenPrompt:
             input_ids = args[0] if args else kwargs.get("input_ids")
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            vocab_size = 100
+            # Use GPT2 vocab_size (50257) to match tokenizer
+            vocab_size = 50257
 
             output = Mock()
             output.logits = torch.randn(batch_size, seq_len, vocab_size)
@@ -402,7 +404,8 @@ class TestReferenceTargetScorePositiveMixedInvalidMask:
             input_ids = args[0] if args else kwargs.get("input_ids")
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            vocab_size = 100
+            # Use GPT2 vocab_size (50257) to match tokenizer
+            vocab_size = 50257
 
             output = Mock()
             output.logits = torch.randn(batch_size, seq_len, vocab_size)
@@ -603,7 +606,8 @@ class TestRewardIntegration:
             input_ids = args[0] if args else kwargs.get("input_ids")
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            vocab_size = 100
+            # Use GPT2 vocab_size (50257) to match tokenizer
+            vocab_size = 50257
 
             output = Mock()
             # Create deterministic logits for testing

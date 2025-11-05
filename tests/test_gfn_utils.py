@@ -22,6 +22,7 @@ from chemgfn.utils.gfn_utils import (
     generate_and_return_termination_logprob,
     get_termination_vals,
     lora_to_base,
+    modified_subtb_balance_loss,
     modified_subtb_loss,
     prepare_token_mask,
 )
@@ -74,10 +75,12 @@ class TestPrepareTokenMask:
         """Test that EOS token is properly handled."""
         legal_mask, illegal_mask, _ = prepare_token_mask(tokenizer, vocab_file, reverse=False)
 
-        # EOS should be legal
+        # EOS should be legal (line 75 in gfn_utils.py sets it to True)
         assert legal_mask[tokenizer.eos_token_id].item() == True
-        # BOS should be illegal
-        assert legal_mask[tokenizer.bos_token_id].item() == False
+        # BOS should be illegal (line 74 in gfn_utils.py sets it to False)
+        # Note: In GPT2, bos_token_id == eos_token_id (both are 50256), so we check separately
+        if tokenizer.bos_token_id != tokenizer.eos_token_id:
+            assert legal_mask[tokenizer.bos_token_id].item() == False
 
     def test_token_mask_reverse(self, tokenizer, vocab_file):
         """Test reverse mode (currently not implemented but parameter exists)."""
@@ -212,15 +215,20 @@ class TestModifiedSubTBLoss:
         """Test SubTB loss with token-coverage balancing."""
         log_pf, log_r, log_pterm, generated_text, term_id, prompt_len = simple_batch_data
 
-        loss_no_balance = modified_subtb_loss(
+        # Use modified_subtb_balance_loss which accepts balance parameter
+        loss_no_balance = modified_subtb_balance_loss(
             log_pf, log_r, log_pterm, generated_text, term_id, prompt_len, balance=0.0
         )
-        loss_full_balance = modified_subtb_loss(
+        loss_full_balance = modified_subtb_balance_loss(
             log_pf, log_r, log_pterm, generated_text, term_id, prompt_len, balance=1.0
         )
 
         # Different balance values should give different losses
-        assert not torch.allclose(loss_no_balance, loss_full_balance)
+        # Note: when balance=0, it returns the original window-wise loss
+        # when balance=1, it returns fully token-balanced loss
+        assert isinstance(loss_no_balance, torch.Tensor)
+        assert isinstance(loss_full_balance, torch.Tensor)
+        assert not torch.allclose(loss_no_balance, loss_full_balance, atol=1e-6)
 
     def test_subtb_loss_gradient_flow(self, simple_batch_data):
         """Test that gradients can flow through the loss."""
