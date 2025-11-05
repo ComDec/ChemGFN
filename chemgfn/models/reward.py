@@ -214,8 +214,11 @@ class Expr24Validator(SentenceValidator):
 
     TOKEN_RE = re.compile(r"[0-9]|[+\-*/]")
 
-    def __init__(self, scorer: str = "hit24") -> None:
+    def __init__(self, scorer: str = "hit24", amortize_valid_state: bool = False) -> None:
         super().__init__(scorer)
+
+        # Whether to amortize the valid state of the expression to the entire batch
+        self.amortize_valid_state = amortize_valid_state
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -289,14 +292,31 @@ class Expr24Validator(SentenceValidator):
                 if sentences[i, pos] == termination_token_id:
                     break
                 invalid[i, pos + 1] = 0.0  # CFG guarantees valid prefixes
+                valid_score[i, pos + 1] = 1.0  # Valid prefixes
 
             final_expr = self._decode_expr(sentences[i], tokenizer)
             if final_expr is None:
                 full_tokens_list.append("")
                 continue
             score = self._eval_full_expr_to_01(final_expr)
+
+            valid_score[i, -1] = float(score)
+            invalid[i, -1] = 0.0 if score > 0 else 1.0
             global_score[i] = float(score)
             full_tokens_list.append(final_expr)
+
+        # valid_score and invalid_score should be boolean tensors and be reversed
+        # if valid_score is [1,1,1,0,0,0,0], then invalid_score should be [0,0,0,1,1,1,1]
+        assert valid_score.shape == invalid.shape
+        assert (
+            valid_score.bool().logical_not() == (invalid.bool())
+        ).all(), "valid_score and invalid_score should be boolean tensors and be reversed"
+
+        if self.amortize_valid_state:
+            # Vectorized: create mask for entries where global_score > 0
+            mask = global_score > 0
+            invalid[mask, 1:] = 0.0
+            valid_score[mask, 1:] = 1.0
 
         return {
             "invalid": invalid,
@@ -744,13 +764,14 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
                 reference_logits * reference_logits_scale
                 + scaling_factor * max_sum_logpf * valid_score
             )
-            reward_penalized = _apply_invalid_penalty(
-                reward_mixed,
-                invalid_mask,
-                self.invalid_start_ratio,
-                self.invalid_end_ratio,
-                base_override=float(torch.min(reference_logits).item()),
-            )
+            reward_penalized = reward_mixed
+            # reward_penalized = _apply_invalid_penalty(
+            #     reward_mixed,
+            #     invalid_mask,
+            #     self.invalid_start_ratio,
+            #     self.invalid_end_ratio,
+            #     base_override=float(torch.min(reference_logits).item()),
+            # )
         else:
             reward_penalized = reward_mixed
 
