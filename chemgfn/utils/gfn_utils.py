@@ -529,7 +529,6 @@ def modified_subtb_loss(
     )
     # Ensure there is at least one transition before termination
     assert log_pf.shape[1] > 1
-
     # Calculate the change in expected reward and probability at each step
     delta = log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
     # Compute cumulative sum of delta for subtrajectory balance calculation
@@ -791,7 +790,7 @@ class ReplayBuffer:
             # str_sentence = token_sentences[i].replace(".", "").strip()
             # there is no such termination token in the SMILES
             str_sentence = token_sentences[i].strip()
-            valid_state = (result_dict["validator_dict"]["valid_score"].bool())[i][-1]
+            valid_state = (result_dict["validator_dict"]["global_score"].bool())[i]
             self.add(
                 {
                     "logreward": logrewards[

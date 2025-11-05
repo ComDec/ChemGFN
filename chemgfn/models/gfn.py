@@ -182,7 +182,7 @@ class ChemGFNModule(LightningModule):
         pf_high = self.training_mixed_config.pf_temp_high
         return random.random() * (pf_high - pf_low) + pf_low
 
-    def _maybe_generate_from_buffer(self, item, encoded_prompt):
+    def generate_from_replay_buffer(self, item, encoded_prompt):
         """Optionally generate from replay buffer samples (Buffer 1).
 
         Uses a dynamic probability schedule to decide whether to sample
@@ -195,9 +195,6 @@ class ChemGFNModule(LightningModule):
         Returns:
             Tuple of (action_seq, result_dict) if buffer sampling is used, None otherwise.
         """
-        # Use dynamic probability schedule for replay buffer
-        if random.random() >= self.get_use_replay_buffer_at_step(self.global_step):
-            return None
 
         prompt_tensor = encoded_prompt if encoded_prompt.ndim == 2 else encoded_prompt.unsqueeze(0)
         device = encoded_prompt.device
@@ -431,13 +428,19 @@ class ChemGFNModule(LightningModule):
         prompt_len = encoded_prompt.shape[-1]
         buffer_sample = item["buffer_encoded_sample"]
 
-        # Buffer 1: Try to use replay buffer (fixed probability)
-        buffer_result = self._maybe_generate_from_buffer(item, encoded_prompt)
-        used_replay_buffer = buffer_result is not None
+        # Buffer 1: Try to use replay buffer
+        if random.random() <= self.get_use_replay_buffer_at_step(self.global_step):
+            replay_buffer_result = self.generate_from_replay_buffer(item, encoded_prompt)
+            if replay_buffer_result is not None:
+                use_replay_buffer = True
+            else:
+                use_replay_buffer = False
+        else:
+            use_replay_buffer = False
 
-        if used_replay_buffer:
+        if use_replay_buffer:
             # Using replay buffer, no need for dataset buffer
-            _, result_dict = buffer_result
+            _, result_dict = replay_buffer_result
             pf_temp = 1.0
         else:
             # Not using replay buffer, decide whether to use dataset buffer
@@ -448,7 +451,6 @@ class ChemGFNModule(LightningModule):
                 buffer_sample is not None
                 and random.random() < self.get_use_dataset_buffer_at_step(self.global_step)
             )
-
             result_dict = self.forward(
                 item,
                 pf_temperature=pf_temp,
@@ -467,7 +469,7 @@ class ChemGFNModule(LightningModule):
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
 
-        if used_replay_buffer:
+        if use_replay_buffer:
             log_r = model_log_r[:, : max(0, generated_text.shape[1] - prompt_len)]
         else:
             log_r = model_log_r
@@ -534,7 +536,9 @@ class ChemGFNModule(LightningModule):
         if batch_idx % 10 == 0:
             decoded = self._decode_generated_tokens(generated_text[0, prompt_len:])
             acc = self.reward.sentence_validator.accuracy(
-                generated_text[0, prompt_len:], self.tokenizer, item.get("molecule", None)
+                generated_text[0, prompt_len:].unsqueeze(0),
+                self.tokenizer,
+                item.get("molecule", None),
             )
             self.train_samples.append(
                 f"{decoded}: pf_temp={pf_temp:.2f}, logP={log_ps[0].item():.2f}, valid={acc}"

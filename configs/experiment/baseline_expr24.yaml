@@ -41,9 +41,10 @@ model:
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
     illegal_vocab_penalty: -80
-    grammar_disagree_penalty: 0
+    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
+      amortize_valid_state: false
 
   reward_config:
     reward_temp_start: 2
@@ -54,7 +55,7 @@ model:
     scaling_factor_horizon: 50000
     reference_logits_scale_start: 1.0
     reference_logits_scale_end: 0.0
-    reference_logits_scale_horizon: 50000
+    reference_logits_scale_horizon: 10000
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -80,14 +81,14 @@ model:
     pf_temp_prob: 0.666
     # Replay buffer (Buffer 1) schedule
     use_replay_buffer_start_prob: 0.1
-    use_replay_buffer_end_prob: 0.5
+    use_replay_buffer_end_prob: 0.25
     replay_buffer_steps: 50000
     n_samples: 8
     # Dataset buffer (Buffer 2) schedule
     use_buffer_sample_start_prob: 0.8
     use_buffer_sample_end_prob: 0.1
     buffer_sample_steps: 50000
-    buffer_mixture_ratio: 0.5
+    buffer_mixture_ratio: 1.0
     skip_baseline_sampling: true
     balance_start: 0.0
     balance_end: 0.0
