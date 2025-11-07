@@ -291,8 +291,6 @@ class Expr24Validator(SentenceValidator):
             for pos in range(seq_len):
                 if sentences[i, pos] == termination_token_id:
                     break
-                invalid[i, pos + 1] = 0.0  # CFG guarantees valid prefixes
-                valid_score[i, pos + 1] = 1.0  # Valid prefixes
 
             final_expr = self._decode_expr(sentences[i], tokenizer)
             if final_expr is None:
@@ -301,25 +299,16 @@ class Expr24Validator(SentenceValidator):
             score = self._eval_full_expr_to_01(final_expr)
 
             valid_score[i, -1] = float(score)
-            invalid[i, -1] = 0.0 if score > 0 else 1.0
             global_score[i] = float(score)
             full_tokens_list.append(final_expr)
-
-        # valid_score and invalid_score should be boolean tensors and be reversed
-        # if valid_score is [1,1,1,0,0,0,0], then invalid_score should be [0,0,0,1,1,1,1]
-        assert valid_score.shape == invalid.shape
-        assert (
-            valid_score.bool().logical_not() == (invalid.bool())
-        ).all(), "valid_score and invalid_score should be boolean tensors and be reversed"
 
         if self.amortize_valid_state:
             # Vectorized: create mask for entries where global_score > 0
             mask = global_score > 0
-            invalid[mask, 1:] = 0.0
             valid_score[mask, 1:] = 1.0
 
         return {
-            "invalid": invalid,
+            "invalid": None,
             "global_score": global_score,  # 0 or 1
             "valid_score": valid_score,  # placeholder for future shaping
             "full_tokens": full_tokens_list,
@@ -757,7 +746,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, target_molecule
             )
-            invalid_mask = validator_dict["invalid"]
             valid_score = validator_dict["valid_score"]
             max_sum_logpf = torch.max(abs(reference_logits), dim=-1).values.unsqueeze(-1)
             reward_mixed = (

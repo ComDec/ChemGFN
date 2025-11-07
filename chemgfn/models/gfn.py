@@ -39,6 +39,10 @@ from chemgfn.utils.gfn_utils import (
     modified_subtb_loss,
     prepare_token_mask,
 )
+from chemgfn.utils.schedulers import Scheduler
+
+# Re-export Scheduler for backward compatibility with config files
+__all__ = ["ChemGFNModule", "Scheduler"]
 
 sys.setrecursionlimit(1500)
 
@@ -62,23 +66,6 @@ class ChemGFNModule(LightningModule):
         if hasattr(value, "item"):
             return float(value.item())
         return float(value)
-
-    @classmethod
-    def _build_linear_schedule(
-        cls, start: float, end: float, horizon: Any
-    ) -> Callable[[Any], float]:
-        horizon_value = cls._normalize_scalar(horizon)
-        if horizon_value <= 0:
-            return lambda *_: end
-
-        delta = end - start
-
-        def schedule(step: Any) -> float:
-            step_value = cls._normalize_scalar(step)
-            progress = min(1.0, step_value / horizon_value)
-            return start + delta * progress
-
-        return schedule
 
     def _load_token_masks(self):
         tokens_path = getattr(self.constraint_config, "legal_tokens", None)
@@ -243,6 +230,7 @@ class ChemGFNModule(LightningModule):
         constraint_config: dict[str, Any],
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
+        factor_schedulers: dict[str, Any],
         compile: bool,
         disable_peft: bool = False,
     ) -> None:
@@ -262,45 +250,16 @@ class ChemGFNModule(LightningModule):
         self.training_mixed_config = training_mixed_config
         self.end_of_sentence_token_id = self.tokenizer.eos_token_id
 
-        self.get_reward_temp_at_step = self._build_linear_schedule(
-            reward_config["reward_temp_start"],
-            reward_config["reward_temp_end"],
-            reward_config["reward_temp_horizon"],
-        )
-
-        # Target reward scaling factor
-        self.get_scaling_factor_at_step = self._build_linear_schedule(
-            reward_config["scaling_factor_start"],
-            reward_config["scaling_factor_end"],
-            reward_config["scaling_factor_horizon"],
-        )
-
-        # Reference logits scale
-        self.get_reference_logits_scale_at_step = self._build_linear_schedule(
-            reward_config["reference_logits_scale_start"],
-            reward_config["reference_logits_scale_end"],
-            reward_config["reference_logits_scale_horizon"],
-        )
-
-        # Buffer 1: ReplayBuffer (from reward_buffer) - dynamic probability schedule
-        self.get_use_replay_buffer_at_step = self._build_linear_schedule(
-            training_mixed_config.get("use_replay_buffer_start_prob", 0.25),
-            training_mixed_config.get("use_replay_buffer_end_prob", 0.25),
-            training_mixed_config.get("replay_buffer_steps", 50000),
-        )
-
-        # Buffer 2: Dataset buffer (from dataloader) - dynamic probability schedule
-        self.get_use_dataset_buffer_at_step = self._build_linear_schedule(
-            training_mixed_config["use_buffer_sample_start_prob"],
-            training_mixed_config["use_buffer_sample_end_prob"],
-            training_mixed_config["buffer_sample_steps"],
-        )
-
-        self.get_balance_at_step = self._build_linear_schedule(
-            training_mixed_config["balance_start"],
-            training_mixed_config["balance_end"],
-            training_mixed_config["balance_horizon"],
-        )
+        # Initialize all schedulers from config
+        # Can use either hydra instantiate or direct parameter specification
+        # Initialize all factor schedulers
+        self.factor_schedulers = factor_schedulers
+        self.get_reward_temp_at_step = self.factor_schedulers["reward_temp"]
+        self.get_scaling_factor_at_step = self.factor_schedulers["scaling_factor"]
+        self.get_reference_logits_scale_at_step = self.factor_schedulers["reference_logits_scale"]
+        self.get_balance_at_step = self.factor_schedulers["balance"]
+        self.get_replay_buffer_at_step = self.factor_schedulers["replay_buffer"]
+        self.get_dataset_buffer_at_step = self.factor_schedulers["dataset_buffer"]
 
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
@@ -313,11 +272,6 @@ class ChemGFNModule(LightningModule):
             self.legal_token_ids_list,
         ) = self._load_token_masks()
         self._setup_grammar_processors()
-
-        # Read illegal_vocab_penalty from constraint_config
-        self.illegal_vocab_penalty = float(
-            getattr(self.constraint_config, "illegal_vocab_penalty", -50)
-        )
 
         # Read illegal_vocab_penalty from reward object
         if hasattr(reward, "illegal_vocab_penalty"):
@@ -429,7 +383,7 @@ class ChemGFNModule(LightningModule):
         buffer_sample = item["buffer_encoded_sample"]
 
         # Buffer 1: Try to use replay buffer
-        if random.random() <= self.get_use_replay_buffer_at_step(self.global_step):
+        if random.random() <= self.get_replay_buffer_at_step(self.global_step):
             replay_buffer_result = self.generate_from_replay_buffer(item, encoded_prompt)
             if replay_buffer_result is not None:
                 use_replay_buffer = True
@@ -449,7 +403,7 @@ class ChemGFNModule(LightningModule):
             # Buffer 2: Decide whether to use dataset buffer (dynamic probability schedule)
             use_dataset_buffer = (
                 buffer_sample is not None
-                and random.random() < self.get_use_dataset_buffer_at_step(self.global_step)
+                and random.random() < self.get_dataset_buffer_at_step(self.global_step)
             )
             result_dict = self.forward(
                 item,
@@ -484,11 +438,11 @@ class ChemGFNModule(LightningModule):
         self._log_metrics(
             {
                 "replay_buffer_prob": torch.tensor(
-                    self.get_use_replay_buffer_at_step(self.global_step),
+                    self.get_replay_buffer_at_step(self.global_step),
                     device=self.device,
                 ),
                 "dataset_buffer_prob": torch.tensor(
-                    self.get_use_dataset_buffer_at_step(self.global_step),
+                    self.get_dataset_buffer_at_step(self.global_step),
                     device=self.device,
                 ),
                 "target_scaling_ratio": torch.tensor(
@@ -557,7 +511,7 @@ class ChemGFNModule(LightningModule):
         self._log_metrics(
             {
                 "train/dataset_buffer_ratio": torch.tensor(
-                    self.get_use_dataset_buffer_at_step(self.global_step),
+                    self.get_dataset_buffer_at_step(self.global_step),
                     device=self.device,
                 ),
                 "train/reward_var": log_r.var(dim=0).mean(),

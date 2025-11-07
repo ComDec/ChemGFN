@@ -11,7 +11,7 @@ defaults:
 
 tags: ["ChemGFN", "baseline", "expr24"]
 
-exp_name: "baseline_expr24"
+exp_name: "expr24_buffer_overfit_ref_decay"
 seed: 42
 
 # ============================================================================
@@ -40,7 +40,7 @@ model:
     invalid_start_ratio: 0.2
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
-    illegal_vocab_penalty: -80
+    illegal_vocab_penalty: -99
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
@@ -68,7 +68,6 @@ model:
     apply_grammar: true
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
-    illegal_vocab_penalty: -50
     parse_mode: "limited"
 
   training_mixed_config:
@@ -97,8 +96,8 @@ model:
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.8
-      end: 0.1
+      start: 1.0
+      end: 1.0
       horizon: 50000
     balance:
       _target_: chemgfn.models.gfn.Scheduler
@@ -108,7 +107,7 @@ model:
       horizon: 50000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
+      schedule_type: "cosine"
       start: 1.0
       end: 0.0
       horizon: 50000

@@ -46,16 +46,7 @@ reward:
     _target_: chemgfn.models.reward.Expr24Validator
 
 reward_config:
-  reward_temp_start: 2
-  reward_temp_end: 0.8
-  reward_temp_horizon: 50000
-  scaling_factor_start: 50
-  scaling_factor_end: 100
-  scaling_factor_horizon: 5000
-  reference_logits_scale_start: 1.0
-  reference_logits_scale_end: 0.0
-  reference_logits_scale_horizon: 50000
-
+  test_key: test_value
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -79,21 +70,48 @@ training_mixed_config:
   pf_temp_high: 2.0
   pf_temp_low: 0.5
   pf_temp_prob: 0.666
-  # Replay buffer (Buffer 1) schedule
-  use_replay_buffer_start_prob: 0.2
-  use_replay_buffer_end_prob: 0.5
-  replay_buffer_steps: 50000
   n_samples: 8
-  # Dataset buffer (Buffer 2) schedule
-  use_buffer_sample_start_prob: 0.8
-  use_buffer_sample_end_prob: 0.1
-  buffer_sample_steps: 50000
   buffer_mixture_ratio: 0.5
   skip_baseline_sampling: true
-  balance_start: 0.0
-  balance_end: 0.0
-  balance_horizon: 50000
   opt_task: false
+
+  factor_schedulers:
+    reward_temp:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 2
+      end: 0.8
+      horizon: 50000
+    replay_buffer:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.2
+      end: 0.5
+      horizon: 50000
+    dataset_buffer:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.8
+      end: 0.1
+      horizon: 50000
+    balance:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.0
+      end: 0.0
+      horizon: 50000
+    reference_logits_scale:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1.0
+      end: 0.0
+      horizon: 50000
+    scaling_factor:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1
+      end: 1
+      horizon: 5000
 
 compile: false
 

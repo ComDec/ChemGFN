@@ -25,6 +25,8 @@ precision: bf16-true
 
 accumulate_grad_batches: 4
 
+num_sanity_val_steps: 0
+
 # profiler:
 #   _target_: lightning.pytorch.profilers.PyTorchProfiler
 #   sort_by_key: "cpu_time_total"
