@@ -162,3 +162,6 @@ configs/local/default.yaml
 
 *.slout
 *.slerr
+
+# Config template backups
+configs/experiment/templates/*.backup.*

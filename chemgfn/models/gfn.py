@@ -12,7 +12,6 @@ import pandas as pd
 import torch
 import torch.utils  # type: ignore
 import torch.utils.data  # type: ignore
-import wandb  # type: ignore
 from lightning import LightningModule
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
@@ -21,13 +20,13 @@ from transformers_cfg.generation.logits_process import (
     GrammarIncrementalLogitsProcessorForNumberOnly,
     GrammarIncrementalLogitsProcessorGeneral,
     GrammarIncrementalLogitsProcessorSampleEnhanced,
-    GrammarLimitedOneTimeLogitsProcessor,
     GrammarLogitsProcessorPartheseness,
 )
 from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
 from transformers_cfg.parser import parse_ebnf
 from transformers_cfg.recognizer import StringRecognizer
 
+from chemgfn.models.losses import GFNLoss
 from chemgfn.utils.gfn_utils import (
     ReplayBuffer,
     base_to_lora,
@@ -36,7 +35,6 @@ from chemgfn.utils.gfn_utils import (
     generate_and_return_termination_logprob_for_sidechain_opt,
     get_termination_vals,
     lora_to_base,
-    modified_subtb_loss,
     prepare_token_mask,
 )
 from chemgfn.utils.schedulers import Scheduler
@@ -55,175 +53,13 @@ class ChemGFNModule(LightningModule):
     and SubTB loss optimization.
     """
 
-    # --------------------------------------------------------------------- #
-    # Helpers
-    # --------------------------------------------------------------------- #
-
-    @staticmethod
-    def _normalize_scalar(value: Any) -> float:
-        if value is None:
-            return 0.0
-        if hasattr(value, "item"):
-            return float(value.item())
-        return float(value)
-
-    def _load_token_masks(self):
-        tokens_path = getattr(self.constraint_config, "legal_tokens", None)
-        if tokens_path and os.path.exists(tokens_path):
-            return prepare_token_mask(self.tokenizer, tokens_path)
-
-        if tokens_path:
-            print(f"Legal tokens file not found: {tokens_path}")
-        return None, None, None
-
-    def _build_pre_grammar_processor(self, parsed_grammar):
-        processor_type = getattr(self.constraint_config, "processor_type", "none")
-        if processor_type == "none":
-            return None
-        if processor_type == "general":
-            if self.grammar is None:
-                print("Grammar parsing failed with current tokenizer, disable general processor")
-                return None
-            return GrammarConstrainedLogitsProcessor(self.grammar)
-
-        processor_map = {
-            "prefix": GrammarIncrementalLogitsProcessorGeneral,
-            "prefix_enhanced": GrammarIncrementalLogitsProcessorSampleEnhanced,
-            "parenthese": GrammarLogitsProcessorPartheseness,
-            "number_only": GrammarIncrementalLogitsProcessorForNumberOnly,
-        }
-
-        processor_cls = processor_map.get(processor_type)
-        if processor_cls is None:
-            raise ValueError(f"Unsupported processor type: {processor_type}")
-
-        return processor_cls(
-            parsed_grammar,
-            tokenizer=self.tokenizer,
-            nice_token_ids_list=self.legal_token_ids_list,
-            execution_mode=self.constraint_config.parse_mode,
-        )
-
-    def _setup_grammar_processors(self):
-        if not getattr(self.constraint_config, "apply_grammar", False):
-            self.string_grammar = None
-            self.grammar = None
-            self.pre_grammar_processor = None
-            self.grammar_processor = None
-            return
-
-        with open(self.constraint_config.grammar_path) as file:
-            grammar_str = file.read()
-
-        parsed_grammar = parse_ebnf(grammar_str)
-        self.string_grammar = StringRecognizer(
-            parsed_grammar.grammar_encoding, parsed_grammar.symbol_table["root"]
-        )
-        try:
-            self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
-        except Exception:
-            self.grammar = None
-            print("Grammar parsing failed with current tokenizer, disable general processor")
-
-        self.pre_grammar_processor = self._build_pre_grammar_processor(parsed_grammar)
-
-    def _log_metrics(self, metrics: dict[str, Any], **common_kwargs) -> None:
-        for name, value in metrics.items():
-            if isinstance(value, tuple):
-                metric_value, overrides = value
-                kwargs = {**common_kwargs, **overrides}
-            else:
-                metric_value = value
-                kwargs = common_kwargs
-            self.log(name, metric_value, **kwargs)
-
-    def _log_agreement_metrics(self, agree_list) -> None:
-        if agree_list is None:
-            return
-        if isinstance(agree_list, torch.Tensor):
-            tensors = [agree_list]
-        elif isinstance(agree_list, Sequence):
-            if len(agree_list) == 0:
-                return
-            tensors = list(agree_list)
-        else:
-            return
-
-        if len(tensors) == 0:
-            return
-
-        agree_sum = [torch.mean(x.sum(-1).float()).item() for x in tensors]
-        mid_index = len(agree_sum) // 2
-        metrics = {
-            "train/agree_mean": torch.tensor(agree_sum, device=self.device).mean(),
-            "train/agree_start": torch.tensor(agree_sum[0], device=self.device),
-            "train/agree_midd": torch.tensor(agree_sum[mid_index], device=self.device),
-            "train/agree_end": torch.tensor(agree_sum[-1], device=self.device),
-        }
-        self._log_metrics(metrics, on_step=True, sync_dist=True)
-
-    def _sample_pf_temperature(self) -> float:
-        if random.random() >= self.training_mixed_config.pf_temp_prob:
-            return 1.0
-        pf_low = self.training_mixed_config.pf_temp_low
-        pf_high = self.training_mixed_config.pf_temp_high
-        return random.random() * (pf_high - pf_low) + pf_low
-
-    def generate_from_replay_buffer(self, item, encoded_prompt):
-        """Optionally generate from replay buffer samples (Buffer 1).
-
-        Uses a dynamic probability schedule to decide whether to sample
-        from the replay buffer.
-
-        Args:
-            item: Data item dictionary.
-            encoded_prompt: Encoded prompt tensor.
-
-        Returns:
-            Tuple of (action_seq, result_dict) if buffer sampling is used, None otherwise.
-        """
-
-        prompt_tensor = encoded_prompt if encoded_prompt.ndim == 2 else encoded_prompt.unsqueeze(0)
-        device = encoded_prompt.device
-
-        buffer_sentences, _ = self.reward_buffer.sample(
-            self.training_mixed_config.n_samples,
-            prompt_tensor,
-            self.tokenizer,
-        )
-        if buffer_sentences is None:
-            return None
-        # Ensure buffer samples are on the same device as prompt
-        buffer_sentences = buffer_sentences.to(device, non_blocking=True)
-        prompt_expanded = prompt_tensor.expand(buffer_sentences.size(0), -1)
-        prompt_prefix = prompt_expanded[:, :-1]
-        action_seq = torch.cat([prompt_prefix, buffer_sentences], dim=1)
-        result_dict = self.forward(item, action_seq=action_seq)
-        return action_seq, result_dict
-
-    def _decode_generated_tokens(
-        self, tokens: torch.Tensor, skip_special_tokens: bool = True
-    ) -> str:
-        if self.constraint_config.processor_type == "number_only":
-            pieces = []
-            for token in tokens:
-                if token.item() == self.tokenizer.eos_token_id:
-                    break
-                pieces.append(self.tokenizer.decode(token, skip_special_tokens=False))
-            return ",".join(pieces)
-
-        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
-
-    # ------------------------------------------------------------------ #
-    # Core initialisation
-    # ------------------------------------------------------------------ #
-
     def __init__(
         self,
         net_config: dict[str, Any],
         lora_config: LoraConfig,
         tokenizer: PreTrainedTokenizer,
         reward,
+        loss_fn: GFNLoss,
         reward_buffer,
         reward_config: dict[str, Any],
         training_mixed_config: dict[str, Any],
@@ -236,7 +72,7 @@ class ChemGFNModule(LightningModule):
     ) -> None:
         super().__init__()
 
-        self.save_hyperparameters(ignore=["net"])
+        self.save_hyperparameters(ignore=["net", "loss_fn"])
         model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
         if not disable_peft:
             self.net = get_peft_model(model, lora_config)
@@ -257,7 +93,7 @@ class ChemGFNModule(LightningModule):
         self.get_reward_temp_at_step = self.factor_schedulers["reward_temp"]
         self.get_scaling_factor_at_step = self.factor_schedulers["scaling_factor"]
         self.get_reference_logits_scale_at_step = self.factor_schedulers["reference_logits_scale"]
-        self.get_balance_at_step = self.factor_schedulers["balance"]
+        self.get_alpha_reference_at_step = self.factor_schedulers["alpha_reference"]
         self.get_replay_buffer_at_step = self.factor_schedulers["replay_buffer"]
         self.get_dataset_buffer_at_step = self.factor_schedulers["dataset_buffer"]
 
@@ -289,6 +125,12 @@ class ChemGFNModule(LightningModule):
 
         self.opt_task = self.training_mixed_config.get("opt_task", False)
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
+
+        # Initialize loss function from config
+        self.loss_fn: GFNLoss = loss_fn
+
+        if hasattr(self.loss_fn, "set_alpha_reference"):
+            self.loss_fn.set_alpha_reference(self.get_alpha_reference_at_step(self.global_step))
 
         try:
             if self.compile:
@@ -419,6 +261,8 @@ class ChemGFNModule(LightningModule):
         generated_text = result_dict["state"]
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
+        log_r_reference = result_dict["log_r_reference"]
+        log_r_target = result_dict["log_r_target"]
         model_log_r = result_dict["log_r"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
@@ -435,38 +279,40 @@ class ChemGFNModule(LightningModule):
                 result_dict=result_dict,
             )
 
-        self._log_metrics(
-            {
-                "replay_buffer_prob": torch.tensor(
-                    self.get_replay_buffer_at_step(self.global_step),
-                    device=self.device,
-                ),
-                "dataset_buffer_prob": torch.tensor(
-                    self.get_dataset_buffer_at_step(self.global_step),
-                    device=self.device,
-                ),
-                "target_scaling_ratio": torch.tensor(
-                    self.get_scaling_factor_at_step(self.global_step), device=self.device
-                ),
-                "reference_logits_scale": torch.tensor(
-                    self.get_reference_logits_scale_at_step(self.global_step), device=self.device
-                ),
-            },
-            on_step=True,
+        # automatically log all classes inside factor_schedulers
+        # we need read from the class name and log the value, group all those values together
+        scheduled_values = {}
+        for key, value in self.factor_schedulers.items():
+            scheduled_values[key] = value(self.global_step)
+        # Log each scheduled value separately (Lightning doesn't support logging dicts directly)
+        self.log_dict(
+            {f"scheduled/{key}": val for key, val in scheduled_values.items()},
             sync_dist=True,
+            on_step=True,
         )
+
         self._log_agreement_metrics(agree_list)
 
-        loss = modified_subtb_loss(
+        loss_output = self.loss_fn(
             log_pf=log_pf,
-            log_r=log_r,
+            log_r=log_r,  # compatibility with old loss functions
+            log_r_reference=log_r_reference,
+            log_r_target=log_r_target,
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            subtb_lambda=self.training_mixed_config.subtb_lambda,
-            balance=self.get_balance_at_step(self.global_step),
         )
+
+        # Handle dict or scalar output for backward compatibility
+        if isinstance(loss_output, dict):
+            loss = loss_output["loss"]
+            # Log all component losses automatically
+            component_losses = {f"train/{k}": v for k, v in loss_output.items() if k != "loss"}
+            if component_losses:
+                self.log_dict(component_losses, on_step=True, sync_dist=True, prog_bar=True)
+        else:
+            loss = loss_output
 
         _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
             generated_text=generated_text,
@@ -552,18 +398,31 @@ class ChemGFNModule(LightningModule):
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
         log_r = result_dict["log_r"]
+        log_r_reference = result_dict["log_r_reference"]
+        log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         self.val_samples.extend(generated_text[:, prompt_len:].tolist())
 
-        loss = modified_subtb_loss(
+        loss_output = self.loss_fn(
             log_pf=log_pf,
-            log_r=log_r,
+            log_r=log_r,  # compatibility with old loss functions
+            log_r_reference=log_r_reference,
+            log_r_target=log_r_target,
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            subtb_lambda=self.training_mixed_config.subtb_lambda,
         )
+
+        # Handle dict or scalar output for backward compatibility
+        if isinstance(loss_output, dict):
+            loss = loss_output["loss"]
+            # Log all component losses automatically
+            component_losses = {f"val/{k}": v for k, v in loss_output.items() if k != "loss"}
+            if component_losses:
+                self.log_dict(component_losses, on_step=False, sync_dist=True)
+        else:
+            loss = loss_output
 
         _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
             generated_text=generated_text,
@@ -970,3 +829,162 @@ class ChemGFNModule(LightningModule):
                 },
             }
         return {"optimizer": optimizer}
+
+    # --------------------------------------------------------------------- #
+    # Helpers
+    # --------------------------------------------------------------------- #
+
+    @staticmethod
+    def _normalize_scalar(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if hasattr(value, "item"):
+            return float(value.item())
+        return float(value)
+
+    def _load_token_masks(self):
+        tokens_path = getattr(self.constraint_config, "legal_tokens", None)
+        if tokens_path and os.path.exists(tokens_path):
+            return prepare_token_mask(self.tokenizer, tokens_path)
+
+        if tokens_path:
+            print(f"Legal tokens file not found: {tokens_path}")
+        return None, None, None
+
+    def _build_pre_grammar_processor(self, parsed_grammar):
+        processor_type = getattr(self.constraint_config, "processor_type", "none")
+        if processor_type == "none":
+            return None
+        if processor_type == "general":
+            if self.grammar is None:
+                print("Grammar parsing failed with current tokenizer, disable general processor")
+                return None
+            return GrammarConstrainedLogitsProcessor(self.grammar)
+
+        processor_map = {
+            "prefix": GrammarIncrementalLogitsProcessorGeneral,
+            "prefix_enhanced": GrammarIncrementalLogitsProcessorSampleEnhanced,
+            "parenthese": GrammarLogitsProcessorPartheseness,
+            "number_only": GrammarIncrementalLogitsProcessorForNumberOnly,
+        }
+
+        processor_cls = processor_map.get(processor_type)
+        if processor_cls is None:
+            raise ValueError(f"Unsupported processor type: {processor_type}")
+
+        return processor_cls(
+            parsed_grammar,
+            tokenizer=self.tokenizer,
+            nice_token_ids_list=self.legal_token_ids_list,
+            execution_mode=self.constraint_config.parse_mode,
+        )
+
+    def _setup_grammar_processors(self):
+        if not getattr(self.constraint_config, "apply_grammar", False):
+            self.string_grammar = None
+            self.grammar = None
+            self.pre_grammar_processor = None
+            self.grammar_processor = None
+            return
+
+        with open(self.constraint_config.grammar_path) as file:
+            grammar_str = file.read()
+
+        parsed_grammar = parse_ebnf(grammar_str)
+        self.string_grammar = StringRecognizer(
+            parsed_grammar.grammar_encoding, parsed_grammar.symbol_table["root"]
+        )
+        try:
+            self.grammar = IncrementalGrammarConstraint(grammar_str, "root", self.tokenizer)
+        except Exception:
+            self.grammar = None
+            print("Grammar parsing failed with current tokenizer, disable general processor")
+
+        self.pre_grammar_processor = self._build_pre_grammar_processor(parsed_grammar)
+
+    def _log_metrics(self, metrics: dict[str, Any], **common_kwargs) -> None:
+        for name, value in metrics.items():
+            if isinstance(value, tuple):
+                metric_value, overrides = value
+                kwargs = {**common_kwargs, **overrides}
+            else:
+                metric_value = value
+                kwargs = common_kwargs
+            self.log(name, metric_value, **kwargs)
+
+    def _log_agreement_metrics(self, agree_list) -> None:
+        if agree_list is None:
+            return
+        if isinstance(agree_list, torch.Tensor):
+            tensors = [agree_list]
+        elif isinstance(agree_list, Sequence):
+            if len(agree_list) == 0:
+                return
+            tensors = list(agree_list)
+        else:
+            return
+
+        if len(tensors) == 0:
+            return
+
+        agree_sum = [torch.mean(x.sum(-1).float()).item() for x in tensors]
+        mid_index = len(agree_sum) // 2
+        metrics = {
+            "train/agree_mean": torch.tensor(agree_sum, device=self.device).mean(),
+            "train/agree_start": torch.tensor(agree_sum[0], device=self.device),
+            "train/agree_midd": torch.tensor(agree_sum[mid_index], device=self.device),
+            "train/agree_end": torch.tensor(agree_sum[-1], device=self.device),
+        }
+        self._log_metrics(metrics, on_step=True, sync_dist=True)
+
+    def _sample_pf_temperature(self) -> float:
+        if random.random() >= self.training_mixed_config.pf_temp_prob:
+            return 1.0
+        pf_low = self.training_mixed_config.pf_temp_low
+        pf_high = self.training_mixed_config.pf_temp_high
+        return random.random() * (pf_high - pf_low) + pf_low
+
+    def generate_from_replay_buffer(self, item, encoded_prompt):
+        """Optionally generate from replay buffer samples (Buffer 1).
+
+        Uses a dynamic probability schedule to decide whether to sample
+        from the replay buffer.
+
+        Args:
+            item: Data item dictionary.
+            encoded_prompt: Encoded prompt tensor.
+
+        Returns:
+            Tuple of (action_seq, result_dict) if buffer sampling is used, None otherwise.
+        """
+
+        prompt_tensor = encoded_prompt if encoded_prompt.ndim == 2 else encoded_prompt.unsqueeze(0)
+        device = encoded_prompt.device
+
+        buffer_sentences, _ = self.reward_buffer.sample(
+            self.training_mixed_config.n_samples,
+            prompt_tensor,
+            self.tokenizer,
+        )
+        if buffer_sentences is None:
+            return None
+        # Ensure buffer samples are on the same device as prompt
+        buffer_sentences = buffer_sentences.to(device, non_blocking=True)
+        prompt_expanded = prompt_tensor.expand(buffer_sentences.size(0), -1)
+        prompt_prefix = prompt_expanded[:, :-1]
+        action_seq = torch.cat([prompt_prefix, buffer_sentences], dim=1)
+        result_dict = self.forward(item, action_seq=action_seq)
+        return action_seq, result_dict
+
+    def _decode_generated_tokens(
+        self, tokens: torch.Tensor, skip_special_tokens: bool = True
+    ) -> str:
+        if self.constraint_config.processor_type == "number_only":
+            pieces = []
+            for token in tokens:
+                if token.item() == self.tokenizer.eos_token_id:
+                    break
+                pieces.append(self.tokenizer.decode(token, skip_special_tokens=False))
+            return ",".join(pieces)
+
+        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)

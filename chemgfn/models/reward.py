@@ -772,6 +772,79 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         }
 
 
+class Reference_Target_Score_Split_Reward:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator | None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        disable_peft: bool = False,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        **kwargs,
+    ) -> None:
+        """Initialize reward class with penalty values."""
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.disable_peft = disable_peft
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        with use_base_model(model, disable_peft=self.disable_peft):
+            reference_logits, _ = score_fast(
+                model=model,
+                encoded_input=input_batch,
+                termination_token_id=tokenizer.eos_token_id,
+                skip_first=prompt_length,
+                reward_temperature=reward_temperature,
+                invalid_vocab_mask=vocab_invalid_mask,
+                agree_list=agree_list,
+                illegal_vocab_penalty=self.illegal_vocab_penalty,
+                grammar_disagree_penalty=self.grammar_disagree_penalty,
+            )
+
+        validator_dict = None
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"]
+            max_sum_logpf = torch.max(abs(reference_logits), dim=-1).values.unsqueeze(-1)
+            reward_reference = reference_logits
+            reward_target = scaling_factor * max_sum_logpf * valid_score
+            reward_penalized = reward_target
+        else:
+            reward_penalized = reward_target
+
+        return {
+            "reward": reward_target + reference_logits_scale * reward_reference,
+            "reward_unpenalized": reward_reference,
+            "reward_target": reward_target,
+            "reward_reference": reward_reference,
+            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
+            "log_pf_ref": reference_logits,
+            "validator_dict": validator_dict,
+        }
+
+
 class UniformModelSentenceGivenPrompt:
     def __init__(
         self,

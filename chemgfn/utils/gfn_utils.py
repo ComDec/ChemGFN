@@ -218,8 +218,8 @@ def generate_and_return_termination_logprob(
         if action_seq is None:
             scores = logits.clone().detach()
             scores = default_processor(state, scores)
-
             results = logits_processor(state, scores)
+
             if isinstance(results, dict):
                 modified_logits = results["masked_logits"]
                 agree_entries.append(results["acceptance"])
@@ -238,6 +238,7 @@ def generate_and_return_termination_logprob(
 
             prob = (modified_logits / temperature).softmax(dim=-1)
             token_ids = torch.multinomial(prob, num_samples=1)
+
             if use_buffer_sample and buffer_sample is not None:
                 if step < buffer_sample.size(-1):
                     if step >= max_len:
@@ -312,6 +313,8 @@ def generate_and_return_termination_logprob(
         if isinstance(reward_results, dict):
             log_r = reward_results["reward"]
             log_r_unpenalized = reward_results["reward_unpenalized"]
+            log_r_reference = reward_results.get("reward_reference", None)
+            log_r_target = reward_results.get("reward_target", None)
             log_pf_ref = reward_results.get("log_pf_ref")
             full_tokens = reward_results.get("full_tokens")
             validator_dict = reward_results.get("validator_dict")
@@ -324,6 +327,8 @@ def generate_and_return_termination_logprob(
         "log_pterm": log_pterm,
         "log_r": log_r,
         "log_r_unpenalized": log_r_unpenalized,
+        "log_r_reference": log_r_reference,
+        "log_r_target": log_r_target,
         "agree_list": agree_entries,
         "log_pf_ref": log_pf_ref,
         "full_tokens": full_tokens,
@@ -508,161 +513,6 @@ def generate_and_return_termination_logprob_for_sidechain_opt(
         "full_tokens": full_tokens,
         "validator_dict": validator_dict,
     }
-
-
-def modified_subtb_loss(
-    log_pf,
-    log_r,
-    log_pterm,
-    generated_text,
-    termination_token_id,
-    prompt_len,
-    subtb_lambda=1.0,
-    **kwargs,
-):
-    # Ensure the dimensions of log probabilities, rewards, and generated text match
-    assert (
-        log_pf.shape[1]
-        == log_r.shape[1]
-        == log_pterm.shape[1]
-        == generated_text.shape[1] - prompt_len
-    )
-    # Ensure there is at least one transition before termination
-    assert log_pf.shape[1] > 1
-    # Calculate the change in expected reward and probability at each step
-    delta = log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
-    # Compute cumulative sum of delta for subtrajectory balance calculation
-    delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], 1).cumsum(1)
-
-    # Create a mask for tokens after the termination token
-    mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(-1) >= 1
-    batch_loss = 0.0
-    total_lambda = 0.0
-    generated_len = generated_text.shape[1] - prompt_len
-    for subtraj_len in range(1, generated_len):
-        # Calculate the subtrajectory balance term
-        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
-        # Apply mask to ignore invalid parts of the sequence
-        subtb_term[mask[:, subtraj_len - 1 :]] = 0
-        # Accumulate weighted subtrajectory balance term
-        batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
-        # Accumulate total weight for normalization
-        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
-    # Normalize the loss by the total weight
-
-    batch_loss /= total_lambda
-    return batch_loss
-
-
-def modified_subtb_balance_loss(
-    log_pf: torch.Tensor,  # [B, L]
-    log_r: torch.Tensor,  # [B, L]
-    log_pterm: torch.Tensor,  # [B, L]
-    generated_text: torch.Tensor,  # [B, prompt_len + L]
-    termination_token_id: int,
-    prompt_len: int,
-    subtb_lambda: float = 1.0,  # Original length decay weight
-    balance: float = 0.0,  # New: 0~1, controls token-level balancing degree
-    eps: float = 1e-8,
-):
-    """
-    Subtrajectory Balance (SubTB) with token-coverage balancing.
-
-    Args:
-        log_pf:        log P_F at each step (forward policy), shape [B, L]
-        log_r:         log reward prefix accumulator used in your SubTB, shape [B, L]
-        log_pterm:     log termination (or other TB buffers), shape [B, L]
-        generated_text: token ids incl. prompt, shape [B, prompt_len+L]
-        termination_token_id: EOS id to build mask
-        prompt_len:    length of prompt
-        subtb_lambda:  per-window-length weight, ^(len-1)
-        balance:       in [0,1]; 0 keeps original window-sum; 1 re-weights so each token contributes equally
-        eps:           numerical stabilizer
-    Returns:
-        scalar loss
-    """
-
-    # Basic checks
-    B, L = log_pf.shape
-    assert (
-        L == log_r.shape[1] == log_pterm.shape[1] == generated_text.shape[1] - prompt_len
-    ), "Shapes must match: [B, L] and generated_text len - prompt_len == L"
-    assert L > 1, "Need at least one transition before termination (L > 1)."
-
-    # ----- Standard SubTB core (unchanged) -----
-    # delta has length L-1 (per-step TB residuals)
-    delta = (
-        log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
-    )  # [B, L-1]
-
-    # prefix-sum trick to get window sums quickly
-    delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(
-        dim=1
-    )  # [B, L]
-
-    # mask out everything at/after first EOS inside the generated suffix (exclude last token)
-    # shape: [B, L-1]
-    mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(dim=-1) >= 1
-
-    # ---------- (A) Original design: window-wise accumulation ----------
-    loss_num_win = delta.new_zeros(())
-    loss_den_win = delta.new_zeros(())
-
-    # ---------- (B) New addition: token-coverage "amortized" accumulation ----------
-    # We amortize each window loss (sum(delta_i))^2 of length s evenly to the s delta positions it covers.
-    # Then average over all tokens (delta positions). This makes all tokens contribute more evenly to the loss.
-    # contributions: accumulated amortized loss for each sample and each delta position
-    contributions = torch.zeros(B, L - 1, device=delta.device, dtype=delta.dtype)
-    # denom_tokens: effective coverage count for each delta position (also amortized by 1/s)
-    denom_tokens = torch.zeros(B, L - 1, device=delta.device, dtype=delta.dtype)
-
-    for s in range(1, L):  # window length from 1..L-1
-        # Window sum: delta_cumsum[:, s:] - delta_cumsum[:, :-s]  -> [B, L-s]
-        window_sum = delta_cumsum[:, s:] - delta_cumsum[:, :-s]  # [B, L-s]
-        subtb_term = window_sum.pow(2)  # [B, L-s]
-
-        # Apply mask (at the window start index dimension)
-        # mask has shape [B, L-1], slice to [B, L-s]
-        m_slice = mask[:, s - 1 :]  # [B, L-s]
-        subtb_term = subtb_term.masked_fill(m_slice, 0.0)
-
-        # Original design accumulation (window-wise) with length weight subtb_lambda^(s-1)
-        w = subtb_lambda ** (s - 1)
-        loss_num_win = loss_num_win + w * subtb_term.sum()
-        loss_den_win = loss_den_win + w * (~m_slice).sum()
-
-        # ------- Amortize to token (delta index) level contribution -------
-        # Distribute each window value evenly to the s positions it covers (by 1/s):
-        # This is equivalent to a 1D transposed convolution on [B, 1, L-s] with an all-ones kernel of length s,
-        # resulting in [B, 1, (L-s) + s - 1] = [B, 1, L-1], then divide by s.
-        if balance > 0:
-            v = (w * subtb_term).unsqueeze(1)  # [B, 1, L-s]
-            k = torch.ones(1, 1, s, device=delta.device, dtype=delta.dtype)
-            contrib_add = F.conv_transpose1d(v, k)[:, 0, :] / float(s)  # [B, L-1]
-            contributions.add_(contrib_add)
-
-            # Coverage count denominator: use the same "transposed convolution" to compute how many
-            # windows of length s cover each token, amortized by 1/s with the same weight w.
-            cover = (~m_slice).to(dtype=delta.dtype).unsqueeze(1)  # [B, 1, L-s]
-            cover_add = F.conv_transpose1d(cover, k)[:, 0, :] / float(s)  # [B, L-1]
-            denom_tokens.add_(w * cover_add)
-
-    # Safety clamp
-    loss_den_win = torch.clamp(loss_den_win, min=eps)
-
-    # (A) Original window-wise loss
-    loss_win = loss_num_win / loss_den_win
-
-    if balance <= 0:
-        return loss_win
-
-    # (B) Token-balanced loss: average the contribution allocated to each token
-    denom_tokens = torch.clamp(denom_tokens, min=eps)
-    loss_tok = (contributions / denom_tokens).mean()
-
-    # Linear interpolation: balance=0 -> pure original design; balance=1 -> fully balanced to token
-    loss = (1.0 - balance) * loss_win + balance * loss_tok
-    return loss
 
 
 def get_termination_vals(

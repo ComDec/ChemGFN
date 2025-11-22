@@ -12,7 +12,29 @@ import numpy as np
 import pytest
 import torch
 
-from chemgfn.utils.gfn_utils import modified_subtb_loss
+from chemgfn.models.losses import ModifiedSubTBBalanceLoss
+
+
+# Helper function to maintain backward compatibility with tests
+def modified_subtb_loss(
+    log_pf,
+    log_r,
+    log_pterm,
+    generated_text,
+    termination_token_id,
+    prompt_len,
+    subtb_lambda=1.0,
+    balance=0.0,
+    **kwargs
+):
+    """Wrapper function for backward compatibility with existing tests."""
+    loss_fn = ModifiedSubTBBalanceLoss(subtb_lambda=subtb_lambda, balance=balance)
+    loss_output = loss_fn(
+        log_pf, log_r, log_pterm, generated_text, termination_token_id, prompt_len
+    )
+    # Return scalar for backward compatibility with tests
+    return loss_output["loss"] if isinstance(loss_output, dict) else loss_output
+
 
 # ============================================================================
 # Test Basic Loss Computation

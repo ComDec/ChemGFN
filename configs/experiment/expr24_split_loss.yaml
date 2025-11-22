@@ -9,9 +9,9 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "baseline", "expr24"]
+tags: ["ChemGFN", "split_loss", "expr24"]
 
-exp_name: "baseline_expr24"
+exp_name: "expr24_split_loss_base"
 seed: 42
 
 # ============================================================================
@@ -23,7 +23,7 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 1
+  devices: 4
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -36,35 +36,23 @@ model:
     weight_decay: 0.01
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
-    invalid_start_ratio: 0.2
-    invalid_end_ratio: 1.2
+    _target_: chemgfn.models.reward.Reference_Target_Score_Split_Reward
     disable_peft: ${model.disable_peft}
-    illegal_vocab_penalty: -80
-    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+    illegal_vocab_penalty: -99
+    grammar_disagree_penalty: -99
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
-      amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.ModifiedSubTBLoss
+    _target_: chemgfn.models.losses.ModifiedSubTBLossSplitReward
     subtb_lambda: 1.0
     eps: 1e-8
-
-  reward_config:
-    reward_temp_start: 2
-    reward_temp_end: 0.8
-    reward_temp_horizon: 50000
-    scaling_factor_start: 1
-    scaling_factor_end: 1
-    scaling_factor_horizon: 50000
+    alpha_reference: 0.5
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
     sim_tolerance: 0.25
-    strict_mode: false
-    buffer_aug_value: 0.0
 
   constraint_config:
     min_sentence_len: 1
@@ -77,7 +65,6 @@ model:
     parse_mode: "limited"
 
   training_mixed_config:
-    subtb_lambda: 1.0
     pf_temp_high: 2.0
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
@@ -96,25 +83,25 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.2
-      end: 0.5
+      start: 0.8
+      end: 0.1
       horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.8
+      start: 0.5
       end: 0.1
       horizon: 50000
     alpha_reference:
       _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 0.0
+      schedule_type: "cosine"
+      start: 0.25
       end: 0.0
       horizon: 50000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 1.0
+      start: 0.0
       end: 0.0
       horizon: 50000
     scaling_factor:
@@ -122,7 +109,7 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 5000
 
 # ============================================================================
 # Data Configuration

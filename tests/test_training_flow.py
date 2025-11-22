@@ -169,7 +169,7 @@ class TestLossComputation:
 
     def test_loss_backpropagation(self):
         """Test that loss can be backpropagated."""
-        from chemgfn.utils.gfn_utils import modified_subtb_loss
+        from chemgfn.models.losses import ModifiedSubTBBalanceLoss
 
         batch_size = 4
         seq_len = 5
@@ -182,7 +182,9 @@ class TestLossComputation:
         generated_text = torch.randint(1, 100, (batch_size, prompt_len + seq_len))
         generated_text[:, -1] = term_id
 
-        loss = modified_subtb_loss(log_pf, log_r, log_pterm, generated_text, term_id, prompt_len)
+        loss_fn = ModifiedSubTBBalanceLoss()
+        loss_output = loss_fn(log_pf, log_r, log_pterm, generated_text, term_id, prompt_len)
+        loss = loss_output["loss"] if isinstance(loss_output, dict) else loss_output
 
         # Backpropagate
         loss.backward()
@@ -539,10 +541,12 @@ class TestIntegrationScenarios:
         log_r = torch.randn(batch_size, seq_len)
 
         # 3. Compute loss
-        from chemgfn.utils.gfn_utils import modified_subtb_loss
+        from chemgfn.models.losses import ModifiedSubTBBalanceLoss
 
         generated_text[:, -1] = 0  # termination token
-        loss = modified_subtb_loss(log_pf, log_r, log_pterm, generated_text, 0, prompt_len)
+        loss_fn = ModifiedSubTBBalanceLoss()
+        loss_output = loss_fn(log_pf, log_r, log_pterm, generated_text, 0, prompt_len)
+        loss = loss_output["loss"] if isinstance(loss_output, dict) else loss_output
 
         # 4. Verify
         assert not torch.isnan(loss)

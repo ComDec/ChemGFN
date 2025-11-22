@@ -15,6 +15,7 @@ import pytest
 import torch
 from transformers import GPT2Tokenizer
 
+from chemgfn.models.losses import ModifiedSubTBBalanceLoss, ModifiedSubTBLoss
 from chemgfn.utils.gfn_utils import (
     ReplayBuffer,
     base_to_lora,
@@ -22,10 +23,50 @@ from chemgfn.utils.gfn_utils import (
     generate_and_return_termination_logprob,
     get_termination_vals,
     lora_to_base,
-    modified_subtb_balance_loss,
-    modified_subtb_loss,
     prepare_token_mask,
 )
+
+
+# Helper functions to maintain backward compatibility with tests
+def modified_subtb_loss(
+    log_pf,
+    log_r,
+    log_pterm,
+    generated_text,
+    termination_token_id,
+    prompt_len,
+    subtb_lambda=1.0,
+    **kwargs
+):
+    """Wrapper function for backward compatibility with existing tests."""
+    loss_fn = ModifiedSubTBLoss(subtb_lambda=subtb_lambda)
+    loss_output = loss_fn(
+        log_pf, log_r, log_pterm, generated_text, termination_token_id, prompt_len
+    )
+    # Return scalar for backward compatibility with tests
+    return loss_output["loss"] if isinstance(loss_output, dict) else loss_output
+
+
+def modified_subtb_balance_loss(
+    log_pf,
+    log_r,
+    log_pterm,
+    generated_text,
+    termination_token_id,
+    prompt_len,
+    subtb_lambda=1.0,
+    balance=0.0,
+    eps=1e-8,
+    **kwargs
+):
+    """Wrapper function for backward compatibility with existing tests."""
+    loss_fn = ModifiedSubTBBalanceLoss(subtb_lambda=subtb_lambda, balance=balance, eps=eps)
+    loss_output = loss_fn(
+        log_pf, log_r, log_pterm, generated_text, termination_token_id, prompt_len
+    )
+    # Return scalar for backward compatibility with tests
+    return loss_output["loss"] if isinstance(loss_output, dict) else loss_output
+
 
 # ============================================================================
 # Test Token Mask Preparation
