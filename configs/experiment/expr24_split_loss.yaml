@@ -58,7 +58,7 @@ model:
     min_sentence_len: 1
     max_sentence_len: 7
     grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
-    apply_grammar: true
+    disable_grammar: false
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
     illegal_vocab_penalty: -50

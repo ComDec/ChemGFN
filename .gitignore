@@ -165,3 +165,4 @@ configs/local/default.yaml
 
 # Config template backups
 configs/experiment/templates/*.backup.*
+notebooks/zinc15_250k.txt

@@ -753,13 +753,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
                 + scaling_factor * max_sum_logpf * valid_score
             )
             reward_penalized = reward_mixed
-            # reward_penalized = _apply_invalid_penalty(
-            #     reward_mixed,
-            #     invalid_mask,
-            #     self.invalid_start_ratio,
-            #     self.invalid_end_ratio,
-            #     base_override=float(torch.min(reference_logits).item()),
-            # )
         else:
             reward_penalized = reward_mixed
 

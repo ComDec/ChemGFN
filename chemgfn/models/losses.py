@@ -6,16 +6,26 @@ including SubTrajectory Balance (SubTB) losses with various enhancements.
 """
 
 from abc import ABC, abstractmethod
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from chemgfn.models.mcmc_prior import (
+    CoarseTokenIndexer,
+    load_q_mcmc,
+    pack_q_mcmc_to_device,
+)
 
 __all__ = [
     "GFNLoss",
     "ModifiedSubTBLoss",
     "ModifiedSubTBLossSplitReward",
     "ModifiedSubTBBalanceLoss",
+    "SubTBMCMCPriorLoss",
+    "SubTBBatchDiversityLoss",
+    "SubTBBatchDiversityPriorLoss",
 ]
 
 
@@ -31,6 +41,36 @@ class GFNLoss(nn.Module, ABC):
     - Consistent interface across loss functions
     - Easy extension with new loss variants
     """
+
+    def __init__(self):
+        super().__init__()
+        self.global_step: int | None = None
+        self.weight_schedulers: dict[str, callable] = {}
+        self.requires_policy_logits: bool = False
+
+    def set_global_step(self, step: int):
+        self.global_step = int(step)
+
+    def set_weight_schedulers(self, schedulers: dict[str, callable]):
+        self.weight_schedulers = schedulers or {}
+
+    def _resolve_weight(
+        self,
+        name: str,
+        base_value: float,
+        overrides: dict | None = None,
+        step: Optional[int] = None,
+    ) -> float:
+        step = self.global_step if step is None else step
+        if overrides is not None and name in overrides and overrides[name] is not None:
+            # overrides 直接覆盖为常数
+            return float(overrides[name])
+        if self.weight_schedulers and name in self.weight_schedulers and step is not None:
+            try:
+                return float(self.weight_schedulers[name](step))
+            except Exception:
+                pass
+        return float(base_value)
 
     @abstractmethod
     def forward(
@@ -423,3 +463,1161 @@ class ModifiedSubTBBalanceLoss(GFNLoss):
         # Linear interpolation: balance=0 -> pure original design; balance=1 -> fully balanced to token
         loss = (1.0 - self.balance) * loss_win + self.balance * loss_tok
         return {"loss": loss}
+
+
+def _entropy_from_counts(counts: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    probs = counts / counts.sum().clamp_min(eps)
+    return -(probs * probs.add(eps).log()).sum()
+
+
+class SubTBBatchDiversityLoss(GFNLoss):
+    """
+    SubTB + batch-level diversity loss.
+
+    Args:
+        subtb_lambda: SubTB lambda
+        balance: Balance between SubTB and diversity loss
+        eps: Epsilon
+        seq_diversity_weight: Sequence-level diversity weight
+        pos_diversity_weight: Position-level diversity weight
+        pos_max: Maximum position
+        use_logits: Use logits to compute diversity loss
+    """
+
+    def __init__(
+        self,
+        subtb_lambda: float = 1.0,
+        balance: float = 0.0,
+        eps: float = 1e-8,
+        seq_diversity_weight: float = 0.0,
+        pos_diversity_weight: float = 0.0,
+        pos_max: Optional[int] = None,
+        use_logits: bool = False,
+    ):
+        super().__init__()
+        self.base_subtb = ModifiedSubTBBalanceLoss(
+            subtb_lambda=subtb_lambda, balance=balance, eps=eps
+        )
+        self.seq_diversity_weight = seq_diversity_weight
+        self.pos_diversity_weight = pos_diversity_weight
+        self.pos_max = pos_max
+        self.eps = eps
+        self.use_logits = use_logits
+        self.requires_policy_logits = use_logits
+
+    def _batch_seq_entropy(
+        self, suffix: torch.Tensor, termination_token_id: int
+    ) -> Optional[torch.Tensor]:
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        alive_mask = eos_cum == 0
+        if not bool(alive_mask.any()):
+            return None
+        tokens = suffix[alive_mask]
+        vocab = int(tokens.max().item()) + 1
+        counts = torch.bincount(tokens, minlength=vocab).to(torch.float32)
+        return _entropy_from_counts(counts, eps=self.eps)
+
+    def _batch_pos_entropy_tokens(
+        self, suffix: torch.Tensor, termination_token_id: int, max_pos: Optional[int]
+    ) -> Optional[torch.Tensor]:
+        B, L = suffix.shape
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        ent_acc = torch.zeros((), device=suffix.device, dtype=torch.float32)
+        ent_cnt = torch.zeros((), device=suffix.device, dtype=torch.float32)
+        limit = L if max_pos is None else min(L, int(max_pos))
+        vocab = int(suffix.max().item()) + 1
+        for t in range(limit):
+            mask = eos_cum[:, t] == 0
+            if not bool(mask.any()):
+                continue
+            toks = suffix[mask, t]
+            counts = torch.bincount(toks, minlength=vocab).to(torch.float32)
+            ent_acc = ent_acc + _entropy_from_counts(counts, eps=self.eps)
+            ent_cnt = ent_cnt + 1.0
+        if ent_cnt.item() == 0:
+            return None
+        return ent_acc / ent_cnt.clamp_min(1.0)
+
+    def _batch_pos_entropy_logits(
+        self,
+        policy_logits: torch.Tensor,
+        suffix: torch.Tensor,
+        termination_token_id: int,
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if policy_logits is None:
+            return None
+        B, L = suffix.shape
+        logits = policy_logits[:, :L, :]
+        ptheta = logits.log_softmax(dim=-1).exp()
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        ent_acc = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+        ent_cnt = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+        limit = L if max_pos is None else min(L, int(max_pos))
+        for t in range(limit):
+            mask = eos_cum[:, t] == 0
+            if not bool(mask.any()):
+                continue
+            p_bar = ptheta[mask, t].mean(dim=0)
+            ent_acc = ent_acc + (-(p_bar * p_bar.add(self.eps).log())).sum()
+            ent_cnt = ent_cnt + 1.0
+        if ent_cnt.item() == 0:
+            return None
+        return ent_acc / ent_cnt.clamp_min(1.0)
+
+    def forward(
+        self,
+        log_pf: torch.Tensor,
+        log_r: torch.Tensor,
+        log_pterm: torch.Tensor,
+        generated_text: torch.Tensor,
+        termination_token_id: int,
+        prompt_len: int,
+        policy_logits: Optional[torch.Tensor] = None,
+        weight_overrides: Optional[dict] = None,
+        global_step: Optional[int] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        suffix = generated_text[:, prompt_len:]
+        subtb_out = self.base_subtb(
+            log_pf=log_pf,
+            log_r=log_r,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=termination_token_id,
+            prompt_len=prompt_len,
+        )
+        subtb_loss = subtb_out["loss"] if isinstance(subtb_out, dict) else subtb_out
+        loss_total = subtb_loss
+        logs = {"loss_subtb": subtb_loss.detach()}
+
+        seq_w = self._resolve_weight(
+            "seq_diversity_weight", self.seq_diversity_weight, weight_overrides
+        )
+        pos_w = self._resolve_weight(
+            "pos_diversity_weight", self.pos_diversity_weight, weight_overrides
+        )
+
+        if seq_w >= 0.0:
+            seq_ent = self._batch_seq_entropy(suffix, termination_token_id)
+            if seq_ent is not None:
+                loss_total = loss_total - seq_w * seq_ent
+                logs["loss_batch_seq_entropy"] = (-seq_w * seq_ent).detach()
+
+        if pos_w >= 0.0:
+            if self.use_logits:
+                pos_ent = self._batch_pos_entropy_logits(
+                    policy_logits, suffix, termination_token_id, self.pos_max
+                )
+            else:
+                pos_ent = self._batch_pos_entropy_tokens(
+                    suffix, termination_token_id, self.pos_max
+                )
+            if pos_ent is not None:
+                loss_total = loss_total - pos_w * pos_ent
+                logs["loss_batch_pos_entropy"] = (-pos_w * pos_ent).detach()
+
+        logs["loss"] = loss_total
+        return logs
+
+
+class SubTBMCMCPriorLoss(GFNLoss):
+    """
+    SubTB loss with optional MCMC n-gram regularization.
+
+    Adds two regularizers to the base SubTB objective:
+    - Sequence-level prior NLL against a pre-computed q_MCMC.
+    - Position-wise KL between the model policy and q_MCMC.
+    Coarse-grained variants are supported via a token grouping map.
+    """
+
+    def __init__(
+        self,
+        subtb_lambda: float = 1.0,
+        balance: float = 0.0,
+        eps: float = 1e-8,
+        # MCMC priors
+        q_mcmc_path: Optional[str] = None,
+        q_mcmc: Optional[Dict[Tuple[int, ...], Dict[int, float]]] = None,
+        prior_temperature: float = 1.0,
+        base_n: int = 2,
+        bos_id: int = -1,
+        vocab_size: Optional[int] = None,
+        # Sequence-level prior
+        seq_weight: float = 0.0,
+        seq_include_eos: bool = False,
+        seq_normalize_by_len: bool = True,
+        seq_max_pos: Optional[int] = None,
+        # Logits-level KL
+        kl_weight: float = 0.0,
+        kl_max_pos: Optional[int] = 1,
+        kl_temperature: float = 1.0,
+        # Coarse-grained options
+        coarse_token_groups: Optional[list[list[int]]] = None,
+        token_to_coarse: Optional[Dict[int, int]] = None,
+        coarse_default_id: Optional[int] = None,
+        coarse_ngram_n: Optional[int] = None,
+        coarse_seq_weight: float = 0.0,
+        coarse_seq_include_eos: bool = False,
+        coarse_seq_normalize_by_len: bool = True,
+        coarse_seq_max_pos: Optional[int] = None,
+        coarse_kl_weight: float = 0.0,
+        coarse_kl_max_pos: Optional[int] = 1,
+        coarse_prior_temperature: Optional[float] = None,
+        coarse_q_mcmc_path: Optional[str] = None,
+        coarse_q_mcmc: Optional[Dict[Tuple[int, ...], Dict[int, float]]] = None,
+        # Batch-level distribution regularizer
+        batch_kl_weight: float = 0.0,
+        batch_kl_max_pos: Optional[int] = None,
+        coarse_batch_kl_weight: float = 0.0,
+        coarse_batch_kl_max_pos: Optional[int] = None,
+        # Diversity (entropy) bonus
+        diversity_weight: float = 0.0,
+        diversity_max_pos: Optional[int] = None,
+        diversity_batch_level: bool = True,
+        diversity_use_logits: bool = True,
+        # Coarse reward shaping
+        coarse_reward_weight: float = 0.0,
+    ):
+        super().__init__()
+        self.base_subtb = ModifiedSubTBBalanceLoss(
+            subtb_lambda=subtb_lambda, balance=balance, eps=eps
+        )
+        self.eps = eps
+        self.base_n = base_n
+        self.bos_id = bos_id
+        self.vocab_size = vocab_size
+
+        self.seq_weight = seq_weight
+        self.seq_include_eos = seq_include_eos
+        self.seq_normalize_by_len = seq_normalize_by_len
+        self.seq_max_pos = seq_max_pos
+
+        self.kl_weight = kl_weight
+        self.kl_max_pos = kl_max_pos
+        self.kl_temperature = kl_temperature
+        self.prior_temperature = prior_temperature
+
+        self.coarse_seq_weight = coarse_seq_weight
+        self.coarse_seq_include_eos = coarse_seq_include_eos
+        self.coarse_seq_normalize_by_len = coarse_seq_normalize_by_len
+        self.coarse_seq_max_pos = coarse_seq_max_pos
+        self.coarse_kl_weight = coarse_kl_weight
+        self.coarse_kl_max_pos = coarse_kl_max_pos
+        self.coarse_prior_temperature = (
+            prior_temperature if coarse_prior_temperature is None else coarse_prior_temperature
+        )
+        self.coarse_ngram_n = coarse_ngram_n or base_n
+
+        # Batch-level distribution KL
+        self.batch_kl_weight = batch_kl_weight
+        self.batch_kl_max_pos = batch_kl_max_pos
+        self.coarse_batch_kl_weight = coarse_batch_kl_weight
+        self.coarse_batch_kl_max_pos = coarse_batch_kl_max_pos
+
+        # Diversity/entropy bonus
+        self.diversity_weight = diversity_weight
+        self.diversity_max_pos = diversity_max_pos
+        self.diversity_batch_level = diversity_batch_level
+        self.diversity_use_logits = diversity_use_logits
+
+        # Coarse reward shaping
+        self.coarse_reward_weight = coarse_reward_weight
+
+        mapping = None
+        if token_to_coarse is not None:
+            mapping = {int(k): int(v) for k, v in token_to_coarse.items()}
+        elif coarse_token_groups:
+            mapping = {}
+            for cid, group in enumerate(coarse_token_groups):
+                for tok in group:
+                    mapping[int(tok)] = cid
+
+        self.coarse_indexer = (
+            CoarseTokenIndexer(mapping, vocab_size, coarse_default_id)
+            if mapping is not None
+            else None
+        )
+
+        self.q_mcmc_source = q_mcmc or self._load_prior(q_mcmc_path)
+        self.q_mcmc_coarse_source = coarse_q_mcmc or self._load_prior(coarse_q_mcmc_path)
+        self._q_cache: dict[tuple[torch.device, int], Dict[Tuple[int, ...], torch.Tensor]] = {}
+        self._q_coarse_cache: dict[
+            tuple[torch.device, int], Dict[Tuple[int, ...], torch.Tensor]
+        ] = {}
+        self._warned_missing_prior: set[str] = set()
+        self.requires_policy_logits = (
+            (kl_weight > 0.0)
+            or (coarse_kl_weight > 0.0)
+            or (diversity_weight > 0.0 and diversity_use_logits)
+        )
+        self.weight_schedulers: dict[str, callable] = {}
+
+    # Optional: allow external schedulers to adjust weights dynamically
+    def set_weight_scheduler(self, name: str, fn):
+        self.weight_schedulers[name] = fn
+        if name in {"kl_weight", "coarse_kl_weight", "diversity_weight"}:
+            self.requires_policy_logits = True
+
+    def set_weight_schedulers(self, schedulers: dict[str, callable]):
+        self.weight_schedulers.update(schedulers)
+        if any(n in {"kl_weight", "coarse_kl_weight", "diversity_weight"} for n in schedulers):
+            self.requires_policy_logits = True
+
+    # ----------------------- helpers ----------------------- #
+    @staticmethod
+    def _load_prior(path: Optional[str]):
+        if path is None:
+            return None
+        try:
+            return load_q_mcmc(path)
+        except FileNotFoundError:
+            print(f"[SubTBMCMCPriorLoss] q_mcmc file not found: {path}, skipping.")
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[SubTBMCMCPriorLoss] Failed to load q_mcmc from {path}: {exc}")
+        return None
+
+    @staticmethod
+    def _ctx_tuple(row: torch.Tensor, t: int, n: int, bos: int) -> Tuple[int, ...]:
+        k = n - 1
+        if k <= 0:
+            return ()
+        ctx = []
+        for kk in range(k, 0, -1):
+            idx = t - kk
+            ctx.append(bos if idx < 0 else int(row[idx].item()))
+        return tuple(ctx)
+
+    def _infer_vocab_size(self, policy_logits, generated_text: torch.Tensor) -> int:
+        if self.vocab_size is not None:
+            return int(self.vocab_size)
+        if policy_logits is not None:
+            return int(policy_logits.shape[-1])
+        return int(generated_text.max().item()) + 1
+
+    def _get_q_packed(
+        self,
+        source: Optional[Dict[Tuple[int, ...], Dict[int, float]]],
+        cache: dict[tuple[torch.device, int], Dict[Tuple[int, ...], torch.Tensor]],
+        device: torch.device,
+        vocab_size: int,
+    ) -> Optional[Dict[Tuple[int, ...], torch.Tensor]]:
+        if source is None:
+            return None
+        key = (device, vocab_size)
+        if key not in cache:
+            cache[key] = pack_q_mcmc_to_device(
+                source, vocab_size=vocab_size, device=device, eps=self.eps
+            )
+        return cache[key]
+
+    def _get_q_vec(
+        self, q_packed: Dict[Tuple[int, ...], torch.Tensor], context: Tuple[int, ...]
+    ) -> torch.Tensor:
+        h = context
+        while True:
+            if h in q_packed:
+                q = q_packed[h]
+                break
+            if len(h) == 0:
+                q = q_packed[()]
+                break
+            h = h[1:]
+        if self.prior_temperature == 1.0:
+            return q
+        q_temp = torch.pow(q, 1.0 / max(self.prior_temperature, self.eps))
+        return q_temp / q_temp.sum().clamp_min(self.eps)
+
+    def _get_q_vec_coarse(
+        self, q_packed: Dict[Tuple[int, ...], torch.Tensor], context: Tuple[int, ...]
+    ) -> torch.Tensor:
+        h = context
+        while True:
+            if h in q_packed:
+                q = q_packed[h]
+                break
+            if len(h) == 0:
+                q = q_packed[()]
+                break
+            h = h[1:]
+        if self.coarse_prior_temperature == 1.0:
+            return q
+        q_temp = torch.pow(q, 1.0 / max(self.coarse_prior_temperature, self.eps))
+        return q_temp / q_temp.sum().clamp_min(self.eps)
+
+    def _warn_missing(self, key: str, message: str):
+        if key in self._warned_missing_prior:
+            return
+        print(message)
+        self._warned_missing_prior.add(key)
+
+    # ----------------------- loss terms ----------------------- #
+    def _sequence_prior_loss(
+        self,
+        suffix: torch.Tensor,
+        termination_token_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+        base_n: int,
+        include_eos: bool,
+        normalize_by_len: bool,
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute the sequence prior loss.
+        Make sure the token choice is not far from the prior.
+        More suitable for small vocabulary sizes.
+        """
+        if q_packed is None:
+            return None
+
+        B, L = suffix.shape
+        total = suffix.new_zeros(())
+        denom = suffix.new_zeros(())
+
+        for b in range(B):
+            row = suffix[b]
+            T_eff = L
+            if not include_eos:
+                pos = (row == termination_token_id).nonzero(as_tuple=False)
+                if pos.numel() > 0:
+                    T_eff = int(pos[0].item())
+            if max_pos is not None:
+                T_eff = min(T_eff, int(max_pos))
+            if T_eff <= 0:
+                continue
+
+            logp = 0.0
+            for t in range(T_eff):
+                ctx = self._ctx_tuple(row, t, n=base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx)
+                w = int(row[t].item())
+                logp += float(torch.log(q_vec[w].clamp_min(self.eps)).item())
+
+            if include_eos and (T_eff < L):
+                ctx = self._ctx_tuple(row, T_eff, n=base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx)
+                logp += float(torch.log(q_vec[termination_token_id].clamp_min(self.eps)).item())
+
+            if normalize_by_len:
+                total = total + (-logp / max(1, T_eff))
+            else:
+                total = total + (-logp)
+            denom = denom + 1.0
+
+        return total / denom.clamp_min(1.0)
+
+    def _kl_regularizer(
+        self,
+        suffix: torch.Tensor,
+        policy_logits: torch.Tensor,
+        termination_token_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+    ) -> Optional[torch.Tensor]:
+        if q_packed is None:
+            return None
+        B, L = suffix.shape
+        logits = policy_logits[:, :L, :]
+        if self.kl_temperature != 1.0:
+            logits = logits / float(self.kl_temperature)
+        ptheta = logits.log_softmax(dim=-1).exp()
+
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        alive = eos_cum == 0
+        if self.kl_max_pos is not None:
+            pos_mask = torch.arange(L, device=suffix.device).unsqueeze(0) < int(self.kl_max_pos)
+            alive = alive & pos_mask
+
+        kl_acc = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+        kl_cnt = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+
+        for b in range(B):
+            row = suffix[b]
+            for t in range(L):
+                if not bool(alive[b, t].item()):
+                    continue
+                ctx = self._ctx_tuple(row, t, n=self.base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx).to(ptheta.dtype)
+                p = ptheta[b, t]
+                kl = (p * (p.add(self.eps).log() - q_vec.add(self.eps).log())).sum()
+                kl_acc = kl_acc + kl
+                kl_cnt = kl_cnt + 1.0
+
+        return kl_acc / kl_cnt.clamp_min(1.0)
+
+    def _coarse_sequence_loss(
+        self,
+        coarse_suffix: torch.Tensor,
+        termination_token_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+        include_eos: bool,
+        normalize_by_len: bool,
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if q_packed is None:
+            return None
+
+        B, L = coarse_suffix.shape
+        total = coarse_suffix.new_zeros(())
+        denom = coarse_suffix.new_zeros(())
+
+        for b in range(B):
+            row = coarse_suffix[b]
+            T_eff = L
+            if not include_eos:
+                pos = (row == termination_token_id).nonzero(as_tuple=False)
+                if pos.numel() > 0:
+                    T_eff = int(pos[0].item())
+            if max_pos is not None:
+                T_eff = min(T_eff, int(max_pos))
+            if T_eff <= 0:
+                continue
+
+            logp = 0.0
+            for t in range(T_eff):
+                ctx = self._ctx_tuple(row, t, n=self.coarse_ngram_n, bos=self.bos_id)
+                q_vec = self._get_q_vec_coarse(q_packed, ctx)
+                w = int(row[t].item())
+                logp += float(torch.log(q_vec[w].clamp_min(self.eps)).item())
+            if include_eos and (T_eff < L):
+                ctx = self._ctx_tuple(row, T_eff, n=self.coarse_ngram_n, bos=self.bos_id)
+                q_vec = self._get_q_vec_coarse(q_packed, ctx)
+                logp += float(torch.log(q_vec[termination_token_id].clamp_min(self.eps)).item())
+
+            if normalize_by_len:
+                total = total + (-logp / max(1, T_eff))
+            else:
+                total = total + (-logp)
+            denom = denom + 1.0
+
+        return total / denom.clamp_min(1.0)
+
+    def _coarse_kl_regularizer(
+        self,
+        coarse_suffix: torch.Tensor,
+        policy_logits: torch.Tensor,
+        termination_coarse_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+        projection: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if q_packed is None:
+            return None
+
+        B, L = coarse_suffix.shape
+        logits = policy_logits[:, :L, :]
+        if self.kl_temperature != 1.0:
+            logits = logits / float(self.kl_temperature)
+        ptheta = logits.log_softmax(dim=-1).exp()
+        coarse_probs = torch.matmul(ptheta, projection.to(ptheta.dtype))  # [B, L, C]
+
+        eos_cum = (coarse_suffix == termination_coarse_id).cumsum(dim=1)
+        alive = eos_cum == 0
+        if self.coarse_kl_max_pos is not None:
+            pos_mask = torch.arange(L, device=coarse_suffix.device).unsqueeze(0) < int(
+                self.coarse_kl_max_pos
+            )
+            alive = alive & pos_mask
+
+        kl_acc = torch.zeros((), device=coarse_suffix.device, dtype=coarse_probs.dtype)
+        kl_cnt = torch.zeros((), device=coarse_suffix.device, dtype=coarse_probs.dtype)
+
+        for b in range(B):
+            row = coarse_suffix[b]
+            for t in range(L):
+                if not bool(alive[b, t].item()):
+                    continue
+                ctx = self._ctx_tuple(row, t, n=self.coarse_ngram_n, bos=self.bos_id)
+                q_vec = self._get_q_vec_coarse(q_packed, ctx).to(coarse_probs.dtype)
+                p = coarse_probs[b, t]
+                kl = (p * (p.add(self.eps).log() - q_vec.add(self.eps).log())).sum()
+                kl_acc = kl_acc + kl
+                kl_cnt = kl_cnt + 1.0
+
+        return kl_acc / kl_cnt.clamp_min(1.0)
+
+    def _batch_distribution_kl(
+        self,
+        suffix: torch.Tensor,
+        termination_token_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if q_packed is None:
+            return None
+        B, L = suffix.shape
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        kl_acc = suffix.new_zeros((), dtype=torch.float32, device=suffix.device)
+        kl_cnt = suffix.new_zeros((), dtype=torch.float32, device=suffix.device)
+
+        limit = L if max_pos is None else min(L, int(max_pos))
+        for t in range(limit):
+            alive = eos_cum[:, t] == 0
+            if not bool(alive.any()):
+                continue
+            active_tokens = suffix[alive, t]
+            vocab_size = q_packed.get((), next(iter(q_packed.values()))).numel()
+            p_counts = torch.bincount(active_tokens, minlength=vocab_size).to(torch.float32)
+            p = p_counts / p_counts.sum().clamp_min(self.eps)
+
+            q_list = []
+            idx_alive = active_tokens.shape[0]
+            for i in range(idx_alive):
+                row = suffix[alive][i]
+                ctx = self._ctx_tuple(row, t, n=self.base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx).to(torch.float32)
+                q_list.append(q_vec)
+            q_batch = torch.stack(q_list, dim=0).mean(dim=0)
+            kl = (p * (p.add(self.eps).log() - q_batch.add(self.eps).log())).sum()
+            kl_acc = kl_acc + kl
+            kl_cnt = kl_cnt + 1.0
+        return kl_acc / kl_cnt.clamp_min(1.0)
+
+    def _coarse_batch_distribution_kl(
+        self,
+        coarse_suffix: torch.Tensor,
+        termination_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if q_packed is None:
+            return None
+        B, L = coarse_suffix.shape
+        eos_cum = (coarse_suffix == termination_id).cumsum(dim=1)
+        kl_acc = coarse_suffix.new_zeros((), dtype=torch.float32, device=coarse_suffix.device)
+        kl_cnt = coarse_suffix.new_zeros((), dtype=torch.float32, device=coarse_suffix.device)
+        limit = L if max_pos is None else min(L, int(max_pos))
+        for t in range(limit):
+            alive = eos_cum[:, t] == 0
+            if not bool(alive.any()):
+                continue
+            active_tokens = coarse_suffix[alive, t]
+            vocab_size = q_packed.get((), next(iter(q_packed.values()))).numel()
+            p_counts = torch.bincount(active_tokens, minlength=vocab_size).to(torch.float32)
+            p = p_counts / p_counts.sum().clamp_min(self.eps)
+
+            q_list = []
+            idx_alive = active_tokens.shape[0]
+            for i in range(idx_alive):
+                row = coarse_suffix[alive][i]
+                ctx = self._ctx_tuple(row, t, n=self.coarse_ngram_n, bos=self.bos_id)
+                q_vec = self._get_q_vec_coarse(q_packed, ctx).to(torch.float32)
+                q_list.append(q_vec)
+            q_batch = torch.stack(q_list, dim=0).mean(dim=0)
+            kl = (p * (p.add(self.eps).log() - q_batch.add(self.eps).log())).sum()
+            kl_acc = kl_acc + kl
+            kl_cnt = kl_cnt + 1.0
+        return kl_acc / kl_cnt.clamp_min(1.0)
+
+    def _entropy_bonus(
+        self,
+        policy_logits: torch.Tensor,
+        termination_token_id: int,
+        suffix: torch.Tensor,
+        max_pos: Optional[int],
+    ) -> Optional[torch.Tensor]:
+        if policy_logits is None and self.diversity_use_logits:
+            return None
+        B, L = suffix.shape
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        alive = eos_cum == 0
+        if max_pos is not None:
+            pos_mask = torch.arange(L, device=suffix.device).unsqueeze(0) < int(max_pos)
+            alive = alive & pos_mask
+
+        if self.diversity_use_logits:
+            logits = policy_logits[:, :L, :]
+            ptheta = logits.log_softmax(dim=-1).exp()
+            ent_acc = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+            ent_cnt = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
+            for t in range(L):
+                mask_t = alive[:, t]
+                if not bool(mask_t.any()):
+                    continue
+                p_bar = ptheta[mask_t, t].mean(dim=0)
+                ent = -(p_bar * p_bar.add(self.eps).log()).sum()
+                ent_acc = ent_acc + ent
+                ent_cnt = ent_cnt + 1.0
+        else:
+            # 用采样 token 的 batch 分布熵作为多样性指标
+            ent_acc = torch.zeros((), device=suffix.device, dtype=torch.float32)
+            ent_cnt = torch.zeros((), device=suffix.device, dtype=torch.float32)
+            vocab_size = int(suffix.max().item()) + 1
+            for t in range(L):
+                mask_t = alive[:, t]
+                if not bool(mask_t.any()):
+                    continue
+                tokens = suffix[mask_t, t]
+                counts = torch.bincount(tokens, minlength=vocab_size).to(torch.float32)
+                p = counts / counts.sum().clamp_min(self.eps)
+                ent = -(p * p.add(self.eps).log()).sum()
+                ent_acc = ent_acc + ent
+                ent_cnt = ent_cnt + 1.0
+        if ent_cnt.item() == 0:
+            return None
+        return -(ent_acc / ent_cnt.clamp_min(1.0))
+
+    def _coarse_reward_bonus(
+        self,
+        coarse_suffix: torch.Tensor,
+        termination_coarse_id: int,
+        q_packed: Optional[Dict[Tuple[int, ...], torch.Tensor]],
+    ) -> Optional[torch.Tensor]:
+        """基于 coarse n-gram 先验的逐 token log 概率，用于奖励塑形。"""
+        if q_packed is None:
+            return None
+        B, L = coarse_suffix.shape
+        bonus = torch.zeros(B, L, device=coarse_suffix.device, dtype=torch.float32)
+        eos_cum = (coarse_suffix == termination_coarse_id).cumsum(dim=1)
+        alive = eos_cum == 0
+        for b in range(B):
+            row = coarse_suffix[b]
+            for t in range(L):
+                if not bool(alive[b, t].item()):
+                    continue
+                ctx = self._ctx_tuple(row, t, n=self.coarse_ngram_n, bos=self.bos_id)
+                q_vec = self._get_q_vec_coarse(q_packed, ctx).to(torch.float32)
+                w = int(row[t].item())
+                bonus[b, t] = torch.log(q_vec[w].clamp_min(self.eps))
+        return bonus
+
+    # ----------------------- main forward ----------------------- #
+    def forward(
+        self,
+        log_pf: torch.Tensor,
+        log_r: torch.Tensor,
+        log_pterm: torch.Tensor,
+        generated_text: torch.Tensor,
+        termination_token_id: int,
+        prompt_len: int,
+        policy_logits: Optional[torch.Tensor] = None,
+        weight_overrides: Optional[dict] = None,
+        global_step: Optional[int] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        B, L = log_pf.shape
+        suffix = generated_text[:, prompt_len : prompt_len + L]
+        device = log_pf.device
+        vocab_size = self._infer_vocab_size(policy_logits, generated_text)
+
+        q_packed = self._get_q_packed(self.q_mcmc_source, self._q_cache, device, vocab_size)
+        logs = {}
+
+        # Resolve weights (static, override, or scheduler)
+        seq_w = self._resolve_weight("seq_weight", self.seq_weight, weight_overrides)
+        kl_w = self._resolve_weight("kl_weight", self.kl_weight, weight_overrides)
+        batch_kl_w = self._resolve_weight(
+            "batch_kl_weight", self.batch_kl_weight, weight_overrides
+        )
+        coarse_seq_w = self._resolve_weight(
+            "coarse_seq_weight", self.coarse_seq_weight, weight_overrides
+        )
+        coarse_kl_w = self._resolve_weight(
+            "coarse_kl_weight", self.coarse_kl_weight, weight_overrides
+        )
+        coarse_batch_kl_w = self._resolve_weight(
+            "coarse_batch_kl_weight",
+            self.coarse_batch_kl_weight,
+            weight_overrides,
+        )
+        diversity_w = self._resolve_weight(
+            "diversity_weight", self.diversity_weight, weight_overrides
+        )
+        coarse_reward_w = self._resolve_weight(
+            "coarse_reward_weight", self.coarse_reward_weight, weight_overrides
+        )
+
+        # --------- 可选：coarse 先验奖励塑形（修改 log_r 家族后再算 SubTB） ---------
+        if self.coarse_indexer is not None and coarse_reward_w > 0.0:
+            self.coarse_indexer.ensure_vocab_size(vocab_size)
+            coarse_suffix = self.coarse_indexer.coarse_tokens(suffix)
+            coarse_term_id = int(
+                self.coarse_indexer.coarse_tokens(
+                    torch.tensor([termination_token_id], device=device)
+                )[0].item()
+            )
+            q_coarse_pack = self._get_q_packed(
+                self.q_mcmc_coarse_source,
+                self._q_coarse_cache,
+                device,
+                self.coarse_indexer.coarse_vocab_size,
+            )
+            coarse_bonus = self._coarse_reward_bonus(
+                coarse_suffix=coarse_suffix,
+                termination_coarse_id=coarse_term_id,
+                q_packed=q_coarse_pack,
+            )
+            if coarse_bonus is not None:
+                w = float(coarse_reward_w)
+                log_r = log_r + w * coarse_bonus.to(log_r.dtype)
+                if "log_r_reference" in kwargs and kwargs["log_r_reference"] is not None:
+                    kwargs["log_r_reference"] = kwargs["log_r_reference"] + w * coarse_bonus.to(
+                        kwargs["log_r_reference"].dtype
+                    )
+                if "log_r_target" in kwargs and kwargs["log_r_target"] is not None:
+                    kwargs["log_r_target"] = kwargs["log_r_target"] + w * coarse_bonus.to(
+                        kwargs["log_r_target"].dtype
+                    )
+
+        # --------- 主体 SubTB（使用可能被奖励塑形后的 log_r） ---------
+        subtb_out = self.base_subtb(
+            log_pf=log_pf,
+            log_r=log_r,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=termination_token_id,
+            prompt_len=prompt_len,
+        )
+        subtb_loss = subtb_out["loss"] if isinstance(subtb_out, dict) else subtb_out
+        loss_total = subtb_loss
+        logs["loss_subtb"] = subtb_loss.detach()
+
+        if seq_w > 0.0:
+            seq_loss = self._sequence_prior_loss(
+                suffix,
+                termination_token_id,
+                q_packed,
+                base_n=self.base_n,
+                include_eos=self.seq_include_eos,
+                normalize_by_len=self.seq_normalize_by_len,
+                max_pos=self.seq_max_pos,
+            )
+            if seq_loss is None:
+                self._warn_missing(
+                    "seq", "[SubTBMCMCPriorLoss] Missing q_MCMC for sequence prior; skipping."
+                )
+            else:
+                loss_total = loss_total + seq_w * seq_loss
+                logs["loss_seq_prior"] = seq_loss.detach()
+
+        if kl_w > 0.0:
+            if policy_logits is None:
+                self._warn_missing(
+                    "kl", "[SubTBMCMCPriorLoss] policy_logits is None; KL term skipped."
+                )
+            else:
+                kl_loss = self._kl_regularizer(
+                    suffix,
+                    policy_logits,
+                    termination_token_id=termination_token_id,
+                    q_packed=q_packed,
+                )
+                if kl_loss is None:
+                    self._warn_missing(
+                        "kl_q", "[SubTBMCMCPriorLoss] Missing q_MCMC for KL prior; skipping."
+                    )
+                else:
+                    loss_total = loss_total + kl_w * kl_loss
+                    logs["loss_logits_kl"] = kl_loss.detach()
+
+        if batch_kl_w > 0.0:
+            batch_kl = self._batch_distribution_kl(
+                suffix,
+                termination_token_id=termination_token_id,
+                q_packed=q_packed,
+                max_pos=self.batch_kl_max_pos,
+            )
+            if batch_kl is None:
+                self._warn_missing(
+                    "batch_kl",
+                    "[SubTBMCMCPriorLoss] Missing q_MCMC for batch KL; skipping.",
+                )
+            else:
+                loss_total = loss_total + batch_kl_w * batch_kl
+                logs["loss_batch_kl"] = batch_kl.detach()
+
+        # --------- coarse-grained terms --------- #
+        if self.coarse_indexer is not None and (
+            coarse_seq_w > 0.0 or coarse_kl_w > 0.0 or coarse_batch_kl_w > 0.0
+        ):
+            self.coarse_indexer.ensure_vocab_size(vocab_size)
+
+            coarse_suffix = self.coarse_indexer.coarse_tokens(suffix)
+            projection = self.coarse_indexer.projection(device)
+            coarse_vocab = self.coarse_indexer.coarse_vocab_size
+            coarse_term_id = int(
+                self.coarse_indexer.coarse_tokens(
+                    torch.tensor([termination_token_id], device=device)
+                )[0].item()
+            )
+            q_coarse = self._get_q_packed(
+                self.q_mcmc_coarse_source, self._q_coarse_cache, device, coarse_vocab
+            )
+
+            if coarse_seq_w > 0.0:
+                seq_loss_c = self._coarse_sequence_loss(
+                    coarse_suffix,
+                    termination_token_id=coarse_term_id,
+                    q_packed=q_coarse,
+                    include_eos=self.coarse_seq_include_eos,
+                    normalize_by_len=self.coarse_seq_normalize_by_len,
+                    max_pos=self.coarse_seq_max_pos,
+                )
+                if seq_loss_c is None:
+                    self._warn_missing(
+                        "coarse_seq",
+                        "[SubTBMCMCPriorLoss] Missing coarse q_MCMC for sequence prior; skipping.",
+                    )
+                else:
+                    loss_total = loss_total + coarse_seq_w * seq_loss_c
+                    logs["loss_coarse_seq_prior"] = seq_loss_c.detach()
+
+            if coarse_kl_w > 0.0:
+                if policy_logits is None:
+                    self._warn_missing(
+                        "coarse_kl_logits",
+                        "[SubTBMCMCPriorLoss] policy_logits is None; coarse KL term skipped.",
+                    )
+                else:
+                    kl_c = self._coarse_kl_regularizer(
+                        coarse_suffix,
+                        policy_logits,
+                        termination_coarse_id=coarse_term_id,
+                        q_packed=q_coarse,
+                        projection=projection,
+                    )
+                    if kl_c is None:
+                        self._warn_missing(
+                            "coarse_kl_q",
+                            "[SubTBMCMCPriorLoss] Missing coarse q_MCMC for KL prior; skipping.",
+                        )
+                    else:
+                        loss_total = loss_total + coarse_kl_w * kl_c
+                        logs["loss_coarse_logits_kl"] = kl_c.detach()
+            if coarse_batch_kl_w > 0.0:
+                batch_kl_c = self._coarse_batch_distribution_kl(
+                    coarse_suffix,
+                    termination_id=coarse_term_id,
+                    q_packed=q_coarse,
+                    max_pos=self.coarse_batch_kl_max_pos,
+                )
+                if batch_kl_c is None:
+                    self._warn_missing(
+                        "coarse_batch_kl",
+                        "[SubTBMCMCPriorLoss] Missing coarse q_MCMC for batch KL; skipping.",
+                    )
+                else:
+                    loss_total = loss_total + coarse_batch_kl_w * batch_kl_c
+                    logs["loss_coarse_batch_kl"] = batch_kl_c.detach()
+        elif coarse_seq_w > 0.0 or coarse_kl_w > 0.0 or coarse_batch_kl_w > 0.0:
+            self._warn_missing(
+                "coarse_map",
+                "[SubTBMCMCPriorLoss] coarse_token_groups/token_to_coarse not provided; coarse terms skipped.",
+            )
+
+        if diversity_w > 0.0:
+            div_loss = self._entropy_bonus(
+                policy_logits=policy_logits,
+                termination_token_id=termination_token_id,
+                suffix=suffix,
+                max_pos=self.diversity_max_pos,
+            )
+            if div_loss is not None:
+                loss_total = loss_total + diversity_w * div_loss
+                logs["loss_diversity"] = div_loss.detach()
+
+        logs["loss"] = loss_total
+        return logs
+
+
+class SubTBBatchDiversityPriorLoss(SubTBBatchDiversityLoss):
+    """
+    Batch 多样性 + MCMC 先验（序列先验 + batch 位置先验 KL）。
+    """
+
+    def __init__(
+        self,
+        q_mcmc_path: Optional[str] = None,
+        q_mcmc: Optional[Dict[Tuple[int, ...], Dict[int, float]]] = None,
+        base_n: int = 2,
+        bos_id: int = -1,
+        seq_prior_weight: float = 0.0,
+        batch_prior_weight: float = 0.0,
+        batch_prior_max_pos: Optional[int] = None,
+        prior_temperature: float = 1.0,
+        subtb_lambda: float = 1.0,
+        balance: float = 0.0,
+        eps: float = 1e-8,
+        seq_diversity_weight: float = 0.0,
+        pos_diversity_weight: float = 0.0,
+        pos_max: Optional[int] = None,
+        use_logits: bool = False,
+    ):
+        super().__init__(
+            subtb_lambda=subtb_lambda,
+            balance=balance,
+            eps=eps,
+            seq_diversity_weight=seq_diversity_weight,
+            pos_diversity_weight=pos_diversity_weight,
+            pos_max=pos_max,
+            use_logits=use_logits,
+        )
+        self.q_mcmc_source = q_mcmc or self._load_prior(q_mcmc_path)
+        self.base_n = base_n
+        self.bos_id = bos_id
+        self.seq_prior_weight = seq_prior_weight
+        self.batch_prior_weight = batch_prior_weight
+        self.batch_prior_max_pos = batch_prior_max_pos
+        self.prior_temperature = prior_temperature
+        self._q_cache: dict[tuple[torch.device, int], Dict[Tuple[int, ...], torch.Tensor]] = {}
+
+    @staticmethod
+    def _load_prior(path: Optional[str]):
+        if path is None:
+            return None
+        try:
+            return load_q_mcmc(path)
+        except Exception:
+            return None
+
+    def _get_q_packed(
+        self,
+        source: Optional[Dict[Tuple[int, ...], Dict[int, float]]],
+        cache: dict[tuple[torch.device, int], Dict[Tuple[int, ...], torch.Tensor]],
+        device: torch.device,
+        vocab_size: int,
+    ) -> Optional[Dict[Tuple[int, ...], torch.Tensor]]:
+        if source is None:
+            return None
+        key = (device, vocab_size)
+        if key not in cache:
+            cache[key] = pack_q_mcmc_to_device(
+                source, vocab_size=vocab_size, device=device, eps=1e-8
+            )
+        return cache[key]
+
+    def _get_q_vec(
+        self, q_packed: Dict[Tuple[int, ...], torch.Tensor], context: Tuple[int, ...]
+    ) -> torch.Tensor:
+        h = context
+        while True:
+            if h in q_packed:
+                q = q_packed[h]
+                break
+            if len(h) == 0:
+                q = q_packed[()]
+                break
+            h = h[1:]
+        if self.prior_temperature == 1.0:
+            return q
+        q_temp = torch.pow(q, 1.0 / max(self.prior_temperature, 1e-8))
+        return q_temp / q_temp.sum().clamp_min(1e-8)
+
+    @staticmethod
+    def _ctx_tuple(row: torch.Tensor, t: int, n: int, bos: int) -> Tuple[int, ...]:
+        k = n - 1
+        if k <= 0:
+            return ()
+        ctx = []
+        for kk in range(k, 0, -1):
+            idx = t - kk
+            ctx.append(bos if idx < 0 else int(row[idx].item()))
+        return tuple(ctx)
+
+    def _sequence_prior(self, suffix: torch.Tensor, termination_token_id: int, q_packed):
+        if q_packed is None:
+            return None
+        B, L = suffix.shape
+        total = suffix.new_zeros(())
+        denom = suffix.new_zeros(())
+        for b in range(B):
+            row = suffix[b]
+            T_eff = L
+            pos = (row == termination_token_id).nonzero(as_tuple=False)
+            if pos.numel() > 0:
+                T_eff = int(pos[0].item())
+            logp = 0.0
+            for t in range(T_eff):
+                ctx = self._ctx_tuple(row, t, n=self.base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx)
+                w = int(row[t].item())
+                logp += float(torch.log(q_vec[w].clamp_min(1e-8)).item())
+            total = total + (-logp / max(1, T_eff))
+            denom = denom + 1.0
+        return total / denom.clamp_min(1.0)
+
+    def _batch_prior_kl(self, suffix: torch.Tensor, termination_token_id: int, q_packed):
+        if q_packed is None:
+            return None
+        B, L = suffix.shape
+        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
+        kl_acc = torch.zeros((), device=suffix.device, dtype=torch.float32)
+        kl_cnt = torch.zeros((), device=suffix.device, dtype=torch.float32)
+        limit = L if self.batch_prior_max_pos is None else min(L, int(self.batch_prior_max_pos))
+        vocab_size = next(iter(q_packed.values())).numel()
+        for t in range(limit):
+            mask = eos_cum[:, t] == 0
+            if not bool(mask.any()):
+                continue
+            toks = suffix[mask, t]
+            p_counts = torch.bincount(toks, minlength=vocab_size).to(torch.float32)
+            p = p_counts / p_counts.sum().clamp_min(1e-8)
+            q_list = []
+            idxs = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            for i in idxs:
+                row = suffix[i]
+                ctx = self._ctx_tuple(row, t, n=self.base_n, bos=self.bos_id)
+                q_vec = self._get_q_vec(q_packed, ctx).to(torch.float32)
+                q_list.append(q_vec)
+            q_avg = torch.stack(q_list, dim=0).mean(dim=0)
+            kl = (p * (p.add(1e-8).log() - q_avg.add(1e-8).log())).sum()
+            kl_acc = kl_acc + kl
+            kl_cnt = kl_cnt + 1.0
+        if kl_cnt.item() == 0:
+            return None
+        return kl_acc / kl_cnt.clamp_min(1.0)
+
+    def forward(
+        self,
+        log_pf: torch.Tensor,
+        log_r: torch.Tensor,
+        log_pterm: torch.Tensor,
+        generated_text: torch.Tensor,
+        termination_token_id: int,
+        prompt_len: int,
+        policy_logits: Optional[torch.Tensor] = None,
+        weight_overrides: Optional[dict] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        suffix = generated_text[:, prompt_len:]
+        device = log_pf.device
+        vocab_size = int(
+            max(
+                int(suffix.max().item()) + 1,
+                policy_logits.shape[-1] if policy_logits is not None else 0,
+            )
+        )
+        q_packed = self._get_q_packed(self.q_mcmc_source, self._q_cache, device, vocab_size)
+
+        out = super().forward(
+            log_pf=log_pf,
+            log_r=log_r,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=termination_token_id,
+            prompt_len=prompt_len,
+            policy_logits=policy_logits,
+            weight_overrides=weight_overrides,
+            **kwargs,
+        )
+        loss_total = out["loss"]
+
+        seq_prior_w = self._resolve_weight(
+            "seq_prior_weight", self.seq_prior_weight, weight_overrides
+        )
+        batch_prior_w = self._resolve_weight(
+            "batch_prior_weight", self.batch_prior_weight, weight_overrides
+        )
+
+        if seq_prior_w > 0.0:
+            seq_prior = self._sequence_prior(suffix, termination_token_id, q_packed)
+            if seq_prior is not None:
+                loss_total = loss_total + seq_prior_w * seq_prior
+                out["loss_seq_prior"] = seq_prior.detach()
+
+        if batch_prior_w > 0.0:
+            batch_kl = self._batch_prior_kl(suffix, termination_token_id, q_packed)
+            if batch_kl is not None:
+                loss_total = loss_total + batch_prior_w * batch_kl
+                out["loss_batch_prior_kl"] = batch_kl.detach()
+
+        out["loss"] = loss_total
+        return out

@@ -39,7 +39,7 @@ model:
     min_sentence_len: 2
     max_sentence_len: 5
     grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
-    apply_grammar: true
+    disable_grammar: false
     processor_type: "prefix"
     parse_mode: "full"  # can be "full" or "limited"
 

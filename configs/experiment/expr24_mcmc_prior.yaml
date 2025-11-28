@@ -1,7 +1,7 @@
 # @package _global_
 
-# Debug experiment for 24-points task
-# Run with: python chemgfn/train.py experiment=debug_expr24
+# Sequence + logits regularized SubTB with MCMC priors to mitigate prefix collapse.
+# Run with: python chemgfn/train.py experiment=expr24_mcmc_prior
 
 defaults:
   - override /data: expr24
@@ -9,29 +9,73 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "baseline", "expr24"]
+tags: ["ChemGFN", "expr24", "mcmc_prior"]
 
-exp_name: "baseline_expr24"
+exp_name: "expr24_mcmc_prior"
 seed: 42
 
-# ============================================================================
-# Trainer Configuration
-# ============================================================================
 trainer:
-  max_steps: 60000
+  max_epochs: 150
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
 
-# ============================================================================
-# Model Overrides (only parameters that differ from base config)
-# ============================================================================
 model:
+  loss_fn:
+    _target_: chemgfn.models.losses.SubTBMCMCPriorLoss
+    subtb_lambda: 1.0
+    balance: 0.0
+    eps: 1e-8
+    base_n: 2
+    bos_id: -1
+    vocab_size: null
+    # Fine-grained priors
+    q_mcmc_path: ${paths.data_dir}/24_points/q_mcmc_bigram.pkl.gz
+    seq_weight: 0.1
+    seq_include_eos: false
+    seq_normalize_by_len: false
+    seq_max_pos: 2
+    kl_weight: 0.1
+    kl_max_pos: 2
+    kl_temperature: 1.0
+    prior_temperature: 1.0
+    # Coarse-grained priors (digits vs ops vs other)
+    coarse_q_mcmc_path: ${paths.data_dir}/24_points/q_mcmc_coarse_bigram.pkl.gz
+    coarse_seq_weight: 0.05
+    coarse_seq_include_eos: false
+    coarse_seq_normalize_by_len: false
+    coarse_seq_max_pos: 2
+    coarse_kl_weight: 0.05
+    coarse_kl_max_pos: 2
+    coarse_ngram_n: 2
+    coarse_prior_temperature: 1.0
+    coarse_default_id: 2
+    batch_kl_weight: 0.05
+    batch_kl_max_pos: 2
+    coarse_batch_kl_weight: 0.05
+    coarse_batch_kl_max_pos: 2
+    diversity_weight: 0.2
+    diversity_max_pos: 2
+    token_to_coarse:
+      15: 0
+      16: 0
+      17: 0
+      18: 0
+      19: 0
+      20: 0
+      21: 0
+      22: 0
+      23: 0
+      24: 0
+      9: 1
+      10: 1
+      12: 1
+      14: 1
+
+  # Keep the remaining settings identical to baseline
   optimizer:
-    _target_: torch.optim.AdamW
-    _partial_: true
     lr: 0.0001
 
   reward:
@@ -40,15 +84,10 @@ model:
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
     illegal_vocab_penalty: -80
-    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+    grammar_disagree_penalty: 0
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
       amortize_valid_state: false
-
-  loss_fn:
-    _target_: chemgfn.models.losses.ModifiedSubTBLoss
-    subtb_lambda: 1.0
-    eps: 1e-8
 
   reward_config:
     reward_temp_start: 2
@@ -81,7 +120,7 @@ model:
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
     n_samples: 8
-    buffer_mixture_ratio: 0.5
+    buffer_mixture_ratio: 1.0
     skip_baseline_sampling: true
     opt_task: false
 
@@ -95,15 +134,15 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.25
-      end: 0.0
+      start: 0.2
+      end: 0.5
       horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
-      horizon: 25000
+      start: 0.8
+      end: 0.1
+      horizon: 50000
     alpha_reference:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
@@ -114,7 +153,7 @@ model:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.0
-      end: 1.0
+      end: 0.0
       horizon: 50000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
@@ -122,17 +161,35 @@ model:
       start: 1
       end: 1
       horizon: 50000
+    seq_weight:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.1
+      end: 0.05
+      horizon: 20000
+    batch_kl_weight:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.05
+      end: 0.05
+      horizon: 1
+    coarse_batch_kl_weight:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.05
+      end: 0.05
+      horizon: 1
+    diversity_weight:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.2
+      end: 0.0
+      horizon: 5000
 
-# ============================================================================
-# Data Configuration
-# ============================================================================
 data:
   num_workers: 8
 
-# ============================================================================
-# Logger Configuration
-# ============================================================================
 logger:
   wandb:
     project: "ChemGFN"
-    offline: false
+    offline: true

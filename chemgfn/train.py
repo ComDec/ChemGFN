@@ -1,9 +1,11 @@
 import os
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import lightning as L
 import rootutils
+from hydra.core.hydra_config import HydraConfig
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
@@ -37,6 +39,12 @@ from chemgfn.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+# Support --debug flag (strip before Hydra parses args)
+DEBUG_FLAG = False
+if "--debug" in sys.argv:
+    sys.argv.remove("--debug")
+    DEBUG_FLAG = True
 
 
 @task_wrapper
@@ -121,6 +129,20 @@ def main(cfg: DictConfig) -> Optional[float]:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     extras(cfg)
+
+    # If --debug flag is set, apply debug-friendly defaults unless explicitly overridden
+    if DEBUG_FLAG:
+        hydra_overrides = HydraConfig.get().overrides.task
+
+        def _has_override(prefix: str) -> bool:
+            return any(item.startswith(prefix) for item in hydra_overrides)
+
+        if not _has_override("logger.wandb.offline"):
+            cfg.logger.wandb.offline = True
+        if not _has_override("exp_name"):
+            cfg.exp_name = "debug"
+        if not _has_override("trainer.devices"):
+            cfg.trainer.devices = 1
 
     # train the model
     metric_dict, _ = train(cfg)

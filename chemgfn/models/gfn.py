@@ -128,6 +128,14 @@ class ChemGFNModule(LightningModule):
 
         # Initialize loss function from config
         self.loss_fn: GFNLoss = loss_fn
+        self.return_policy_logits = bool(getattr(self.loss_fn, "requires_policy_logits", False))
+
+        # Optional: loss weight schedulers（直接复用 factor_schedulers，由具体 loss 自行取用）
+        self.loss_weight_schedulers = dict(self.factor_schedulers)
+        if hasattr(self.loss_fn, "set_weight_schedulers"):
+            self.loss_fn.set_weight_schedulers(self.loss_weight_schedulers)
+
+        self.return_policy_logits = True
 
         if hasattr(self.loss_fn, "set_alpha_reference"):
             self.loss_fn.set_alpha_reference(self.get_alpha_reference_at_step(self.global_step))
@@ -206,6 +214,8 @@ class ChemGFNModule(LightningModule):
             "use_buffer_sample": use_buffer_sample,
             "buffer_sample": buffer_sample,
             "buffer_mixture_ratio": buffer_mixture_ratio,
+            "return_policy_logits": self.return_policy_logits,
+            "disable_grammar": getattr(self.constraint_config, "disable_grammar", False),
         }
 
         generator = (
@@ -223,6 +233,7 @@ class ChemGFNModule(LightningModule):
         encoded_prompt = item["encoded_prompt"]
         prompt_len = encoded_prompt.shape[-1]
         buffer_sample = item["buffer_encoded_sample"]
+        use_dataset_buffer = False
 
         # Buffer 1: Try to use replay buffer
         if random.random() <= self.get_replay_buffer_at_step(self.global_step):
@@ -266,6 +277,7 @@ class ChemGFNModule(LightningModule):
         model_log_r = result_dict["log_r"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
+        policy_logits = result_dict.get("policy_logits")
 
         if use_replay_buffer:
             log_r = model_log_r[:, : max(0, generated_text.shape[1] - prompt_len)]
@@ -290,8 +302,19 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
             on_step=True,
         )
+        if not use_replay_buffer or not use_dataset_buffer:
+            self._log_agreement_metrics(agree_list)
 
-        self._log_agreement_metrics(agree_list)
+        if hasattr(self.loss_fn, "set_global_step"):
+            self.loss_fn.set_global_step(self.global_step)
+        weight_overrides = None
+        if getattr(self, "loss_weight_schedulers", None):
+            # Evaluate all loss-weight schedulers at the current step so losses can
+            # resolve their weights without reaching back into the module.
+            weight_overrides = {
+                name: sched(self.global_step)
+                for name, sched in self.loss_weight_schedulers.items()
+            }
 
         loss_output = self.loss_fn(
             log_pf=log_pf,
@@ -302,6 +325,9 @@ class ChemGFNModule(LightningModule):
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
+            policy_logits=policy_logits,
+            global_step=self.global_step,
+            weight_overrides=weight_overrides,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -340,8 +366,21 @@ class ChemGFNModule(LightningModule):
                 self.tokenizer,
                 item.get("molecule", None),
             )
+            acc_val = acc["acc"] if isinstance(acc, dict) and "acc" in acc else float(acc)
             self.train_samples.append(
-                f"{decoded}: pf_temp={pf_temp:.2f}, logP={log_ps[0].item():.2f}, valid={acc}"
+                {
+                    "decoded": decoded,
+                    "pf_temp": float(pf_temp),
+                    "logP": float(log_ps[0].item()),
+                    "logR": float(last_log_r[0].item()),
+                    "log_pf_list": [float(x) for x in log_pf[0].detach().cpu().tolist()],
+                    "log_r_list": [float(x) for x in log_r[0].detach().cpu().tolist()],
+                    "valid": float(acc_val),
+                    "buffer": bool(use_replay_buffer or use_dataset_buffer),
+                    "source": "replay"
+                    if use_replay_buffer
+                    else ("dataset" if use_dataset_buffer else "online"),
+                }
             )
 
             replay_buffer_stats = self.reward_buffer.stat()
@@ -401,8 +440,17 @@ class ChemGFNModule(LightningModule):
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
+        policy_logits = result_dict.get("policy_logits")
         self.val_samples.extend(generated_text[:, prompt_len:].tolist())
 
+        if hasattr(self.loss_fn, "set_global_step"):
+            self.loss_fn.set_global_step(self.global_step)
+        weight_overrides = None
+        if getattr(self, "loss_weight_schedulers", None):
+            weight_overrides = {
+                name: sched(self.global_step)
+                for name, sched in self.loss_weight_schedulers.items()
+            }
         loss_output = self.loss_fn(
             log_pf=log_pf,
             log_r=log_r,  # compatibility with old loss functions
@@ -412,6 +460,9 @@ class ChemGFNModule(LightningModule):
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
+            policy_logits=policy_logits,
+            global_step=self.global_step,
+            weight_overrides=weight_overrides,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -479,7 +530,11 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
 
     def on_train_epoch_end(self):
-        df = pd.DataFrame(self.train_samples, columns=["Sampled sentence"])
+        if self.train_samples:
+            df = pd.DataFrame(self.train_samples)
+            df = df.sort_values(by="buffer", ascending=False).reset_index(drop=True)
+        else:
+            df = pd.DataFrame(columns=["decoded", "pf_temp", "logP", "valid", "buffer", "source"])
         df.to_csv(
             os.path.join(
                 self.trainer.default_root_dir,
@@ -927,13 +982,14 @@ class ChemGFNModule(LightningModule):
         if len(tensors) == 0:
             return
 
-        agree_sum = [torch.mean(x.sum(-1).float()).item() for x in tensors]
-        mid_index = len(agree_sum) // 2
+        agree_means = [torch.mean(x.sum(-1).float()) for x in tensors]
+        mid_index = len(tensors) // 2
+
         metrics = {
-            "train/agree_mean": torch.tensor(agree_sum, device=self.device).mean(),
-            "train/agree_start": torch.tensor(agree_sum[0], device=self.device),
-            "train/agree_midd": torch.tensor(agree_sum[mid_index], device=self.device),
-            "train/agree_end": torch.tensor(agree_sum[-1], device=self.device),
+            "train/agree_mean": torch.stack(agree_means).mean(),
+            "train/agree_start": agree_means[0],
+            "train/agree_midd": agree_means[mid_index],
+            "train/agree_end": agree_means[-1],
         }
         self._log_metrics(metrics, on_step=True, sync_dist=True)
 
