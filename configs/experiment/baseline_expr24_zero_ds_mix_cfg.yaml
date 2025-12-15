@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "baseline", "expr24", "disable_cfg", "dataset_buffer_mix"]
+tags: ["ChemGFN", "baseline", "expr24", "cfg", "dataset_buffer_mix"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "baseline_expr24_zero_disable_cfg_ds_mix_0.5_start_1.0_fix"
+exp_name: "baseline_expr24_zero_cfg_ds_mix_0.5_start_1.0_fix"
 seed: 42
 
 # ============================================================================
@@ -70,7 +70,7 @@ model:
     min_sentence_len: 1
     max_sentence_len: 7
     grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
-    disable_grammar: true
+    disable_grammar: false
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
     illegal_vocab_penalty: -50

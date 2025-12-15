@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.utils  # type: ignore
-import torch.utils.data  # type: ignore
+import torch.utils
+import torch.utils.data
 from lightning import LightningModule
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
@@ -74,11 +74,20 @@ class ChemGFNModule(LightningModule):
 
         self.save_hyperparameters(ignore=["net", "loss_fn"])
         model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
+        model.train()
+
+        model_frozen = AutoModelForCausalLM.from_pretrained(
+            net_config.pretrained_model_name_or_path
+        )
+        model_frozen.eval()
+        model_frozen.requires_grad_(False)
+
         if not disable_peft:
             self.net = get_peft_model(model, lora_config)
         else:
             self.net = model
 
+        self.net_frozen = model_frozen
         self.tokenizer = tokenizer
 
         self.reward_config = reward_config
@@ -96,6 +105,8 @@ class ChemGFNModule(LightningModule):
         self.get_alpha_reference_at_step = self.factor_schedulers["alpha_reference"]
         self.get_replay_buffer_at_step = self.factor_schedulers["replay_buffer"]
         self.get_dataset_buffer_at_step = self.factor_schedulers["dataset_buffer"]
+        self.get_pf_temp_low_at_step = getattr(self.factor_schedulers, "pf_temp_low", None)
+        self.get_pf_temp_high_at_step = getattr(self.factor_schedulers, "pf_temp_high", None)
 
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
@@ -143,6 +154,9 @@ class ChemGFNModule(LightningModule):
         try:
             if self.compile:
                 self.net = torch.compile(self.net, mode="max-autotune", fullgraph=False)
+                self.net_frozen = torch.compile(
+                    self.net_frozen, mode="max-autotune", fullgraph=False
+                )
         except Exception as exc:  # pragma: no cover - defensive logging
             print(f"torch.compile failed, continuing without compilation: {exc}")
 
@@ -196,7 +210,7 @@ class ChemGFNModule(LightningModule):
             "reward_fn": partial(
                 self.reward.score,
                 prompt_length=encoded_prompt.shape[1],
-                model=self.net,
+                model=self.net_frozen,
                 tokenizer=self.tokenizer,
             ),
             "termination_token_id": self.end_of_sentence_token_id,
@@ -274,10 +288,13 @@ class ChemGFNModule(LightningModule):
         log_pterm = result_dict["log_pterm"]
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
+
+        log_pf_ref = result_dict["log_pf_ref"]
+        log_pterm_ref = result_dict["log_pterm_ref"]
+
         model_log_r = result_dict["log_r"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
-        policy_logits = result_dict.get("policy_logits")
 
         if use_replay_buffer:
             log_r = model_log_r[:, : max(0, generated_text.shape[1] - prompt_len)]
@@ -325,7 +342,6 @@ class ChemGFNModule(LightningModule):
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            policy_logits=policy_logits,
             global_step=self.global_step,
             weight_overrides=weight_overrides,
         )
@@ -367,14 +383,20 @@ class ChemGFNModule(LightningModule):
                 item.get("molecule", None),
             )
             acc_val = acc["acc"] if isinstance(acc, dict) and "acc" in acc else float(acc)
+
             self.train_samples.append(
                 {
                     "decoded": decoded,
                     "pf_temp": float(pf_temp),
+                    "reward_temp": float(self.reward.temperature),
                     "logP": float(log_ps[0].item()),
                     "logR": float(last_log_r[0].item()),
                     "log_pf_list": [float(x) for x in log_pf[0].detach().cpu().tolist()],
                     "log_r_list": [float(x) for x in log_r[0].detach().cpu().tolist()],
+                    "log_pf_ref_list": [float(x) for x in log_pf_ref[0].detach().cpu().tolist()],
+                    "log_pterm_ref_list": [
+                        float(x) for x in log_pterm_ref[0].detach().cpu().tolist()
+                    ],
                     "valid": float(acc_val),
                     "buffer": bool(use_replay_buffer or use_dataset_buffer),
                     "source": "replay"
@@ -395,10 +417,6 @@ class ChemGFNModule(LightningModule):
 
         self._log_metrics(
             {
-                "train/dataset_buffer_ratio": torch.tensor(
-                    self.get_dataset_buffer_at_step(self.global_step),
-                    device=self.device,
-                ),
                 "train/reward_var": log_r.var(dim=0).mean(),
                 "train/loss": (loss, {"prog_bar": True}),
             },
@@ -437,10 +455,12 @@ class ChemGFNModule(LightningModule):
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
         log_r = result_dict["log_r"]
+        log_pf_ref = result_dict["log_pf_ref"]
+        log_pterm_ref = result_dict["log_pterm_ref"]
+
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
-        policy_logits = result_dict.get("policy_logits")
         self.val_samples.extend(generated_text[:, prompt_len:].tolist())
 
         if hasattr(self.loss_fn, "set_global_step"):
@@ -460,7 +480,6 @@ class ChemGFNModule(LightningModule):
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            policy_logits=policy_logits,
             global_step=self.global_step,
             weight_overrides=weight_overrides,
         )
@@ -518,8 +537,6 @@ class ChemGFNModule(LightningModule):
         lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
         self.reward.scaling_factor = scaling_factor
-
-        self.log("train/scaling_factor", scaling_factor, sync_dist=True, on_step=True)
         self.log("train/reward_temp", reward_temp, sync_dist=True, on_step=True)
 
         for pg in self.optimizers().param_groups:
@@ -700,7 +717,8 @@ class ChemGFNModule(LightningModule):
                 log_r_unpenalized = result_dict["log_r_unpenalized"]
                 log_pf = result_dict["log_pf"]
                 log_pterm = result_dict["log_pterm"]
-                log_pf_ref = result_dict.get("log_pf_ref", None)
+                log_pf_ref = result_dict["log_pf_ref"]
+                log_pterm_ref = result_dict["log_pterm_ref"]
 
             log_ps, log_ps_unpenalized = get_termination_vals(
                 generated_text=generated_text,
@@ -727,11 +745,14 @@ class ChemGFNModule(LightningModule):
                 samples.append(
                     {
                         "Sampled sentence": sequence,
-                        "logPf": log_pf[idx].tolist(),
-                        "logPf_ref": log_pf_ref[idx].tolist() if log_pf_ref is not None else [],
-                        "logPterm": log_pterm[idx].tolist(),
-                        "logR": log_r[idx].tolist(),
-                        "logR unpenalized": log_r_unpenalized[idx].tolist(),
+                        "log_pf": log_pf[idx].tolist(),
+                        "log_pterm": log_pterm[idx].tolist(),
+                        "log_pf_ref": log_pf_ref[idx].tolist() if log_pf_ref is not None else [],
+                        "log_pterm_ref": log_pterm_ref[idx].tolist()
+                        if log_pterm_ref is not None
+                        else [],
+                        "log_r": log_r[idx].tolist(),
+                        "log_r_unpenalized": log_r_unpenalized[idx].tolist(),
                     }
                 )
         return pd.DataFrame(samples)
@@ -869,6 +890,7 @@ class ChemGFNModule(LightningModule):
     def setup(self, stage: str) -> None:
         if self.compile and stage == "fit":
             self.net = torch.compile(self.net)
+            self.net_frozen = torch.compile(self.net_frozen)
 
     def configure_optimizers(self) -> dict[str, Any]:
         optimizer = self.optimizer(params=self.trainer.model.parameters())
@@ -935,12 +957,14 @@ class ChemGFNModule(LightningModule):
         )
 
     def _setup_grammar_processors(self):
-        if not getattr(self.constraint_config, "apply_grammar", False):
-            self.string_grammar = None
-            self.grammar = None
-            self.pre_grammar_processor = None
-            self.grammar_processor = None
-            return
+        # we have a elegant way to disable grammar, but it is not used in the code
+
+        # if not getattr(self.constraint_config, "apply_grammar", False):
+        #     self.string_grammar = None
+        #     self.grammar = None
+        #     self.pre_grammar_processor = None
+        #     self.grammar_processor = None
+        #     return
 
         with open(self.constraint_config.grammar_path) as file:
             grammar_str = file.read()
@@ -994,10 +1018,19 @@ class ChemGFNModule(LightningModule):
         self._log_metrics(metrics, on_step=True, sync_dist=True)
 
     def _sample_pf_temperature(self) -> float:
+        if self.get_pf_temp_low_at_step is None or self.get_pf_temp_high_at_step is None:
+            pf_low = self.training_mixed_config.pf_temp_low
+            pf_high = self.training_mixed_config.pf_temp_high
+        else:
+            pf_low = self.get_pf_temp_low_at_step(self.global_step)
+            pf_high = self.get_pf_temp_high_at_step(self.global_step)
+
         if random.random() >= self.training_mixed_config.pf_temp_prob:
             return 1.0
-        pf_low = self.training_mixed_config.pf_temp_low
-        pf_high = self.training_mixed_config.pf_temp_high
+        if pf_high < pf_low:
+            pf_low, pf_high = pf_high, pf_low
+        if pf_high == pf_low:
+            return pf_high
         return random.random() * (pf_high - pf_low) + pf_low
 
     def generate_from_replay_buffer(self, item, encoded_prompt):

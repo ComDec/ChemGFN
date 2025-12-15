@@ -142,7 +142,6 @@ def generate_and_return_termination_logprob(
     buffer_sample=None,
     buffer_mixture_ratio=0.5,
     disable_grammar: bool = False,
-    return_policy_logits: bool = False,
     **kwargs,
 ):
     """Generate sequences using the model and compute termination log probabilities.
@@ -212,13 +211,10 @@ def generate_and_return_termination_logprob(
     if use_buffer_sample and buffer_sample is not None:
         nums_replace = max(1, int(encoded_prompt.size(0) * buffer_mixture_ratio))
 
-    policy_logits: list[torch.Tensor] = []
-
     for step in range(max_len + 1):
         output = model(input_ids=token_ids, past_key_values=past_key_values)
         past_key_values = output.past_key_values
         logits = output.logits[:, -1, :]
-        logits_to_record = None
 
         if action_seq is None:
             scores = logits.clone().detach()
@@ -245,10 +241,6 @@ def generate_and_return_termination_logprob(
                 mask[:, termination_token_id] = False
                 modified_logits[mask] = -torch.inf
                 modified_logits[:, termination_token_id] = 0
-
-            if return_policy_logits:
-                delta = modified_logits - scores
-                logits_to_record = logits + delta
 
             prob = (modified_logits / temperature).softmax(dim=-1)
             token_ids = torch.multinomial(prob, num_samples=1)
@@ -278,8 +270,6 @@ def generate_and_return_termination_logprob(
                     agree_entries.append(
                         vocab_nice_mask.unsqueeze(0).repeat(token_ids.size(0), 1).to(device)
                     )
-            if return_policy_logits:
-                logits_to_record = logits
 
         inactive_tokens = token_ids.new_full(token_ids.shape, termination_token_id)
         token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, inactive_tokens)
@@ -303,12 +293,8 @@ def generate_and_return_termination_logprob(
 
         state = torch.cat([state, token_ids], dim=-1)
 
-        if return_policy_logits:
-            policy_logits.append(logits if logits_to_record is None else logits_to_record)
-
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
-    policy_logits_tensor = torch.stack(policy_logits, dim=1) if return_policy_logits else None
 
     log_r = None
     log_r_unpenalized = None
@@ -328,14 +314,20 @@ def generate_and_return_termination_logprob(
             agree_list=agree_tensor,
             termination_token_id=termination_token_id,
             target_molecule=target_molecule,
+            action_seq=action_seq,
         )
 
         if isinstance(reward_results, dict):
+            # tensors
             log_r = reward_results["reward"]
             log_r_unpenalized = reward_results["reward_unpenalized"]
             log_pf_ref = reward_results.get("log_pf_ref")
+            log_pterm_ref = reward_results.get("log_pterm_ref")
+
+            # auxiliary information
             full_tokens = reward_results.get("full_tokens")
             validator_dict = reward_results.get("validator_dict")
+
             # if you use split reward and loss
             log_r_reference = reward_results.get("reward_reference", None)
             log_r_target = reward_results.get("reward_target", None)
@@ -350,11 +342,11 @@ def generate_and_return_termination_logprob(
         "log_r_unpenalized": log_r_unpenalized,
         "log_r_reference": log_r_reference,
         "log_r_target": log_r_target,
-        "agree_list": agree_entries,
         "log_pf_ref": log_pf_ref,
+        "log_pterm_ref": log_pterm_ref,
+        "agree_list": agree_entries,
         "full_tokens": full_tokens,
         "validator_dict": validator_dict,
-        "policy_logits": policy_logits_tensor,
     }
 
 

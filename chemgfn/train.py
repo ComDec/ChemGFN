@@ -137,12 +137,9 @@ def main(cfg: DictConfig) -> Optional[float]:
         def _has_override(prefix: str) -> bool:
             return any(item.startswith(prefix) for item in hydra_overrides)
 
-        if not _has_override("logger.wandb.offline"):
-            cfg.logger.wandb.offline = True
-        if not _has_override("exp_name"):
-            cfg.exp_name = "debug"
-        if not _has_override("trainer.devices"):
-            cfg.trainer.devices = 1
+        cfg.logger.wandb.offline = True
+        cfg.exp_name = "debug"
+        cfg.trainer.devices = 1
 
     # train the model
     metric_dict, _ = train(cfg)

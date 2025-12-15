@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "baseline", "expr24", "disable_cfg", "dataset_buffer_mix"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "baseline_expr24_zero_disable_cfg_ds_mix_0.5_start_1.0_fix"
+exp_name: "baseline_expr24_zero_disable_cfg_ds_mix_0.5_start_1.0_fix_overfit_replay_aug_1.0_amo"
 seed: 42
 
 # ============================================================================
@@ -44,7 +44,7 @@ model:
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
-      amortize_valid_state: false
+      amortize_valid_state: true
 
   loss_fn:
     _target_: chemgfn.models.losses.ModifiedSubTBLoss
@@ -64,7 +64,7 @@ model:
     buffer_size: 200
     sim_tolerance: 0.25
     strict_mode: false
-    buffer_aug_value: 0.0
+    buffer_aug_value: 10
 
   constraint_config:
     min_sentence_len: 1
@@ -96,14 +96,14 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.25
-      end: 0.0
+      start: 0.5
+      end: 0.5
       horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.0
-      end: 0.0
+      end: 1.0
       horizon: 25000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler

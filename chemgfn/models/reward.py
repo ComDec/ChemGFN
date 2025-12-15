@@ -152,6 +152,8 @@ def score_fast(
         logits = model(encoded_input, past_key_values=batched_cache).logits
 
     logits = logits.detach()[:, skip_first - 1 :]
+
+    # TODO: remove all penalty from the logits
     if invalid_vocab_mask is not None:
         logits = logits.clone()
         logits[:, :, invalid_vocab_mask] += illegal_vocab_penalty
@@ -189,7 +191,11 @@ def score_fast(
     reward = reward.clone()
     reward[~non_term_mask] = 0.0
 
-    return reward, reward.clone()
+    return {
+        "ref_log_pf": log_pf,
+        "ref_log_pterm": logprob[:, :, termination_token_id],
+        "reward": reward,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -724,6 +730,155 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         reference_logits_scale: float = 0.5,
         target_molecule: str | None = None,
         agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        reference_results = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        validator_dict = None
+        reward_mixed = reference_results["reward"]
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"]
+            scaled_reference_logits = reward_mixed * reference_logits_scale
+            max_sum_logpf = torch.abs(scaled_reference_logits)[..., -1].unsqueeze(-1)
+            reward_mixed = scaled_reference_logits + scaling_factor * max_sum_logpf * valid_score
+            reward_penalized = reward_mixed
+        else:
+            reward_penalized = reward_mixed
+
+        return {
+            "reward": reward_penalized,
+            "reward_unpenalized": reward_mixed,
+            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+class Target_Score_Positive:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator | None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        disable_peft: bool = False,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        **kwargs,
+    ) -> None:
+        """Initialize reward class with penalty values."""
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.disable_peft = disable_peft
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        reference_results = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        validator_dict = None
+        reward_unpenalized = reference_results["reward"]
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"]
+            reward_penalized = valid_score
+
+        else:
+            reward_penalized = reward_unpenalized
+
+        return {
+            "reward": reward_penalized,
+            "reward_unpenalized": reward_unpenalized,
+            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask_Entropy:
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator | None,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
+        disable_peft: bool = False,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        **kwargs,
+    ) -> None:
+        """Initialize reward class with penalty values."""
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+
+        self.invalid_start_ratio = invalid_start_ratio
+        self.invalid_end_ratio = invalid_end_ratio
+        self.disable_peft = disable_peft
+        self.temperature = 1.0
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         with use_base_model(model, disable_peft=self.disable_peft):
@@ -747,18 +902,30 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
                 input_batch[:, prompt_length:], tokenizer, target_molecule
             )
             valid_score = validator_dict["valid_score"]
-            max_sum_logpf = torch.max(abs(reference_logits), dim=-1).values.unsqueeze(-1)
-            reward_mixed = (
-                reference_logits * reference_logits_scale
-                + scaling_factor * max_sum_logpf * valid_score
-            )
-            reward_penalized = reward_mixed
-        else:
-            reward_penalized = reward_mixed
+            scaled_reference_logits = reference_logits * reference_logits_scale
+            max_sum_logpf = torch.abs(scaled_reference_logits)[..., -1].unsqueeze(-1)
+            reward_mixed = scaled_reference_logits + scaling_factor * max_sum_logpf * valid_score
+        # Add entropy over the generated sentence tokens to encourage diversity
+        sentences = input_batch[:, prompt_length:]
+        entropies: list[Tensor] = []
+        eos_token_id = tokenizer.eos_token_id
+        for seq in sentences:
+            # Trim at EOS to avoid padding impact
+            eos_positions = (seq == eos_token_id).nonzero(as_tuple=False)
+            end_idx = eos_positions[0, 0].item() if eos_positions.numel() > 0 else seq.size(0)
+            trimmed = seq[:end_idx]
+            unique_tokens, counts = torch.unique(trimmed, return_counts=True)
+            probs = counts.float() / counts.sum().clamp(min=1e-12)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-12))
+            entropies.append(entropy)
+        entropy_tensor = torch.stack(entropies, dim=0).unsqueeze(-1)
+
+        reward = reward_mixed + entropy_tensor * valid_score
+        reward_unpenalized = scaled_reference_logits
 
         return {
-            "reward": reward_penalized,
-            "reward_unpenalized": reward_mixed,
+            "reward": reward,
+            "reward_unpenalized": reward_unpenalized,
             "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
             "log_pf_ref": reference_logits,
             "validator_dict": validator_dict,

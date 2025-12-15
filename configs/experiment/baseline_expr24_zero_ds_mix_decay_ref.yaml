@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "baseline", "expr24", "disable_cfg", "dataset_buffer_mix", "decay_ref"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "baseline_expr24_zero_disable_cfg_ds_mix_0.5_start_1.0_decay_ref"
+exp_name: "baseline_expr24_zero_disable_cfg_ds_mix_0.5_start_1.0_decay_ref_fix"
 seed: 42
 
 # ============================================================================
@@ -24,7 +24,7 @@ trainer:
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
-  devices: 1
+  devices: 4
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
