@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
 import re
+from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -13,6 +16,11 @@ from rdkit import Chem, RDLogger
 from torch import Tensor
 from transformers import PreTrainedTokenizer
 
+from chemgfn.models.mcmc_prior import (
+    _get_q_vec_with_backoff,
+    load_q_mcmc,
+    pack_q_mcmc_to_device,
+)
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
 from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING, verify_smiles, verify_smiles_pa
 
@@ -176,9 +184,8 @@ def score_fast(
     log_pf = logprob[:, :-1].gather(-1, token_ids).squeeze(-1)
     log_p = log_pf.cumsum(dim=-1)
 
-    reward = logprob[:, :, termination_token_id]
-    reward[:, 1:] += log_p
-
+    reward = logprob[:, :, termination_token_id].clone()
+    reward[:, 1:] = reward[:, 1:] + log_p
     non_term_mask = (encoded_input != termination_token_id)[:, skip_first:]
     non_term_mask = torch.cat(
         (
@@ -706,6 +713,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         disable_peft: bool = False,
         illegal_vocab_penalty: float = -99,
         grammar_disagree_penalty: float = -99,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
         **kwargs,
     ) -> None:
         """Initialize reward class with penalty values."""
@@ -717,6 +725,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         self.invalid_end_ratio = invalid_end_ratio
         self.disable_peft = disable_peft
         self.temperature = 1.0
+        self.score_function = score_function
 
     def score(
         self,
@@ -733,7 +742,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         action_seq: Tensor | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        reference_results = score_fast(
+        reference_results = eval(self.score_function)(
             model=model,
             encoded_input=input_batch,
             termination_token_id=tokenizer.eos_token_id,
@@ -746,7 +755,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         )
 
         validator_dict = None
-        reward_mixed = reference_results["reward"]
+        reference_logP = reference_results["reward"]
         ref_log_pf = reference_results["ref_log_pf"]
         ref_log_pterm = reference_results["ref_log_pterm"]
 
@@ -755,9 +764,12 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
                 input_batch[:, prompt_length:], tokenizer, target_molecule
             )
             valid_score = validator_dict["valid_score"]
-            scaled_reference_logits = reward_mixed * reference_logits_scale
-            max_sum_logpf = torch.abs(scaled_reference_logits)[..., -1].unsqueeze(-1)
-            reward_mixed = scaled_reference_logits + scaling_factor * max_sum_logpf * valid_score
+            reward_mixed = (
+                reference_logP
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + scaling_factor * valid_score
+            )
+
             reward_penalized = reward_mixed
         else:
             reward_penalized = reward_mixed
@@ -801,8 +813,6 @@ class Target_Score_Positive:
         tokenizer: PreTrainedTokenizer,
         reward_temperature: float = 1.0,
         vocab_invalid_mask=None,
-        scaling_factor: float = 0.5,
-        reference_logits_scale: float = 0.5,
         target_molecule: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
@@ -829,9 +839,16 @@ class Target_Score_Positive:
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, target_molecule
             )
-            valid_score = validator_dict["valid_score"]
-            reward_penalized = valid_score
+            global_score = validator_dict["global_score"].bool()  # [B]
 
+            # Keep intermediate steps as reference reward; only shape terminal step per SubTB design
+            reward_penalized = reward_unpenalized.clone()
+            terminal_idx = reward_penalized.shape[1] - 1
+            eps = 1e-6
+            reward_penalized[global_score, terminal_idx] = 0.0  # log(1) for valid
+            reward_penalized[~global_score, terminal_idx] = torch.log(
+                torch.full_like(reward_penalized[~global_score, terminal_idx], eps)
+            )
         else:
             reward_penalized = reward_unpenalized
 
@@ -841,6 +858,127 @@ class Target_Score_Positive:
             "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
             "log_pf_ref": ref_log_pf,
             "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+class Target_Score_Positive_MCMCPrior:
+    """
+    Reward that uses an n-gram MCMC prior q(x) (trained offline) to supply dense log_r,
+    while shaping only the terminal step based on Expr24 validity/length.
+
+    - Middle steps: log_r is log q(token | context) from the prior (with backoff).
+    - Terminal step: if first EOS arrives after exactly target_length generated tokens,
+      set log_r to 0 (log(1)); otherwise set to log_eps (strong penalty).
+    """
+
+    def __init__(
+        self,
+        sentence_validator: SentenceValidator | None,
+        q_mcmc_path: str,
+        target_length: int = 7,
+        eps: float = 1e-6,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.q_mcmc_path = q_mcmc_path
+        self.target_length = target_length
+        self.eps = eps
+
+        self._q_mcmc = None
+        self._q_packed_per_device: dict[torch.device, dict[tuple[int, ...], torch.Tensor]] = {}
+        self._max_ctx_len: int | None = None
+        self.temperature = 1.0
+
+    def _ensure_q_packed(self, tokenizer: PreTrainedTokenizer, device: torch.device):
+        if self._q_mcmc is None:
+            self._q_mcmc = load_q_mcmc(self.q_mcmc_path)
+            self._max_ctx_len = max((len(k) for k in self._q_mcmc.keys()), default=0)
+        if device not in self._q_packed_per_device:
+            self._q_packed_per_device[device] = pack_q_mcmc_to_device(
+                self._q_mcmc,
+                vocab_size=len(tokenizer),
+                device=device,
+                eps=self.eps,
+                dtype=torch.float32,
+            )
+        return self._q_packed_per_device[device]
+
+    def _log_q(
+        self, q_packed: dict[tuple[int, ...], torch.Tensor], context: tuple[int, ...], token: int
+    ):
+        q_vec = _get_q_vec_with_backoff(q_packed, context)
+        return torch.log(q_vec[token].clamp_min(self.eps))
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model,
+        tokenizer: PreTrainedTokenizer,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        device = input_batch.device
+        q_packed = self._ensure_q_packed(tokenizer, device)
+
+        eos_id = tokenizer.eos_token_id
+        generated = input_batch[:, prompt_length:]
+        batch_size, gen_len = generated.shape
+        log_q_steps = torch.full_like(generated, fill_value=float("-inf"), dtype=torch.float32)
+
+        # Build log q for each position (context includes prompt + previous generated tokens)
+        for b in range(batch_size):
+            prefix_tokens = input_batch[b, :prompt_length].tolist()
+            for t in range(gen_len):
+                tok = int(generated[b, t].item())
+                # Context: last max_ctx_len tokens from full history
+                if self._max_ctx_len and self._max_ctx_len > 0:
+                    ctx = tuple(prefix_tokens[-self._max_ctx_len :])
+                else:
+                    ctx = ()
+                log_q_steps[b, t] = self._log_q(q_packed, ctx, tok)
+                prefix_tokens.append(tok)
+
+        reward_unpenalized = log_q_steps.cumsum(dim=-1)
+        # Terminal shaping based on Expr24 length and validator
+        reward_penalized = reward_unpenalized.clone()
+        validator_dict = None
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+
+        for b in range(batch_size):
+            seq = generated[b]
+            eos_positions = (seq == eos_id).nonzero(as_tuple=False)
+            eos_pos = int(eos_positions[0].item()) if eos_positions.numel() > 0 else None
+            gen_tokens_before_eos = eos_pos if eos_pos is not None else gen_len
+
+            valid_len = gen_tokens_before_eos == self.target_length
+            valid_expr = False
+            if validator_dict is not None:
+                valid_expr = bool(validator_dict["global_score"][b].item())
+            is_valid = valid_len and valid_expr
+
+            if eos_pos is not None:
+                if is_valid:
+                    # keep cumulative log_q up to EOS (best estimate of log p(x))
+                    reward_penalized[b, eos_pos] = reward_unpenalized[b, eos_pos]
+                else:
+                    reward_penalized[b, eos_pos] = reward_unpenalized[b, eos_pos] + math.log(
+                        self.eps
+                    )
+
+        return {
+            "reward": reward_penalized,
+            "reward_unpenalized": reward_unpenalized,
+            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
+            "log_pf_ref": None,
+            "log_pterm_ref": None,
             "validator_dict": validator_dict,
         }
 
@@ -881,30 +1019,23 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_Entropy:
         action_seq: Tensor | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        with use_base_model(model, disable_peft=self.disable_peft):
-            reference_logits, _ = score_fast(
-                model=model,
-                encoded_input=input_batch,
-                termination_token_id=tokenizer.eos_token_id,
-                skip_first=prompt_length,
-                reward_temperature=reward_temperature,
-                invalid_vocab_mask=vocab_invalid_mask,
-                agree_list=agree_list,
-                illegal_vocab_penalty=self.illegal_vocab_penalty,
-                grammar_disagree_penalty=self.grammar_disagree_penalty,
-            )
+        reference_results = score_fast(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
 
         validator_dict = None
-        reward_mixed = reference_logits
+        reference_logP = reference_results["reward"]
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
 
-        if self.sentence_validator is not None:
-            validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
-            )
-            valid_score = validator_dict["valid_score"]
-            scaled_reference_logits = reference_logits * reference_logits_scale
-            max_sum_logpf = torch.abs(scaled_reference_logits)[..., -1].unsqueeze(-1)
-            reward_mixed = scaled_reference_logits + scaling_factor * max_sum_logpf * valid_score
         # Add entropy over the generated sentence tokens to encourage diversity
         sentences = input_batch[:, prompt_length:]
         entropies: list[Tensor] = []
@@ -920,14 +1051,264 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_Entropy:
             entropies.append(entropy)
         entropy_tensor = torch.stack(entropies, dim=0).unsqueeze(-1)
 
-        reward = reward_mixed + entropy_tensor * valid_score
-        reward_unpenalized = scaled_reference_logits
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"]
+            # set valid sample's logR[-1] to 0 + fixed reward + entropy reward
+            reward_mixed = (
+                reference_logP
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + scaling_factor * valid_score
+            )
+
+            reward_penalized = reward_mixed
+        else:
+            reward_penalized = reward_mixed
 
         return {
-            "reward": reward,
-            "reward_unpenalized": reward_unpenalized,
+            "reward": reward_penalized,
+            "reward_unpenalized": reward_mixed,
             "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
-            "log_pf_ref": reference_logits,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+def batch_prefix_value_kgram(
+    sentences: torch.Tensor,  # (B,T) 生成部分 tokens（不含 prompt）
+    y: torch.Tensor,  # (B,) 终局 0/1
+    k: int = 6,
+    alpha: float = 1.0,
+    min_count: int = 2,
+    backoff: bool = True,
+) -> torch.Tensor:
+    """
+    返回 pv: (B,T), pv[i,t] ≈ P(y=1 | suffix-kgram(prefix_{i,t}))
+    用 batch 内统计，Beta-Binomial 平滑。
+    """
+    B, T = sentences.shape
+    y = y.to(torch.float32).view(B)
+
+    # counts[(len, tuple)] = (N,S)
+    N = defaultdict(float)
+    S = defaultdict(float)
+
+    toks_list = sentences.tolist()
+    for i in range(B):
+        yi = float(y[i].item())
+        toks = toks_list[i]
+        for t in range(T):
+            for kk in range(1, k + 1):
+                s = max(0, t - kk + 1)
+                key = (kk, tuple(toks[s : t + 1]))
+                N[key] += 1.0
+                S[key] += yi
+
+    pv = torch.empty((B, T), device=sentences.device, dtype=torch.float32)
+
+    for i in range(B):
+        toks = toks_list[i]
+        for t in range(T):
+            chosen = None
+            # 优先用最长 k-gram；太稀疏就 backoff
+            for kk in range(k, 0, -1):
+                s = max(0, t - kk + 1)
+                key = (kk, tuple(toks[s : t + 1]))
+                if (not backoff) or (N[key] >= min_count) or kk == 1:
+                    chosen = key
+                    break
+            n = N[chosen]
+            ssum = S[chosen]
+            pv[i, t] = (ssum + alpha) / (n + 2.0 * alpha)
+
+    return pv.clamp(1e-4, 1.0 - 1e-4)
+
+
+def build_prefix_potential(
+    pv: torch.Tensor,  # (B,T) in (0,1)
+    ref_log_pf: torch.Tensor,  # (B,T) 每步 token logprob（来自 score_fast 返回）
+    non_term_mask: torch.Tensor,  # (B,T) True 表示还没终止的位置（你可以用 score_fast 里的 mask）
+    eta: float = 1.0,
+    clamp: float = 4.0,
+) -> torch.Tensor:
+    """
+    生成势函数 Phi(prefix_t)，并锚定终点 Phi[:, -1]=0（避免直接改终局尺度）。
+    eta 控制强度；clamp 防止爆炸。
+    """
+    # logit(p)
+    logit = torch.log(pv) - torch.log1p(-pv)
+    logit = logit.clamp(-clamp, clamp)  # 让它成为“温和的信号”
+
+    # 用每步 logprob 的平均幅度来对齐尺度（典型 1~5）
+    step_scale = ref_log_pf.abs().mean(dim=-1, keepdim=True).clamp_min(0.5)  # (B,1)
+    phi = eta * step_scale * logit  # (B,T)
+
+    # 只在未终止位置有效
+    phi = phi * non_term_mask.to(phi.dtype)
+
+    # 关键：锚定终点（不直接改变终局 logR 的绝对值）
+    phi[:, -1] = 0.0
+    return phi
+
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
+    def __init__(
+        self,
+        sentence_validator,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        phi_weight: float = 1.0,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        **kwargs,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+        self.phi_weight = phi_weight
+        self.score_function = score_function
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model=None,
+        tokenizer=None,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,  # (B,T) 生成的动作 token（不含 prompt）
+        **kwargs,
+    ) -> dict[str, Any]:
+        reference_results = eval(self.score_function)(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        reference_logP = reference_results["reward"] * float(reference_logits_scale)
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
+
+        validator_dict = None
+        reward_mixed = reference_logP
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"].to(
+                reference_logP.dtype
+            )  # (B,T), 000..1 or 000..0
+
+            y = valid_score[:, -1]  # (B,)
+
+            reward_mixed = (
+                reference_logP
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + scaling_factor * valid_score
+            )
+            sentences = input_batch[:, prompt_length:]
+            non_term_mask = (input_batch != tokenizer.eos_token_id)[:, prompt_length:]
+
+            pv = batch_prefix_value_kgram(sentences, y, k=6, alpha=1.0, min_count=2, backoff=True)
+            phi = build_prefix_potential(pv, ref_log_pf, non_term_mask, eta=1.0, clamp=4.0)
+            reward_mixed[:, 1:] = reward_mixed[:, 1:] + phi * self.phi_weight
+
+        return {
+            "reward": reward_mixed,
+            "reward_unpenalized": reference_logP,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping_TestInvalid_MASK:
+    def __init__(
+        self,
+        sentence_validator,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        phi_weight: float = 0,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        **kwargs,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+        self.phi_weight = phi_weight
+        self.score_function = score_function
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model=None,
+        tokenizer=None,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,  # (B,T) 生成的动作 token（不含 prompt）
+        **kwargs,
+    ) -> dict[str, Any]:
+        reference_results = eval(self.score_function)(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        reference_logP = reference_results["reward"] * float(reference_logits_scale)
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
+
+        validator_dict = None
+        reward_mixed = reference_logP
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"].to(
+                reference_logP.dtype
+            )  # (B,T), 000..1 or 000..0
+
+            y = valid_score[:, -1]  # (B,)
+
+            reward_mixed = reference_logP + (-50) * (1 - valid_score)
+
+            # sentences = input_batch[:, prompt_length:]
+            # non_term_mask = (input_batch != tokenizer.eos_token_id)[:, prompt_length:]
+
+            # pv = batch_prefix_value_kgram(sentences, y, k=6, alpha=1.0, min_count=2, backoff=True)
+            # phi = build_prefix_potential(pv, ref_log_pf, non_term_mask, eta=1.0, clamp=4.0)
+            # reward_mixed[:, 1:] = reward_mixed[:, 1:] + phi * self.phi_weight
+
+        return {
+            "reward": reward_mixed,
+            "reward_unpenalized": reference_logP,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
             "validator_dict": validator_dict,
         }
 

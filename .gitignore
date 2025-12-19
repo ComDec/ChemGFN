@@ -166,3 +166,4 @@ configs/local/default.yaml
 # Config template backups
 configs/experiment/templates/*.backup.*
 notebooks/zinc15_250k.txt
+notebooks/ppo_expr24_eval.csv

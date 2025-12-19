@@ -142,6 +142,7 @@ def generate_and_return_termination_logprob(
     buffer_sample=None,
     buffer_mixture_ratio=0.5,
     disable_grammar: bool = False,
+    grammar_disagree_penalty=-80,
     **kwargs,
 ):
     """Generate sequences using the model and compute termination log probabilities.
@@ -244,7 +245,6 @@ def generate_and_return_termination_logprob(
 
             prob = (modified_logits / temperature).softmax(dim=-1)
             token_ids = torch.multinomial(prob, num_samples=1)
-
             if use_buffer_sample and buffer_sample is not None:
                 if step < buffer_sample.size(-1):
                     if step >= max_len:
@@ -266,14 +266,17 @@ def generate_and_return_termination_logprob(
                 )
             else:
                 token_ids = action_seq[:, idx].unsqueeze(-1).to(device)
-                if vocab_nice_mask is not None:
-                    agree_entries.append(
-                        vocab_nice_mask.unsqueeze(0).repeat(token_ids.size(0), 1).to(device)
-                    )
+                # TODO: simple mask, no-eos before max_len;
+                scores = logits.clone().detach()
+                scores = default_processor(state, scores)
+                results = logits_processor(state, scores, disable_grammar=disable_grammar)
+                modified_logits = results["masked_logits"]
+                agree_entries.append(results["acceptance"])
 
         inactive_tokens = token_ids.new_full(token_ids.shape, termination_token_id)
         token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, inactive_tokens)
 
+        logits[~results["acceptance"]] += grammar_disagree_penalty
         logprob = logits.log_softmax(dim=-1)
 
         term_scores = logprob[:, termination_token_id]
@@ -590,7 +593,7 @@ class ReplayBuffer:
     def reset(self):
         self._buffer = {}
 
-    def add(self, item, force_add=False, psudo_reward: float = 0):
+    def add(self, item, force_add=False):
         """
         add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
         """
@@ -602,7 +605,7 @@ class ReplayBuffer:
             return
 
         new_item = (
-            psudo_reward,
+            item["logreward"],
             item["str_sentence"],
             item["tensor_sentence"],
             item["tensor_answer"],
@@ -622,7 +625,7 @@ class ReplayBuffer:
                 editdistance.eval(new_answer, existing_answer)
                 < (len(new_answer) + len(existing_answer)) * self.sim_tolerance
             ):
-                if buffer_item[0] >= psudo_reward and (not force_add):
+                if buffer_item[0] >= item["logreward"] and (not force_add):
                     return
         # Critical fix: Only add to 'exists' AFTER successful heap insertion
         if len(buffer) >= self.buffer_size:
@@ -634,7 +637,7 @@ class ReplayBuffer:
             if force_add:
                 new_item = list(new_item)
                 # ensure validated items are preferred
-                new_item[-2] += self.buffer_aug_value
+                new_item[-2][..., -1] = new_item[-2][..., -1] + self.buffer_aug_value
                 new_item = tuple(new_item)
             if self.strict_mode:
                 if force_add:
@@ -672,9 +675,9 @@ class ReplayBuffer:
             valid_state = (result_dict["validator_dict"]["global_score"].bool())[i]
             self.add(
                 {
-                    "logreward": logrewards[
-                        i, (sentences[i][prompt_len - 1 :] != self.termination_token_id).sum()
-                    ].item(),
+                    "logreward": logrewards[i, (sentences[i] != self.termination_token_id)]
+                    .sum()
+                    .item(),
                     "str_prompt": str_prompt,
                     "str_sentence": str_sentence,
                     "tensor_answer": sentences[i][prompt_len - 1 :],
@@ -682,7 +685,6 @@ class ReplayBuffer:
                     "full_logrewards": logrewards[i, :],
                 },
                 force_add=valid_state,
-                psudo_reward=result_dict["validator_dict"]["global_score"][i].item(),
             )
 
     def sample(self, batch_size, prompt, tokenizer):
@@ -764,7 +766,7 @@ class ReplayBufferNative(ReplayBuffer):
     A relay buffer that uses a heap to keep the max_size items with the highest reward
     """
 
-    def __init__(self, buffer_size, sim_tolerance=0.25):
+    def __init__(self, buffer_size, sim_tolerance=0.25, **kwargs):
         self.buffer_size = buffer_size
         self.sim_tolerance = sim_tolerance
         self.reset()
@@ -775,7 +777,7 @@ class ReplayBufferNative(ReplayBuffer):
     def reset(self):
         self._buffer = {}
 
-    def add(self, item, force_add=False, psudo_reward: float = 0):
+    def add(self, item, force_add=False):
         """
         add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
         """
@@ -843,8 +845,7 @@ class ReplayBufferNative(ReplayBuffer):
             # str_sentence = token_sentences[i].replace(".", "").strip()
             # there is no such termination token in the SMILES
             str_sentence = token_sentences[i].strip()
-            batch_invalid = result_dict["validator_dict"]["invalid"]
-            valid_state = (~batch_invalid.bool())[i][-1]
+            valid_state = (result_dict["validator_dict"]["global_score"].bool())[i]
             self.add(
                 {
                     "logreward": logrewards[
@@ -857,7 +858,6 @@ class ReplayBufferNative(ReplayBuffer):
                     "full_logrewards": logrewards[i, :],
                 },
                 force_add=valid_state,
-                psudo_reward=result_dict["validator_dict"]["global_score"][i].item(),
             )
 
     def sample(self, batch_size, prompt, tokenizer):

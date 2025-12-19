@@ -26,8 +26,8 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 15
-  limit_val_batches: 2
+  limit_train_batches: 30
+  limit_val_batches: 5
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -39,12 +39,14 @@ model:
     lr: 0.0001
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
     invalid_start_ratio: 0.2
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
-    illegal_vocab_penalty: -80
-    grammar_disagree_penalty: -99 # for any baseline, we MUST set this to 0
+    illegal_vocab_penalty: 0
+    grammar_disagree_penalty: -80 # for any baseline, we MUST set this to 0
+    phi_weight: 0
+    score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator
       amortize_valid_state: false
@@ -59,10 +61,10 @@ model:
     buffer_size: 200
     sim_tolerance: 0.25
     strict_mode: false
-    buffer_aug_value: 10.0
+    buffer_aug_value: 0
 
   constraint_config:
-    min_sentence_len: 1
+    min_sentence_len: 7
     max_sentence_len: 7
     grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
     disable_grammar: false
@@ -76,8 +78,8 @@ model:
     pf_temp_high: 1.0
     pf_temp_low: 1.0
     pf_temp_prob: 0.666
-    n_samples: 10
-    buffer_mixture_ratio: 1.0
+    n_samples: 32
+    buffer_mixture_ratio: 0.7
     skip_baseline_sampling: true
     opt_task: false
 
@@ -91,14 +93,14 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.5
+      start: 0.50
       end: 0.25
       horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.5
-      end: 0.0
+      start: 0.75
+      end: 0.25
       horizon: 25000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -106,6 +108,24 @@ model:
       start: 1
       end: 1.0
       horizon: 50000
+    pf_temp_low:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.8
+      end: 1.0
+      horizon: 50000
+    pf_temp_high:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1.5
+      end: 1.0
+      horizon: 50000
+    scaling_factor:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 50
+      end: 50
+      horizon: 10000
 
   disable_peft: false
 

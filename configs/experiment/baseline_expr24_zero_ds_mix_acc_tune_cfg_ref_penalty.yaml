@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "baseline", "expr24", "enable_cfg", "dataset_buffer_mix"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "baseline_expr24_zero_enable_cfg_ds_mix_0.5_start_1.0_fix_acc_tune_fix_ref_model"
+exp_name: "baseline_expr24_zero_enable_cfg_ds_mix_0.5_start_1.0_fix_acc_tune_ref_penalty_fair_mask"
 seed: 42
 
 # ============================================================================
@@ -59,13 +59,13 @@ model:
     buffer_aug_value: 0.0
 
   constraint_config:
-    min_sentence_len: 1
+    min_sentence_len: 7
     max_sentence_len: 7
     grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
     disable_grammar: false
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
-    illegal_vocab_penalty: -50
+    illegal_vocab_penalty: -99
     parse_mode: "limited"
 
   training_mixed_config:
@@ -73,7 +73,7 @@ model:
     pf_temp_high: 2.0
     pf_temp_low: 0.5
     pf_temp_prob: 0.666
-    n_samples: 10
+    n_samples: 12
     buffer_mixture_ratio: 1.0
     skip_baseline_sampling: true
     opt_task: false
@@ -88,20 +88,38 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0
-      end: 0
+      start: 0.25
+      end: 0.25
       horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 1.0
-      end: 1.0
-      horizon: 25000
+      start: 0.90
+      end: 0.25
+      horizon: 50000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
+      end: 0.2
+      horizon: 50000
+    pf_temp_low:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.8
       end: 1.0
+      horizon: 50000
+    pf_temp_high:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1.5
+      end: 1.0
+      horizon: 50000
+    scaling_factor:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1
+      end: 5
       horizon: 50000
 
 # ============================================================================

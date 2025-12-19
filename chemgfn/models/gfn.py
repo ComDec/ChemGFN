@@ -230,6 +230,9 @@ class ChemGFNModule(LightningModule):
             "buffer_mixture_ratio": buffer_mixture_ratio,
             "return_policy_logits": self.return_policy_logits,
             "disable_grammar": getattr(self.constraint_config, "disable_grammar", False),
+            "grammar_disagree_penalty": getattr(
+                self.training_mixed_config, "grammar_disagree_penalty", -80
+            ),
         }
 
         generator = (
@@ -375,7 +378,7 @@ class ChemGFNModule(LightningModule):
         log_ps = last_log_r * self.reward.temperature
         log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 5 == 0:
             decoded = self._decode_generated_tokens(generated_text[0, prompt_len:])
             acc = self.reward.sentence_validator.accuracy(
                 generated_text[0, prompt_len:].unsqueeze(0),
@@ -392,8 +395,12 @@ class ChemGFNModule(LightningModule):
                     "logP": float(log_ps[0].item()),
                     "logR": float(last_log_r[0].item()),
                     "log_pf_list": [float(x) for x in log_pf[0].detach().cpu().tolist()],
-                    "log_r_list": [float(x) for x in log_r[0].detach().cpu().tolist()],
                     "log_pf_ref_list": [float(x) for x in log_pf_ref[0].detach().cpu().tolist()],
+                    "log_r_list": [float(x) for x in log_r[0].detach().cpu().tolist()],
+                    "log_r_unpenalized_list": [
+                        float(x) for x in log_r_unpenalized[0].detach().cpu().tolist()
+                    ],
+                    "log_pterm_list": [float(x) for x in log_pterm[0].detach().cpu().tolist()],
                     "log_pterm_ref_list": [
                         float(x) for x in log_pterm_ref[0].detach().cpu().tolist()
                     ],
@@ -440,6 +447,7 @@ class ChemGFNModule(LightningModule):
                 "train/logP(s) (max)": log_ps.max(),
                 "train/logP(s) unpenalized (avg)": log_ps_unpenalized.mean(),
                 "train/logP(s) unpenalized (max)": log_ps_unpenalized.max(),
+                "train/Mean(log_pterm - log_pterm_ref)": (log_pterm - log_pterm_ref).mean(),
                 "train/sentence_len": sentence_len.float().mean(),
             },
             on_step=True,
@@ -525,6 +533,7 @@ class ChemGFNModule(LightningModule):
                 "val/logP(s) (max)": log_ps.max(),
                 "val/logP(s) unpenalized (avg)": log_ps_unpenalized.mean(),
                 "val/logP(s) unpenalized (max)": log_ps_unpenalized.max(),
+                "val/Mean(log_pterm - log_pterm_ref)": (log_pterm - log_pterm_ref).mean(),
             },
             sync_dist=True,
         )
@@ -584,7 +593,11 @@ class ChemGFNModule(LightningModule):
         self.train_sentence_length.clear()
 
     def on_train_epoch_start(self):
-        self.log("scheduled/R_temperature", self.reward.temperature, sync_dist=True)
+        self.log(
+            "scheduled/R_temperature",
+            self.get_reward_temp_at_step(self.global_step),
+            sync_dist=True,
+        )
         self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
 
     def on_validation_epoch_start(self):
@@ -710,7 +723,14 @@ class ChemGFNModule(LightningModule):
                     probe[key] = value.to(device, non_blocking=True)
             with torch.no_grad():
                 result_dict = self.forward(
-                    probe, n_samples=n_samples, pf_temperature=1.0, reward_temperature=1.0
+                    probe,
+                    n_samples=n_samples,
+                    pf_temperature=1.0,
+                    reward_temperature=1.0,
+                    scaling_factor=self.get_scaling_factor_at_step(self.global_step),
+                    reference_logits_scale=self.get_reference_logits_scale_at_step(
+                        self.global_step
+                    ),
                 )
                 generated_text = result_dict["state"]
                 log_r = result_dict["log_r"]
@@ -730,8 +750,8 @@ class ChemGFNModule(LightningModule):
                 prompt_len=prompt_len,
             )[1:3]
 
-            log_ps *= self.reward.temperature
-            log_ps_unpenalized *= self.reward.temperature
+            log_ps *= self.get_reward_temp_at_step(self.global_step)
+            log_ps_unpenalized *= self.get_reward_temp_at_step(self.global_step)
 
             generated_sequences = [
                 self._decode_generated_tokens(text[prompt_len:], skip_special_tokens=False)
@@ -1055,6 +1075,7 @@ class ChemGFNModule(LightningModule):
             prompt_tensor,
             self.tokenizer,
         )
+
         if buffer_sentences is None:
             return None
         # Ensure buffer samples are on the same device as prompt
@@ -1062,7 +1083,14 @@ class ChemGFNModule(LightningModule):
         prompt_expanded = prompt_tensor.expand(buffer_sentences.size(0), -1)
         prompt_prefix = prompt_expanded[:, :-1]
         action_seq = torch.cat([prompt_prefix, buffer_sentences], dim=1)
-        result_dict = self.forward(item, action_seq=action_seq)
+        result_dict = self.forward(
+            item,
+            action_seq=action_seq,
+            pf_temperature=1.0,  # no temperature sampling for buffer sampling
+            reward_temperature=self.reward.temperature,
+            scaling_factor=self.get_scaling_factor_at_step(self.global_step),
+            reference_logits_scale=self.get_reference_logits_scale_at_step(self.global_step),
+        )
         return action_seq, result_dict
 
     def _decode_generated_tokens(

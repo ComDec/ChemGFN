@@ -199,6 +199,66 @@ class ModifiedSubTBLoss(GFNLoss):
         return {"loss": batch_loss}
 
 
+class Expr24FixedHorizonSubTBLoss(torch.nn.Module):
+    """
+    Expr24 fixed-horizon SubTB:
+      - EOS only at last position (forced by sampler/CFG)
+      - No termination probability modeling (no log_pterm in delta)
+      - We ignore the last action (EOS) in delta (same as your log_pf[:, :-1] usage)
+    """
+
+    def __init__(self, subtb_lambda: float = 1.0, eps: float = 1e-8):
+        super().__init__()
+        self.subtb_lambda = subtb_lambda
+        self.eps = eps
+
+    def forward(
+        self,
+        log_pf: torch.Tensor,  # [B, L]  (包含最后 EOS 的 logpf 也可以，但我们会忽略最后一步)
+        log_r: torch.Tensor,  # [B, L]  (state potential / log-flow proxy, 对齐到每个位置)
+        generated_text: torch.Tensor,  # [B, prompt_len + L]
+        termination_token_id: int,
+        prompt_len: int,
+        **kwargs,
+    ):
+        B, L = log_pf.shape
+        assert log_r.shape == (B, L)
+        assert generated_text.shape[1] == prompt_len + L
+        assert L > 1
+
+        # delta_t for t=0..L-2
+        # 这里“忽略最后一步(EOS)”：只用 log_pf[:, :-1]
+        delta = log_r[:, :-1] + log_pf[:, :-1] - log_r[:, 1:]  # [B, L-1]
+
+        # 如果你保证 EOS 只能在最后一步出现，那么这里 mask 基本全 False（但保留以防早停）
+        gen = generated_text[:, prompt_len:]  # [B, L]
+        eos_seen = (gen == termination_token_id).cumsum(dim=-1) >= 1  # [B, L]
+        # 对 delta 的位置 t，对应 gen 的位置 t 和 t+1 都不应已终止
+        valid = (~eos_seen[:, :-1]) & (~eos_seen[:, 1:])  # [B, L-1]
+        delta = delta * valid.to(delta.dtype)
+
+        # SubTB: sum_{k=1..L-1} lambda^{k-1} * || prefix-sum window ||^2
+        delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(
+            dim=1
+        )  # [B, L]
+
+        batch_loss = 0.0
+        total_w = 0.0
+        for k in range(1, L):  # subtraj_len
+            term = (delta_cumsum[:, k:] - delta_cumsum[:, :-k]) ** 2  # [B, L-k]
+            # term 对应起点 t=0..L-k-1，只有起点/终点都 valid 才算
+            # 简化：只用 valid 的起点（足够稳）
+            v = valid[:, k - 1 :] if k - 1 < valid.shape[1] else valid[:, :0]
+            term = term * v.to(term.dtype)
+
+            w = self.subtb_lambda ** (k - 1)
+            batch_loss = batch_loss + w * term.sum()
+            total_w = total_w + w * v.sum()
+
+        batch_loss = batch_loss / (total_w.clamp_min(1.0))
+        return {"loss": batch_loss}
+
+
 class ModifiedSubTBLossSplitReward(GFNLoss):
     """
     Modified SubTrajectory Balance (SubTB) Loss with split reward.
