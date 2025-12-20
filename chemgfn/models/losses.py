@@ -146,9 +146,9 @@ class ModifiedSubTBLoss(GFNLoss):
 
         Args:
             log_pf: Log forward policy probabilities at each step, shape [B, L]
-            log_r: Log reward prefix accumulator, shape [B, L]
-            log_pterm: Log termination probabilities, shape [B, L]
-            generated_text: Token IDs including prompt, shape [B, prompt_len + L]
+            log_r: Log reward prefix accumulator, shape [B, L+1]
+            log_pterm: Log termination probabilities, shape [B, L+1]
+            generated_text: Token IDs including prompt, shape [B, prompt_len + L+1]
             termination_token_id: EOS token ID
             prompt_len: Length of prompt
             **kwargs: Additional arguments (for compatibility)
@@ -166,7 +166,6 @@ class ModifiedSubTBLoss(GFNLoss):
 
         # Ensure there is at least one transition before termination
         assert log_pf.shape[1] > 1, "Need at least one transition before termination (L > 1)"
-
         # Calculate the change in expected reward and probability at each step
         delta = (
             log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
@@ -199,64 +198,90 @@ class ModifiedSubTBLoss(GFNLoss):
         return {"loss": batch_loss}
 
 
-class Expr24FixedHorizonSubTBLoss(torch.nn.Module):
+def _first_eos_index(gen_tokens: torch.Tensor, eos_id: int) -> torch.Tensor:
     """
-    Expr24 fixed-horizon SubTB:
-      - EOS only at last position (forced by sampler/CFG)
-      - No termination probability modeling (no log_pterm in delta)
-      - We ignore the last action (EOS) in delta (same as your log_pf[:, :-1] usage)
+    gen_tokens: (B, S) prompt 之后的 token 序列（长度 = S = log_pterm.size(1)）
+    返回: (B,) 每条序列第一次出现 eos 的位置；若没有 eos，则返回 S-1
+    """
+    B, S = gen_tokens.shape
+    is_eos = gen_tokens == eos_id
+    has_eos = is_eos.any(dim=1)
+    first = is_eos.float().argmax(dim=1)  # 若全 False -> 0，需要修正
+    first = torch.where(has_eos, first, torch.full_like(first, S - 1))
+    return first
+
+
+class LLMTrajectoryBalanceLoss(nn.Module):
+    """
+    Trajectory Balance (TB) loss for LLM-GFlowNet with separate (log_pf, log_pterm, log_r grid).
+
+    兼容你的“log_r 是 terminate-at-t 的 logR 表格”设计：
+      - 终止发生在 τ（首次 EOS）：
+         logP(traj) = sum_{t<τ} log_pf[t] + log_pterm[τ]
+         logR(traj) = log_r[τ]
+      - PB=1（tree/backward deterministic）时不需要 log_pb 项
     """
 
-    def __init__(self, subtb_lambda: float = 1.0, eps: float = 1e-8):
+    def __init__(self, learn_log_z: bool = True, **kwargs):
         super().__init__()
-        self.subtb_lambda = subtb_lambda
-        self.eps = eps
+        self.log_z = nn.Parameter(torch.zeros(())) if learn_log_z else None
 
     def forward(
         self,
-        log_pf: torch.Tensor,  # [B, L]  (包含最后 EOS 的 logpf 也可以，但我们会忽略最后一步)
-        log_r: torch.Tensor,  # [B, L]  (state potential / log-flow proxy, 对齐到每个位置)
-        generated_text: torch.Tensor,  # [B, prompt_len + L]
+        log_pf: torch.Tensor,  # (B, S) 或 (B, S-1)
+        log_r: torch.Tensor,  # (B, S)  terminate-at-t 的 logR 表
+        log_pterm: torch.Tensor,  # (B, S)  每个 state 的 EOS logprob
+        generated_text: torch.Tensor,  # (B, prompt_len + S)
         termination_token_id: int,
         prompt_len: int,
+        log_z: Optional[torch.Tensor] = None,
         **kwargs,
-    ):
-        B, L = log_pf.shape
-        assert log_r.shape == (B, L)
-        assert generated_text.shape[1] == prompt_len + L
-        assert L > 1
+    ) -> Dict[str, torch.Tensor]:
+        assert log_r.ndim == log_pterm.ndim == 2
+        B, S = log_pterm.shape
+        assert log_r.shape == (
+            B,
+            S,
+        ), f"log_r shape {log_r.shape} must match log_pterm shape {(B,S)}"
 
-        # delta_t for t=0..L-2
-        # 这里“忽略最后一步(EOS)”：只用 log_pf[:, :-1]
-        delta = log_r[:, :-1] + log_pf[:, :-1] - log_r[:, 1:]  # [B, L-1]
+        # 允许 log_pf 少 1（有人只存非终止动作的 pf）
+        if log_pf.shape[1] == S - 1:
+            log_pf = torch.cat([log_pf, log_pf.new_zeros((B, 1))], dim=1)
+        assert log_pf.shape == (B, S), f"log_pf shape {log_pf.shape} must be (B,S) or (B,S-1)"
 
-        # 如果你保证 EOS 只能在最后一步出现，那么这里 mask 基本全 False（但保留以防早停）
-        gen = generated_text[:, prompt_len:]  # [B, L]
-        eos_seen = (gen == termination_token_id).cumsum(dim=-1) >= 1  # [B, L]
-        # 对 delta 的位置 t，对应 gen 的位置 t 和 t+1 都不应已终止
-        valid = (~eos_seen[:, :-1]) & (~eos_seen[:, 1:])  # [B, L-1]
-        delta = delta * valid.to(delta.dtype)
+        # 从 generated_text 找 τ：prompt 后前 S 个 token
+        gen = generated_text[:, prompt_len : prompt_len + S]
+        tau = _first_eos_index(gen, termination_token_id)  # (B,)
 
-        # SubTB: sum_{k=1..L-1} lambda^{k-1} * || prefix-sum window ||^2
-        delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(
-            dim=1
-        )  # [B, L]
+        # mask: t < τ 的 token 步（非终止前缀）
+        t = torch.arange(S, device=log_pf.device).view(1, S)
+        pre_mask = t < tau.view(B, 1)  # (B, S)
 
-        batch_loss = 0.0
-        total_w = 0.0
-        for k in range(1, L):  # subtraj_len
-            term = (delta_cumsum[:, k:] - delta_cumsum[:, :-k]) ** 2  # [B, L-k]
-            # term 对应起点 t=0..L-k-1，只有起点/终点都 valid 才算
-            # 简化：只用 valid 的起点（足够稳）
-            v = valid[:, k - 1 :] if k - 1 < valid.shape[1] else valid[:, :0]
-            term = term * v.to(term.dtype)
+        # logP(traj) = sum_{t<τ} log_pf[t] + log_pterm[τ]
+        token_logp = (log_pf * pre_mask.to(log_pf.dtype)).sum(dim=1)  # (B,)
+        term_logp = log_pterm.gather(1, tau.view(B, 1)).squeeze(1)  # (B,)
+        logp_traj = token_logp + term_logp
 
-            w = self.subtb_lambda ** (k - 1)
-            batch_loss = batch_loss + w * term.sum()
-            total_w = total_w + w * v.sum()
+        # logR(traj) = log_r[τ] （你的 scorer 已经把 prefix+eos 概率塞进 log_r[t] 了）
+        logr_traj = log_r.gather(1, tau.view(B, 1)).squeeze(1)
 
-        batch_loss = batch_loss / (total_w.clamp_min(1.0))
-        return {"loss": batch_loss}
+        # logZ：外部传入优先，否则学一个全局标量
+        if log_z is None:
+            if self.log_z is None:
+                raise ValueError("No log_z provided and learn_log_z=False.")
+            log_z = self.log_z
+        log_z_b = log_z.expand(B)
+
+        residual = log_z_b + logp_traj - logr_traj
+        loss = (residual**2).mean()
+
+        return {
+            "loss": loss,
+            "tb_residual_mean": residual.mean().detach(),
+            "tb_residual_std": residual.std(unbiased=False).detach(),
+            "logp_traj_mean": logp_traj.mean().detach(),
+            "logr_traj_mean": logr_traj.mean().detach(),
+        }
 
 
 class ModifiedSubTBLossSplitReward(GFNLoss):

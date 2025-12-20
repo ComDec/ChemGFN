@@ -4,7 +4,6 @@ import math
 import re
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -22,6 +21,7 @@ from chemgfn.models.mcmc_prior import (
     pack_q_mcmc_to_device,
 )
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
+from chemgfn.utils.phi_utils import compute_prefix_diagnostics
 from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING, verify_smiles, verify_smiles_pa
 
 RDLogger.DisableLog("rdApp.*")
@@ -1127,12 +1127,203 @@ def batch_prefix_value_kgram(
     return pv.clamp(1e-4, 1.0 - 1e-4)
 
 
+class PrefixValueMemory:
+    """
+    Cross-batch EMA Beta-Binomial PV estimator.
+
+    Keeps EMA counts (N,S) for suffix k-grams across training steps.
+    - update(): uses (sentences, y) to update global stats
+    - query_pv(): returns pv(B,T) and decayed counts using backoff from kmax..1
+    """
+
+    def __init__(
+        self,
+        kmax: int = 4,  # 建议先用4，6太稀疏
+        alpha: float = 1.0,  # Beta prior
+        gamma: float = 0.999,  # EMA decay (~1000 steps memory)
+        min_count: float = 10.0,  # N>=min_count 才信这个key
+        max_keys: int = 500_000,  # 内存上限，够用
+        prune_every: int = 2000,
+        prune_threshold: float = 1.0,
+        tau_conf: float = 20.0,  # 信心权重平滑
+    ):
+        self.kmax = int(kmax)
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.min_count = float(min_count)
+
+        self.max_keys = int(max_keys)
+        self.prune_every = int(prune_every)
+        self.prune_threshold = float(prune_threshold)
+        self.tau_conf = float(tau_conf)
+
+        # stats[(k, tuple(tokens))] = [N, S, last_step]
+        self.stats: dict[tuple[int, tuple[int, ...]], list[float]] = {}
+        self.global_N = 0.0
+        self.global_S = 0.0
+        self.global_last_step = 0
+        self.step = 0
+
+    def set_step(self, step: int) -> None:
+        """Update current step (non-decreasing) for decay bookkeeping."""
+        step = int(step)
+        if step > self.step:
+            self.step = step
+            self._decay_global()
+
+    def _decay_global(self) -> None:
+        delta = max(0, self.step - self.global_last_step)
+        if delta > 0:
+            factor = self.gamma**delta
+            self.global_N *= factor
+            self.global_S *= factor
+            self.global_last_step = self.step
+
+    def _decay_key(self, key: tuple[int, tuple[int, ...]]) -> tuple[float, float]:
+        N, S, last = self.stats[key]
+        if self.step > last:
+            factor = self.gamma ** (self.step - last)
+            N *= factor
+            S *= factor
+            self.stats[key] = [N, S, float(self.step)]
+        return N, S
+
+    @torch.no_grad()
+    def update(self, sentences: torch.Tensor, y: torch.Tensor, non_term_mask: torch.Tensor):
+        """
+        sentences: (B,T) tokens (no prompt)
+        y: (B,) float in {0,1}
+        non_term_mask: (B,T) bool, only count positions where True
+        """
+        B, T = sentences.shape
+        y = y.to(torch.float32).view(B)
+
+        toks_list = sentences.detach().to("cpu").tolist()
+        mask_list = non_term_mask.detach().to("cpu").tolist()
+        y_list = y.detach().to("cpu").tolist()
+
+        batch_N = defaultdict(float)
+        batch_S = defaultdict(float)
+
+        n_global = 0.0
+        s_global = 0.0
+
+        for i in range(B):
+            yi = float(y_list[i])
+            toks = toks_list[i]
+            msk = mask_list[i]
+            for t in range(T):
+                if not msk[t]:
+                    continue
+                n_global += 1.0
+                s_global += yi
+                for kk in range(1, self.kmax + 1):
+                    s = max(0, t - kk + 1)
+                    key = (kk, tuple(toks[s : t + 1]))
+                    batch_N[key] += 1.0
+                    batch_S[key] += yi
+
+        # EMA update global base rate
+        self.global_N = self.global_N + n_global
+        self.global_S = self.global_S + s_global
+        self.global_last_step = self.step
+
+        # EMA update per-key
+        for key, n in batch_N.items():
+            s = batch_S[key]
+            if key in self.stats:
+                N, S = self._decay_key(key)
+                N = N + n
+                S = S + s
+                self.stats[key] = [N, S, float(self.step)]
+            else:
+                self.stats[key] = [n, s, float(self.step)]
+
+        if (self.step % self.prune_every) == 0:
+            self._prune()
+
+    def _prune(self):
+        # 1) drop tiny N
+        to_del = []
+        for k in list(self.stats.keys()):
+            N, S, last = self.stats[k]
+            if self.step > last:
+                factor = self.gamma ** (self.step - last)
+                N *= factor
+                S *= factor
+                self.stats[k] = [N, S, float(self.step)]
+            if N < self.prune_threshold:
+                to_del.append(k)
+        for k in to_del:
+            del self.stats[k]
+
+        # 2) cap by recency
+        if len(self.stats) > self.max_keys:
+            items = sorted(self.stats.items(), key=lambda kv: kv[1][2], reverse=True)
+            self.stats = dict(items[: self.max_keys])
+
+    @torch.no_grad()
+    def query_pv(
+        self, sentences: torch.Tensor, non_term_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        returns pv, counts: both (B,T) float32
+        """
+        B, T = sentences.shape
+        toks_list = sentences.detach().to("cpu").tolist()
+        mask_list = non_term_mask.detach().to("cpu").tolist()
+
+        # fallback base rate
+        if self.global_N > 0:
+            p0 = (self.global_S + self.alpha) / (self.global_N + 2.0 * self.alpha)
+        else:
+            p0 = 0.5
+        p0 = float(min(max(p0, 1e-4), 1.0 - 1e-4))
+
+        pv = torch.empty((B, T), dtype=torch.float32, device=sentences.device)
+        counts = torch.zeros((B, T), dtype=torch.float32, device=sentences.device)
+
+        for i in range(B):
+            toks = toks_list[i]
+            msk = mask_list[i]
+            for t in range(T):
+                if not msk[t]:
+                    pv[i, t] = 1e-4
+                    counts[i, t] = 0.0
+                    continue
+
+                chosen_p = None
+                chosen_n = 0.0
+                # backoff: kmax -> 1
+                for kk in range(self.kmax, 0, -1):
+                    s = max(0, t - kk + 1)
+                    key = (kk, tuple(toks[s : t + 1]))
+                    if key in self.stats:
+                        N, S = self._decay_key(key)
+                        if (N >= self.min_count) or (kk == 1):
+                            chosen_p = (S + self.alpha) / (N + 2.0 * self.alpha)
+                            chosen_n = N
+                            break
+
+                if chosen_p is None:
+                    chosen_p = p0
+                    chosen_n = 0.0
+
+                chosen_p = float(min(max(chosen_p, 1e-4), 1.0 - 1e-4))
+                pv[i, t] = chosen_p
+                counts[i, t] = float(chosen_n)
+
+        return pv, counts
+
+
 def build_prefix_potential(
     pv: torch.Tensor,  # (B,T) in (0,1)
     ref_log_pf: torch.Tensor,  # (B,T) 每步 token logprob（来自 score_fast 返回）
     non_term_mask: torch.Tensor,  # (B,T) True 表示还没终止的位置（你可以用 score_fast 里的 mask）
+    counts: torch.Tensor | None = None,  # (B,T) decayed counts for confidence
     eta: float = 1.0,
-    clamp: float = 4.0,
+    clamp: float = 2.0,
+    tau_conf: float = 20.0,
 ) -> torch.Tensor:
     """
     生成势函数 Phi(prefix_t)，并锚定终点 Phi[:, -1]=0（避免直接改终局尺度）。
@@ -1146,12 +1337,31 @@ def build_prefix_potential(
     step_scale = ref_log_pf.abs().mean(dim=-1, keepdim=True).clamp_min(0.5)  # (B,1)
     phi = eta * step_scale * logit  # (B,T)
 
+    if counts is not None:
+        conf = counts.to(phi.dtype) / (counts.to(phi.dtype) + float(tau_conf))
+        phi = phi * conf.clamp(0.0, 1.0)
+
     # 只在未终止位置有效
     phi = phi * non_term_mask.to(phi.dtype)
 
     # 关键：锚定终点（不直接改变终局 logR 的绝对值）
     phi[:, -1] = 0.0
     return phi
+
+
+@torch.no_grad()
+def apply_potential_shaping(reward_mixed: torch.Tensor, phi: torch.Tensor, phi_weight: float):
+    """
+    Apply differential potential shaping to reward.
+
+    reward_mixed: (B,T+1) or (B,T) depending on caller; we align with reward[:, 1:].
+    """
+    # 差分：shaping_t = phi_t - phi_{t+1}
+    shaping = phi[:, :-1] - phi[:, 1:]  # (B,T-1)
+
+    # 对齐 reward 索引：reward_mixed[:, 1:] 对应 prefix_t，差分长度减 1
+    reward_mixed[:, 1 : 1 + shaping.shape[1]] += phi_weight * shaping
+    return reward_mixed
 
 
 class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
@@ -1212,7 +1422,226 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
                 reference_logP.dtype
             )  # (B,T), 000..1 or 000..0
 
-            y = valid_score[:, -1]  # (B,)
+            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
+
+            reward_mixed = (
+                reference_logP
+                + (-1) * (reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + scaling_factor * valid_score
+            )
+
+            if self.phi_weight > 0:
+                sentences = input_batch[:, prompt_length:]
+                non_term_mask = (input_batch != tokenizer.eos_token_id)[:, prompt_length:]
+
+                pv = batch_prefix_value_kgram(
+                    sentences, y, k=6, alpha=1.0, min_count=2, backoff=True
+                )
+                phi = build_prefix_potential(pv, ref_log_pf, non_term_mask, eta=1.0, clamp=4.0)
+                reward_mixed[:, 1:] = reward_mixed[:, 1:] + phi * self.phi_weight
+
+        return {
+            "reward": reward_mixed,
+            "reward_unpenalized": reference_logP,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+
+
+class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shaping:
+    def __init__(
+        self,
+        sentence_validator,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        phi_weight: float = 1.0,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        **kwargs,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+        self.phi_weight = phi_weight
+        self.score_function = score_function
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model=None,
+        tokenizer=None,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        eos = tokenizer.eos_token_id
+
+        reference_results = eval(self.score_function)(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=eos,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        reference_logP = reference_results["reward"] * float(reference_logits_scale)  # (B, L)
+        ref_log_pf = reference_results["ref_log_pf"]  # (B, T_tok)
+        ref_log_pterm = reference_results["ref_log_pterm"]  # (B, L)
+
+        validator_dict = None
+        reward_mixed = reference_logP
+
+        prefix_diag = None
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
+            y = valid_score[:, -1].clamp(0.0, 1.0)
+
+            reward_mixed = (
+                reference_logP
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + scaling_factor * valid_score
+            )
+
+            B, L = reward_mixed.shape
+            T_tok = L - 1
+            gen_tokens = input_batch[:, prompt_length : prompt_length + T_tok]  # (B, T_tok)
+
+            # active_before[t]：在采样第 t 个 token 之前 state_t 是否仍 active（包含 EOS 那一步）
+            # 公式：active_before[:,0]=1；active_before[:,t]=Π_{j< t} 1[token_j != EOS]
+            active_before = torch.ones((B, T_tok), device=input_batch.device, dtype=torch.bool)
+            if T_tok > 1:
+                alive_after_each = (
+                    (gen_tokens != eos).to(torch.long).cumprod(dim=1).to(torch.bool)
+                )  # Π_{j<=t}
+                active_before[:, 1:] = alive_after_each[:, :-1]  # Π_{j< t}
+
+            # ========= prefix value -> phi_tok（注意：不要用 token!=EOS 的 non_term_mask） =========
+            pv = batch_prefix_value_kgram(
+                gen_tokens, y, k=6, alpha=1.0, min_count=2, backoff=True
+            )  # (B, T_tok)
+
+            # build_prefix_potential 里如果会乘 mask，请传 active_before（不要传 token!=EOS）
+            # 这样 EOS 那一步的 phi 不会被错误清零
+            phi_tok = build_prefix_potential(
+                pv=pv,
+                ref_log_pf=ref_log_pf,
+                non_term_mask=active_before,  # <-- 关键改动
+                eta=1.0,
+                clamp=4.0,
+            )  # (B, T_tok)
+
+            # ========= phi_tok -> phi_state（state轴长度 L） =========
+            phi_state = torch.zeros((B, L), device=phi_tok.device, dtype=phi_tok.dtype)
+            phi_state[:, 1:] = phi_tok  # phi_state[t+1] 对应 prefix ending at token t
+
+            # 你之前锚定两端：保留（保证“净奖励改变量”是常数，不改最优分布）
+            phi_state[:, 0] = 0.0
+            phi_state[:, -1] = 0.0
+
+            # ========= differential shaping：Δphi 作用在每个 transition 上 =========
+            dphi = phi_state[:, 1:] - phi_state[:, :-1]  # (B, T_tok)
+            dphi = dphi * active_before.to(dphi.dtype)  # <-- 关键：mask 用 active_before
+
+            reward_mixed = reward_mixed.clone()
+            reward_mixed[:, 1:] = reward_mixed[:, 1:] + self.phi_weight * dphi
+
+            # ========= diagnostics（你已有函数，放到 phi_state/active_before 之后） =========
+            prefix_diag = compute_prefix_diagnostics(
+                pv=pv,
+                phi_state=phi_state,
+                active_before=active_before,
+                pv_sat_lo=0.05,
+                pv_sat_hi=0.95,
+            )
+
+        out = {
+            "reward": reward_mixed,
+            "reward_unpenalized": reference_logP,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+        }
+        if prefix_diag is not None:
+            out["prefix_diag"] = prefix_diag
+        return out
+
+
+class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory:
+    def __init__(
+        self,
+        sentence_validator,
+        illegal_vocab_penalty: float = -99,
+        grammar_disagree_penalty: float = -99,
+        phi_weight: float = 1.0,
+        phi_warmup: int = 800,
+        phi_ramp_steps: int = 800,
+        pv_memory_kwargs: dict[str, Any] | None = None,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        **kwargs,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
+        self.grammar_disagree_penalty = float(grammar_disagree_penalty)
+        self.score_function = score_function
+        self.pv_mem = PrefixValueMemory(**(pv_memory_kwargs or {}))
+
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model=None,
+        tokenizer=None,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,  # (B,T) 生成的动作 token（不含 prompt）
+        **kwargs,
+    ) -> dict[str, Any]:
+        reference_results = eval(self.score_function)(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=tokenizer.eos_token_id,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        reference_logP = reference_results["reward"] * float(reference_logits_scale)
+        ref_log_pf = reference_results["ref_log_pf"]
+        ref_log_pterm = reference_results["ref_log_pterm"]
+
+        validator_dict = None
+        reward_mixed = reference_logP
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"].to(
+                reference_logP.dtype
+            )  # (B,T), 000..1 or 000..0
+
+            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
 
             reward_mixed = (
                 reference_logP
@@ -1222,9 +1651,22 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
             sentences = input_batch[:, prompt_length:]
             non_term_mask = (input_batch != tokenizer.eos_token_id)[:, prompt_length:]
 
-            pv = batch_prefix_value_kgram(sentences, y, k=6, alpha=1.0, min_count=2, backoff=True)
-            phi = build_prefix_potential(pv, ref_log_pf, non_term_mask, eta=1.0, clamp=4.0)
-            reward_mixed[:, 1:] = reward_mixed[:, 1:] + phi * self.phi_weight
+            phi_weight = self.phi_weight_schedule(getattr(self, "global_step", 0))
+            if phi_weight > 0.0:
+                pv, counts = self.pv_mem.query_pv(sentences, non_term_mask)
+                phi = build_prefix_potential(
+                    pv,
+                    ref_log_pf,
+                    non_term_mask,
+                    counts=counts,
+                    eta=1.0,
+                    clamp=2.0,
+                    tau_conf=self.pv_mem.tau_conf,
+                )
+                reward_mixed = apply_potential_shaping(reward_mixed, phi, phi_weight)
+
+            # Update memory after querying to avoid same-batch leakage.
+            self.pv_mem.update(sentences, y, non_term_mask)
 
         return {
             "reward": reward_mixed,

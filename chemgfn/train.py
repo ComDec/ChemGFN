@@ -132,11 +132,6 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     # If --debug flag is set, apply debug-friendly defaults unless explicitly overridden
     if DEBUG_FLAG:
-        hydra_overrides = HydraConfig.get().overrides.task
-
-        def _has_override(prefix: str) -> bool:
-            return any(item.startswith(prefix) for item in hydra_overrides)
-
         cfg.logger.wandb.offline = True
         cfg.exp_name = "debug"
         cfg.trainer.devices = 1

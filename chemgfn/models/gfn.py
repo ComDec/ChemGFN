@@ -431,6 +431,17 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
+        phi_diag = result_dict.get("phi_diag", None)
+        if phi_diag is not None:
+            for key, value in phi_diag.items():
+                self._log_metrics(
+                    {
+                        f"phi_diag/{key}": value,
+                    },
+                    on_step=True,
+                    sync_dist=True,
+                )
+
         self._log_metrics(
             {
                 f"train/validator_{key}": (value, {"prog_bar": True})

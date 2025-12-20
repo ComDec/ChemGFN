@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "expr24"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "debug_expr24_unified_space"
+exp_name: "debug_expr24_unified_space_phi_1_diff_shaping"
 seed: 42
 
 # ============================================================================
@@ -39,7 +39,7 @@ model:
     lr: 0.0001
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shaping
     invalid_start_ratio: 0.2
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}

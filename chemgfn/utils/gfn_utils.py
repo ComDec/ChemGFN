@@ -334,6 +334,10 @@ def generate_and_return_termination_logprob(
             # if you use split reward and loss
             log_r_reference = reward_results.get("reward_reference", None)
             log_r_target = reward_results.get("reward_target", None)
+
+            # extra phi information
+            phi_diag = reward_results.get("prefix_diag", None)
+
         else:
             log_r, log_r_unpenalized = reward_results
 
@@ -350,6 +354,7 @@ def generate_and_return_termination_logprob(
         "agree_list": agree_entries,
         "full_tokens": full_tokens,
         "validator_dict": validator_dict,
+        "phi_diag": phi_diag,
     }
 
 
