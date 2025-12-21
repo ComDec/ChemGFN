@@ -28,6 +28,7 @@ trainer:
   num_sanity_val_steps: 0
   limit_train_batches: 30
   limit_val_batches: 5
+  log_every_n_steps: 10
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -40,12 +41,37 @@ model:
 
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
-    invalid_start_ratio: 0.2
-    invalid_end_ratio: 1.2
-    disable_peft: ${model.disable_peft}
+
+    # config params
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+
+    # phi params
     phi_weight: 1.0
+    phi_warmup: 20
+    phi_ramp_steps: 200
+    phi_decay_start: 1000
+    phi_decay_gamma: 0.999
+    dphi_clip: 2.0
+
+    # entropy gate
+    use_entropy_gate: true
+    ent_lo: 0.10
+    ent_hi: 0.55
+
+    # phi build params
+    phi_eta: 1.0
+    phi_clamp: 2.0
+    pv_memory_kwargs:
+      kmax: 4
+      alpha: 1.0
+      gamma: 0.999
+      min_count: 50.0
+      max_keys: 500000
+      prune_every: 2000
+      prune_threshold: 1.0
+      tau_conf: 20.0
+
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.reward.Expr24Validator

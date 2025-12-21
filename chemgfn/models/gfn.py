@@ -37,6 +37,7 @@ from chemgfn.utils.gfn_utils import (
     lora_to_base,
     prepare_token_mask,
 )
+from chemgfn.utils.phi_utils import PrefixValueMemory, compute_active_before
 from chemgfn.utils.schedulers import Scheduler
 
 # Re-export Scheduler for backward compatibility with config files
@@ -160,6 +161,10 @@ class ChemGFNModule(LightningModule):
         except Exception as exc:  # pragma: no cover - defensive logging
             print(f"torch.compile failed, continuing without compilation: {exc}")
 
+        # phi cache
+        self._pv_probe_cache = None
+        self._pv_report_epoch = -1
+
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
@@ -252,6 +257,12 @@ class ChemGFNModule(LightningModule):
         buffer_sample = item["buffer_encoded_sample"]
         use_dataset_buffer = False
 
+        # Hot patch for prefix value memory
+        if self.reward.pv_mem is not None:
+            self.reward.set_step(self.global_step)
+            nums_pv_keys = len(self.reward.pv_mem.stats.keys())
+            self.log("train/nums_pv_keys", nums_pv_keys, sync_dist=True, on_step=True)
+
         # Buffer 1: Try to use replay buffer
         if random.random() <= self.get_replay_buffer_at_step(self.global_step):
             replay_buffer_result = self.generate_from_replay_buffer(item, encoded_prompt)
@@ -299,6 +310,31 @@ class ChemGFNModule(LightningModule):
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         agree_list = result_dict["agree_list"]
 
+        # Extra phi information
+        phi_state = getattr(result_dict, "phi_state", torch.zeros_like(log_pf))
+        phi_tok = getattr(result_dict, "phi_tok", torch.zeros_like(log_pf))
+        pv = getattr(result_dict, "pv", torch.zeros_like(log_pf))
+
+        if self._pv_probe_cache is None:
+            if (not use_replay_buffer) and (not use_dataset_buffer):
+                eos = self.end_of_sentence_token_id
+                B = generated_text.shape[0]
+                B_probe = min(B, 128)
+
+                T_tok = log_pf_ref.shape[1]
+
+                probe_tokens = (
+                    generated_text[:B_probe, prompt_len : prompt_len + T_tok].detach().cpu()
+                )
+                probe_active_before = compute_active_before(probe_tokens, eos=eos).detach().cpu()
+                probe_ref_log_pf = log_pf_ref[:B_probe, :T_tok].detach().cpu()
+
+                self._pv_probe_cache = {
+                    "tokens": probe_tokens,
+                    "active_before": probe_active_before,
+                    "ref_log_pf": probe_ref_log_pf,
+                }
+
         if use_replay_buffer:
             log_r = model_log_r[:, : max(0, generated_text.shape[1] - prompt_len)]
         else:
@@ -316,6 +352,7 @@ class ChemGFNModule(LightningModule):
         scheduled_values = {}
         for key, value in self.factor_schedulers.items():
             scheduled_values[key] = value(self.global_step)
+
         # Log each scheduled value separately (Lightning doesn't support logging dicts directly)
         self.log_dict(
             {f"scheduled/{key}": val for key, val in scheduled_values.items()},
@@ -404,6 +441,9 @@ class ChemGFNModule(LightningModule):
                     "log_pterm_ref_list": [
                         float(x) for x in log_pterm_ref[0].detach().cpu().tolist()
                     ],
+                    "phi_state_list": [float(x) for x in phi_state[0].detach().cpu().tolist()],
+                    "phi_tok_list": [float(x) for x in phi_tok[0].detach().cpu().tolist()],
+                    "pv_list": [float(x) for x in pv[0].detach().cpu().tolist()],
                     "valid": float(acc_val),
                     "buffer": bool(use_replay_buffer or use_dataset_buffer),
                     "source": "replay"
@@ -431,12 +471,12 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
-        phi_diag = result_dict.get("phi_diag", None)
-        if phi_diag is not None:
-            for key, value in phi_diag.items():
+        prefix_diag = result_dict.get("prefix_diag", None)
+        if prefix_diag is not None:
+            for key, value in prefix_diag.items():
                 self._log_metrics(
                     {
-                        f"phi_diag/{key}": value,
+                        f"prefix_diag/{key}": value,
                     },
                     on_step=True,
                     sync_dist=True,
@@ -567,25 +607,27 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
 
     def on_train_epoch_end(self):
+        if hasattr(self, "global_rank") and self.global_rank != 0:
+            return
+
         if self.train_samples:
             df = pd.DataFrame(self.train_samples)
             df = df.sort_values(by="buffer", ascending=False).reset_index(drop=True)
         else:
             df = pd.DataFrame(columns=["decoded", "pf_temp", "logP", "valid", "buffer", "source"])
+
+        _root_dir = os.path.join(self.trainer.default_root_dir, "train_samples")
+        os.makedirs(_root_dir, exist_ok=True)
         df.to_csv(
-            os.path.join(
-                self.trainer.default_root_dir,
-                f"samples_train_probes_{self.trainer.current_epoch}.csv",
-            ),
+            os.path.join(_root_dir, f"samples_train_probes_{self.trainer.current_epoch}.csv"),
             index=False,
         )
 
         plt.hist(self.train_sentence_length, bins=50)
+        _root_dir = os.path.join(self.trainer.default_root_dir, "train_sentence_length")
+        os.makedirs(_root_dir, exist_ok=True)
         plt.savefig(
-            os.path.join(
-                self.trainer.default_root_dir,
-                f"train_sentence_length_{self.trainer.current_epoch}.png",
-            )
+            os.path.join(_root_dir, f"train_sentence_length_{self.trainer.current_epoch}.png")
         )
         plt.close()
 
@@ -602,6 +644,42 @@ class ChemGFNModule(LightningModule):
             self.logger.log_table("train/samples_latest", dataframe=df)
         self.train_samples.clear()
         self.train_sentence_length.clear()
+
+        if (self._pv_probe_cache is None) or (getattr(self.reward, "pv_mem", None) is None):
+            return
+
+        pv_mem = self.reward.pv_mem
+        if (self.trainer.current_epoch + 1) % 10 == 0:
+            root_dir = os.path.join(self.trainer.default_root_dir, "phi_report")
+            os.makedirs(root_dir, exist_ok=True)
+            csv_kgram_path = os.path.join(root_dir, f"kgram_{self.trainer.current_epoch}.csv")
+            csv_prefix_path = os.path.join(root_dir, f"prefix_{self.trainer.current_epoch}.csv")
+
+            rep = pv_mem.report(
+                max_keys_sample=20000,
+                csv_kgram_path=csv_kgram_path,
+                csv_prefix_path=csv_prefix_path,
+                probe_tokens=self._pv_probe_cache["tokens"],
+                probe_active_before=self._pv_probe_cache["active_before"],
+                probe_ref_log_pf=self._pv_probe_cache["ref_log_pf"],
+                phi_eta=getattr(self.reward, "phi_eta", 1.0),
+                phi_clamp=getattr(self.reward, "phi_clamp", 2.0),
+                tau_conf=getattr(pv_mem, "tau_conf", 20.0),
+            )
+        else:
+            rep = pv_mem.report(
+                max_keys_sample=20000,
+                csv_kgram_path=None,
+                csv_prefix_path=None,
+                probe_tokens=self._pv_probe_cache["tokens"],
+                probe_active_before=self._pv_probe_cache["active_before"],
+                probe_ref_log_pf=self._pv_probe_cache["ref_log_pf"],
+                phi_eta=getattr(self.reward, "phi_eta", 1.0),
+                phi_clamp=getattr(self.reward, "phi_clamp", 2.0),
+                tau_conf=getattr(pv_mem, "tau_conf", 20.0),
+            )
+
+        self.log_dict({f"pv_report/{k}": v for k, v in rep.items()}, on_epoch=True, sync_dist=True)
 
     def on_train_epoch_start(self):
         self.log(
@@ -652,9 +730,11 @@ class ChemGFNModule(LightningModule):
 
         if self.val_probes is not None and self.logger is not None:
             samples_table = self.sample_probes(self.val_probes)
+            _root_dir = os.path.join(self.trainer.default_root_dir, "validation_samples")
+            os.makedirs(_root_dir, exist_ok=True)
             samples_table.to_csv(
                 os.path.join(
-                    self.trainer.default_root_dir,
+                    _root_dir,
                     f"samples_val_probes_{self.trainer.global_step}.csv",
                 ),
                 index=False,
