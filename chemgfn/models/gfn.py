@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -32,7 +33,6 @@ from chemgfn.utils.gfn_utils import (
     base_to_lora,
     calculate_diversity,
     generate_and_return_termination_logprob,
-    generate_and_return_termination_logprob_for_sidechain_opt,
     get_termination_vals,
     lora_to_base,
     prepare_token_mask,
@@ -164,6 +164,10 @@ class ChemGFNModule(LightningModule):
         # phi cache
         self._pv_probe_cache = None
         self._pv_report_epoch = -1
+        debug_shapes = os.environ.get("CHEMGFN_DEBUG_SHAPES", "0") == "1"
+        debug_steps = int(os.environ.get("CHEMGFN_DEBUG_SHAPES_STEPS", "1"))
+        self.debug_shapes = debug_shapes
+        self._debug_shapes_remaining = debug_steps if debug_shapes else 0
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -207,6 +211,7 @@ class ChemGFNModule(LightningModule):
         n_samples = n_samples or self.training_mixed_config.n_samples
         encoded_prompt = encoded_prompt.expand(n_samples, -1)
         encoded_data["encoded_prompt"] = encoded_prompt
+        prompt_len = encoded_prompt.shape[1]
 
         generation_config = {
             "model": self.net,
@@ -240,12 +245,47 @@ class ChemGFNModule(LightningModule):
             ),
         }
 
-        generator = (
-            generate_and_return_termination_logprob_for_sidechain_opt
-            if self.opt_task
-            else generate_and_return_termination_logprob
-        )
-        return generator(**generation_config)
+        result = generate_and_return_termination_logprob(**generation_config)
+
+        if self._debug_shapes_remaining > 0:
+            self._debug_shapes_remaining -= 1
+            state = result["state"]
+            log_pf = result["log_pf"]
+            log_pterm = result["log_pterm"]
+            log_r = result.get("log_r")
+            log_r_unpenalized = result.get("log_r_unpenalized")
+            log_pf_ref = result.get("log_pf_ref")
+            log_pterm_ref = result.get("log_pterm_ref")
+
+            B = state.shape[0]
+            T_tok = log_pf.shape[1] if log_pf is not None else None
+            L_state = (
+                log_r.shape[1]
+                if log_r is not None
+                else (log_pterm.shape[1] if log_pterm is not None else None)
+            )
+            gen_tokens = state[:, prompt_len : prompt_len + T_tok] if T_tok is not None else None
+
+            assert log_pf is not None and log_pf.ndim == 2
+            assert log_pterm is not None and log_pterm.ndim == 2
+            assert log_pf.shape[0] == B and log_pterm.shape[0] == B
+            if log_r is not None:
+                assert log_r.shape[0] == B
+
+            print(
+                "[forward debug] step="
+                f"{int(self.global_step)} B={B} T_tok={T_tok} L_state={L_state} "
+                f"state={tuple(state.shape)} "
+                f"gen_tokens={None if gen_tokens is None else tuple(gen_tokens.shape)} "
+                f"log_pf={tuple(log_pf.shape)} log_pterm={tuple(log_pterm.shape)} "
+                f"log_r={None if log_r is None else tuple(log_r.shape)} "
+                f"log_r_unpenalized="
+                f"{None if log_r_unpenalized is None else tuple(log_r_unpenalized.shape)} "
+                f"log_pf_ref={None if log_pf_ref is None else tuple(log_pf_ref.shape)} "
+                f"log_pterm_ref={None if log_pterm_ref is None else tuple(log_pterm_ref.shape)}"
+            )
+
+        return result
 
     # ------------------------------------------------------------------ #
     # Training / validation loops
@@ -311,9 +351,16 @@ class ChemGFNModule(LightningModule):
         agree_list = result_dict["agree_list"]
 
         # Extra phi information
-        phi_state = getattr(result_dict, "phi_state", torch.zeros_like(log_pf))
-        phi_tok = getattr(result_dict, "phi_tok", torch.zeros_like(log_pf))
-        pv = getattr(result_dict, "pv", torch.zeros_like(log_pf))
+        phi_state = result_dict.get("phi_state", None)
+        phi_tok = result_dict.get("phi_tok", None)
+        pv = result_dict.get("pv", None)
+
+        if phi_state is None:
+            phi_state = torch.zeros_like(log_pterm)
+        if phi_tok is None:
+            phi_tok = torch.zeros_like(log_pf)
+        if pv is None:
+            pv = torch.zeros_like(log_pf)
 
         if self._pv_probe_cache is None:
             if (not use_replay_buffer) and (not use_dataset_buffer):
@@ -441,9 +488,13 @@ class ChemGFNModule(LightningModule):
                     "log_pterm_ref_list": [
                         float(x) for x in log_pterm_ref[0].detach().cpu().tolist()
                     ],
-                    "phi_state_list": [float(x) for x in phi_state[0].detach().cpu().tolist()],
-                    "phi_tok_list": [float(x) for x in phi_tok[0].detach().cpu().tolist()],
-                    "pv_list": [float(x) for x in pv[0].detach().cpu().tolist()],
+                    "phi_state_list": [
+                        round(float(x), 3) for x in phi_state[0].detach().cpu().tolist()
+                    ],
+                    "phi_tok_list": [
+                        round(float(x), 3) for x in phi_tok[0].detach().cpu().tolist()
+                    ],
+                    "pv_list": [round(float(x), 3) for x in pv[0].detach().cpu().tolist()],
                     "valid": float(acc_val),
                     "buffer": bool(use_replay_buffer or use_dataset_buffer),
                     "source": "replay"
@@ -665,6 +716,7 @@ class ChemGFNModule(LightningModule):
                 phi_eta=getattr(self.reward, "phi_eta", 1.0),
                 phi_clamp=getattr(self.reward, "phi_clamp", 2.0),
                 tau_conf=getattr(pv_mem, "tau_conf", 20.0),
+                short_split=getattr(self.reward, "pv_split", 2),
             )
         else:
             rep = pv_mem.report(
@@ -677,6 +729,7 @@ class ChemGFNModule(LightningModule):
                 phi_eta=getattr(self.reward, "phi_eta", 1.0),
                 phi_clamp=getattr(self.reward, "phi_clamp", 2.0),
                 tau_conf=getattr(pv_mem, "tau_conf", 20.0),
+                short_split=getattr(self.reward, "pv_split", 2),
             )
 
         self.log_dict({f"pv_report/{k}": v for k, v in rep.items()}, on_epoch=True, sync_dist=True)

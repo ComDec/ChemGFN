@@ -183,7 +183,7 @@ def generate_and_return_termination_logprob(
             - validator_dict: Validator output dictionary (if available)
     """
     encoded_prompt = encoded_data["encoded_prompt"]
-    target_molecule = encoded_data.get("molecule")
+    scaffold = encoded_data.get("scaffold")
     device = encoded_prompt.device
 
     active_seqs = torch.ones(encoded_prompt.size(0), dtype=torch.bool, device=device)
@@ -304,6 +304,10 @@ def generate_and_return_termination_logprob(
     log_pf_ref = None
     full_tokens = None
     validator_dict = None
+    phi_diag = None
+    phi_state = None
+    phi_tok = None
+    pv = None
 
     if not skip_rewards:
         agree_tensor = _stack_if_not_empty(agree_entries)
@@ -316,7 +320,7 @@ def generate_and_return_termination_logprob(
             illegal_vocab_penalty=illegal_vocab_penalty,
             agree_list=agree_tensor,
             termination_token_id=termination_token_id,
-            target_molecule=target_molecule,
+            scaffold=scaffold,
             action_seq=action_seq,
         )
 
@@ -337,6 +341,9 @@ def generate_and_return_termination_logprob(
 
             # extra phi information
             phi_diag = reward_results.get("prefix_diag", None)
+            phi_state = reward_results.get("phi_state", None)
+            phi_tok = reward_results.get("phi_tok", None)
+            pv = reward_results.get("pv", None)
 
         else:
             log_r, log_r_unpenalized = reward_results
@@ -355,200 +362,10 @@ def generate_and_return_termination_logprob(
         "full_tokens": full_tokens,
         "validator_dict": validator_dict,
         "phi_diag": phi_diag,
-    }
-
-
-def generate_and_return_termination_logprob_for_sidechain_opt(
-    model,
-    encoded_data,
-    termination_token_id,
-    reward_fn,
-    grammar_processor=None,
-    vocab_nice_mask=None,  # Unused, kept for compatibility with generate_and_return_termination_logprob
-    vocab_invalid_mask=None,
-    illegal_vocab_penalty=float("-inf"),
-    max_len: int = 10,
-    min_len: int = 0,
-    temperature: float = 1.0,
-    reward_temperature: float = 1.0,
-    scaling_factor: float = 50,
-    action_seq=None,
-    skip_rewards: bool = False,
-    use_buffer_sample: bool = False,
-    buffer_sample=None,
-    buffer_mixture_ratio: float = 0.5,
-    return_policy_logits: bool = False,
-):
-    # generate and return the probability of terminating at every step
-    encoded_prompt = encoded_data["encoded_prompt"]
-    target_molecule = encoded_data["molecule"] if "molecule" in encoded_data else None
-    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
-    prompt_len = encoded_prompt.size(1)
-    state = encoded_prompt.clone()
-    log_pf = []
-    log_pterm = []
-    token_ids = state  # For caching hidden states during generation
-    past_key_values = None  # For caching hidden states during generation
-    if grammar_processor is not None:
-        try:
-            grammar_processor.reset()
-            grammar_processor.set_prompt_length(prompt_len)
-        except:
-            pass
-        logits_processor = grammar_processor
-    else:
-        logits_processor = LogitsProcessorList([])
-
-    default_processor = LogitsProcessorList([])
-    agree_list = []
-
-    # according mixture_ratio, ramdom replace token_ids with buffer_sample
-    nums_replace = max(1, int(token_ids.size(0) * buffer_mixture_ratio))
-
-    policy_logits: list[torch.Tensor] = []
-
-    # main loop
-    for i in range(max_len + 1):
-        output = model(input_ids=token_ids, past_key_values=past_key_values)
-        past_key_values = output.past_key_values
-        logits = output.logits[:, -1, :]
-        logits_to_record = None
-
-        if action_seq is None:
-            with torch.no_grad():
-                base_detached = logits.clone().detach()
-                modified_logits = base_detached
-                if vocab_invalid_mask is not None:
-                    modified_logits[:, vocab_invalid_mask] = -torch.inf
-
-                if i >= max_len:
-                    mask = torch.ones_like(modified_logits, dtype=torch.bool)
-                    mask[:, termination_token_id] = False
-                    modified_logits[mask] = -torch.inf
-                    # if modified_logits[:, termination_token_id] == -torch.inf, we replace it with 0
-                    modified_logits[:, termination_token_id] = 1
-                    acceptance = torch.zeros_like(modified_logits, dtype=torch.bool)
-                    acceptance[:, termination_token_id] = True
-                    agree_list.append(acceptance)
-                    token_ids = torch.ones_like(token_ids) * termination_token_id
-
-                else:
-                    modified_logits = default_processor(state, modified_logits)
-                    # apply logits processor
-                    results = logits_processor(state, modified_logits, min_len)
-                    modified_logits = results["masked_logits"]
-                    agree_list.append(results["acceptance"])
-
-                    # TODO: EOS fetching problem, temperature
-                    prob = (modified_logits / temperature).softmax(dim=-1)
-                    if torch.any(torch.isnan(prob)):
-                        # Replace NaN probabilities with uniform distribution
-                        prob = torch.ones_like(prob) / prob.size(-1)
-                    token_ids = torch.multinomial(prob, num_samples=1)
-
-                if return_policy_logits:
-                    delta = modified_logits - base_detached
-                    logits_to_record = logits + delta
-
-                    if use_buffer_sample and buffer_sample is not None:
-                        if i < buffer_sample.size(-1):
-                            if i >= max_len:
-                                token_ids[:nums_replace, :] = termination_token_id
-                            else:
-                                token_ids[:nums_replace, :] = buffer_sample[
-                                    :nums_replace, i
-                                ].unsqueeze(-1)
-                        else:
-                            token_ids[:nums_replace, :] = termination_token_id
-
-        else:
-            if i >= max_len:
-                token_ids = (torch.ones_like(action_seq[:, 0]) * termination_token_id).unsqueeze(
-                    -1
-                )
-                agree_list.append(
-                    torch.zeros_like(logits, dtype=torch.bool)
-                    .to(token_ids.device)
-                    .scatter_(1, token_ids, True)
-                )
-            else:
-                token_ids = action_seq[:, prompt_len - 1 + i].unsqueeze(-1)
-                acceptance = torch.zeros_like(logits, dtype=torch.bool).to(token_ids.device)
-                # Set the acceptance for the current token
-                acceptance.scatter_(1, token_ids, True)
-                agree_list.append(acceptance)
-            if return_policy_logits:
-                logits_to_record = logits
-
-        token_ids = torch.where(
-            active_seqs.unsqueeze(-1),
-            token_ids,
-            termination_token_id,
-        )
-
-        logprob = logits.log_softmax(dim=-1)
-
-        # prob list for termination token by steps
-        log_pterm.append(
-            torch.where(
-                active_seqs,
-                logprob[:, termination_token_id],
-                0,
-            )
-        )
-        active_seqs = active_seqs * (token_ids != termination_token_id).squeeze(-1)
-
-        # prob list for the generated token by steps
-        log_pf.append(
-            torch.where(
-                active_seqs,
-                logprob.gather(-1, token_ids).squeeze(-1),
-                0,
-            )
-        )
-        # update the state, i.e., the sequence so far
-        state = torch.cat([state, token_ids], dim=-1)
-
-        if return_policy_logits:
-            policy_logits.append(logits if logits_to_record is None else logits_to_record)
-
-    log_pf = torch.stack(log_pf, dim=1)
-    log_pterm = torch.stack(log_pterm, dim=1)
-
-    if skip_rewards:
-        log_r, log_r_unpenalized = None, None
-    else:
-        # Reward for all intermediate states (except the last one,
-        # which is guaranteed to be the termination token)
-        if agree_list is not None:
-            agree_list = torch.stack(agree_list, dim=0)
-        reward_results = reward_fn(
-            state[:, :-1],
-            reward_temperature=reward_temperature,
-            scaling_factor=scaling_factor,
-            vocab_invalid_mask=vocab_invalid_mask,
-            illegal_vocab_penalty=illegal_vocab_penalty,
-            agree_list=agree_list,
-            termination_token_id=termination_token_id,
-            target_molecule=target_molecule,
-        )
-        log_r = reward_results["reward"]
-        log_r_unpenalized = reward_results["reward_unpenalized"]
-        log_pf_ref = reward_results.get("log_pf_ref", None)
-        full_tokens = reward_results.get("full_tokens", None)
-        validator_dict = reward_results.get("validator_dict", None)
-
-    return {
-        "state": state,
-        "log_pf": log_pf,
-        "log_pterm": log_pterm,
-        "log_r": log_r,
-        "log_r_unpenalized": log_r_unpenalized,
-        "agree_list": agree_list,
-        "log_pf_ref": log_pf_ref,
-        "full_tokens": full_tokens,
-        "validator_dict": validator_dict,
-        "policy_logits": torch.stack(policy_logits, dim=1) if return_policy_logits else None,
+        "prefix_diag": phi_diag,
+        "phi_state": phi_state,
+        "phi_tok": phi_tok,
+        "pv": pv,
     }
 
 

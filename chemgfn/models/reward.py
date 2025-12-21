@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import defaultdict
 from contextlib import contextmanager
@@ -985,6 +986,7 @@ class Target_Score_Positive_MCMCPrior:
 
 from chemgfn.utils.phi_utils import (
     PrefixValueMemory,
+    PrefixValueMemoryNoBackoff,
     apply_phi_shaping,
     batch_prefix_value_kgram,
     build_prefix_potential,
@@ -1080,11 +1082,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
 
 
 class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shaping:
-    """
-    Batch 内 PV 统计（k-gram Beta-Binomial）-> token-wise φ -> differential shaping.
-    这个版本“维持原状”，不引入跨 batch memory / entropy gate / schedule 等。
-    """
-
     def __init__(
         self,
         sentence_validator,
@@ -1097,7 +1094,7 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
         pv_backoff: bool = True,
         phi_eta: float = 1.0,
         phi_clamp: float = 4.0,
-        dphi_clip: float | None = None,  # 可选：TB 下你也可以开
+        dphi_clip: float | None = None,
         score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
         **kwargs,
     ) -> None:
@@ -1163,7 +1160,6 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
             )
             valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
 
-            # 兼容 valid_score 是 (B,T_tok) 或 (B,L_state)
             if valid_score.shape[1] == reference_logP.shape[1] - 1:
                 valid_score = torch.cat(
                     [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
@@ -1181,11 +1177,8 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
             B, L_state = reward_mixed.shape
             T_tok = L_state - 1
             gen_tokens = input_batch[:, prompt_length : prompt_length + T_tok]  # (B, T_tok)
-
-            # 关键：用 active_before（包含 EOS 那一步）
             active_before = compute_active_before(gen_tokens, eos=eos)  # (B,T_tok)
 
-            # batch 内 pv
             pv = batch_prefix_value_kgram(
                 gen_tokens,
                 y,
@@ -1240,12 +1233,12 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
         sentence_validator,
         illegal_vocab_penalty: float = 0,
         grammar_disagree_penalty: float = -99,
-        phi_weight: float = 1.0,  # 最大强度
-        phi_warmup: int = 800,  # 前 warmup steps 不加 φ
-        phi_ramp_steps: int = 800,  # 线性爬坡到 phi_weight
-        phi_decay_start: int | None = None,  # None=不衰减
+        phi_weight: float = 1.0,
+        phi_warmup: int = 800,
+        phi_ramp_steps: int = 800,
+        phi_decay_start: int | None = None,
         phi_decay_gamma: float = 0.999,
-        dphi_clip: float | None = 2.0,  # TB 下建议开；SubTB 可先关(None)
+        dphi_clip: float | None = 2.0,
         # entropy gate
         use_entropy_gate: bool = True,
         ent_lo: float = 0.10,
@@ -1254,6 +1247,8 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
         phi_eta: float = 1.0,
         phi_clamp: float = 2.0,
         pv_memory_kwargs: dict[str, Any] | None = None,
+        debug_shapes: bool | None = None,
+        debug_shapes_steps: int = 1,
         score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
         **kwargs,
     ) -> None:
@@ -1307,7 +1302,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
         ent_hi: float,
     ) -> Tensor:
         p = pv.clamp(1e-6, 1.0 - 1e-6)
-        ent = -(p * p.log() + (1.0 - p) * (1.0 - p).log())  # Bernoulli entropy, max ~0.693
+        ent = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
         gate = (ent - float(ent_lo)) / max(1e-8, float(ent_hi) - float(ent_lo))
         gate = gate.clamp(0.0, 1.0)
         return gate * active_before.to(gate.dtype)
@@ -1359,7 +1354,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
             )
             valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
 
-            # 对齐 valid_score 到 (B, L_state)
             if valid_score.shape[1] == reference_logP.shape[1] - 1:
                 valid_score = torch.cat(
                     [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
@@ -1380,15 +1374,22 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
             T_tok = L_state - 1
             gen_tokens = input_batch[:, prompt_length : prompt_length + T_tok]  # (B, T_tok)
 
-            # 关键：mask 用 active_before（包含 EOS 那一步）
             active_before = compute_active_before(gen_tokens, eos=eos)  # (B,T_tok)
 
-            # EMA decay bookkeeping
             self.pv_mem.set_step(self.global_step)
             phi_w = self._phi_weight_schedule(self.global_step)
 
+            pv = None
+            counts = None
+            phi_tok = None
+            phi_state = None
+            dphi = None
+
             if phi_w > 0.0:
+                p0 = self.pv_mem.get_base_rate()
+
                 pv, counts = self.pv_mem.query_pv(gen_tokens, active_before)
+
                 phi_tok = build_prefix_potential(
                     pv=pv,
                     ref_log_pf=ref_log_pf,
@@ -1397,7 +1398,10 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
                     eta=self.phi_eta,
                     clamp=self.phi_clamp,
                     tau_conf=self.pv_mem.tau_conf,
-                )  # (B,T_tok)
+                    base_rate=p0,
+                    center_by_base=True,
+                    conf_mode="inv_sqrt",
+                )
 
                 # entropy gate
                 if self.use_entropy_gate:
@@ -1425,9 +1429,6 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
                 )
 
             else:
-                phi_state = None
-                phi_tok = None
-                pv = None
                 prefix_diag = None
 
             self.pv_mem.update(gen_tokens, y, active_before)
@@ -1442,6 +1443,344 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
             "phi_state": phi_state,
             "phi_tok": phi_tok,
             "pv": pv,
+        }
+        return out
+
+
+class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
+    """
+    PrefixValueMemoryNoBackoff + PrefixShaping + Entropy Gate
+    """
+
+    def __init__(
+        self,
+        sentence_validator,
+        illegal_vocab_penalty: float = 0,
+        grammar_disagree_penalty: float = -99,
+        phi_weight: float = 1.0,
+        phi_warmup: int = 800,
+        phi_ramp_steps: int = 800,
+        phi_decay_start: int | None = None,
+        phi_decay_gamma: float = 0.995,
+        dphi_clip: float | None = 2.0,
+        # entropy gate
+        use_entropy_gate: bool = False,
+        use_token_entropy_gate: bool = True,
+        ent_lo: float = 0.10,
+        ent_hi: float = 0.55,
+        # phi build params
+        phi_eta: float = 1.0,
+        phi_clamp: float = 2.0,
+        # split logic
+        pv_split: int = 2,  # split point
+        pv_split_inclusive: bool = True,  # True: len<=split is short prefix
+        pv_memory_kwargs: dict[str, Any] | None = None,
+        score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        **kwargs,
+    ) -> None:
+        self.sentence_validator = sentence_validator
+        self.illegal_vocab_penalty = illegal_vocab_penalty
+        self.grammar_disagree_penalty = grammar_disagree_penalty
+        self.score_function = score_function
+
+        self.phi_weight_max = phi_weight
+        self.phi_warmup = phi_warmup
+        self.phi_ramp_steps = phi_ramp_steps
+        self.phi_decay_start = phi_decay_start
+        self.phi_decay_gamma = phi_decay_gamma
+        self.dphi_clip = dphi_clip if dphi_clip is not None else None
+
+        self.use_entropy_gate = use_entropy_gate
+        self.use_token_entropy_gate = use_token_entropy_gate
+        self.ent_lo = ent_lo
+        self.ent_hi = ent_hi
+
+        self.phi_eta = phi_eta
+        self.phi_clamp = phi_clamp
+
+        self.pv_split = pv_split
+        self.pv_split_inclusive = pv_split_inclusive
+
+        self.global_step = 0
+        self.pv_mem = PrefixValueMemoryNoBackoff(**(pv_memory_kwargs or {}))
+
+    def set_step(self, step: int) -> None:
+        self.global_step = int(step)
+
+    def _phi_weight_schedule(self, step: int) -> float:
+        step = int(step)
+        if step < self.phi_warmup:
+            return 0.0
+        t = step - self.phi_warmup
+        if self.phi_ramp_steps > 0:
+            w = self.phi_weight_max * min(1.0, t / float(self.phi_ramp_steps))
+        else:
+            w = self.phi_weight_max
+        if (self.phi_decay_start is not None) and (step >= self.phi_decay_start):
+            w = w * (self.phi_decay_gamma ** (step - self.phi_decay_start))
+        return float(w)
+
+    @staticmethod
+    def _entropy_gate(pv: Tensor, active_before: Tensor, ent_lo: float, ent_hi: float) -> Tensor:
+        p = pv.clamp(1e-6, 1.0 - 1e-6)
+        ent = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
+        gate = (ent - float(ent_lo)) / max(1e-8, float(ent_hi) - float(ent_lo))
+        gate = gate.clamp(0.0, 1.0)
+        return gate * active_before.to(gate.dtype)
+
+    @staticmethod
+    def token_entropy_gate_from_batch_normalized(
+        gen_tokens: Tensor,  # (B,T) int64
+        active_before: Tensor,  # (B,T) bool
+        ent_lo: float = 0.15,
+        ent_hi: float = 0.75,
+        eps: float = 1e-12,
+    ) -> Tensor:
+        """
+        Normalized batch token-frequency entropy gate.
+        Returns gate (B,T) in [0,1].
+
+        Normalization uses log(U_t), where U_t is #unique tokens among active samples at step t.
+        This makes entropy scale invariant to batch size and varying support size.
+        """
+        B, T = gen_tokens.shape
+        device = gen_tokens.device
+        gate_t = torch.zeros((T,), device=device, dtype=torch.float32)
+
+        for t in range(T):
+            m = active_before[:, t]
+            n_active = int(m.sum().item())
+            if n_active <= 1:
+                gate_t[t] = 0.0
+                continue
+
+            toks = gen_tokens[m, t]  # (n_active,)
+            uniq, cnt = toks.unique(return_counts=True)
+            U = int(uniq.numel())
+            if U <= 1:
+                gate_t[t] = 0.0
+                continue
+
+            q = cnt.to(torch.float32) / cnt.sum().to(torch.float32)
+            H = -(q * (q + eps).log()).sum()  # Shannon entropy (nats)
+            H_norm = H / (torch.log(torch.tensor(float(U), device=device)) + eps)  # in [0,1]
+
+            gate = (H_norm - float(ent_lo)) / max(1e-8, float(ent_hi) - float(ent_lo))
+            gate_t[t] = gate.clamp(0.0, 1.0)
+
+        gate = gate_t.view(1, T).expand(B, T)
+        return gate * active_before.to(torch.float32)
+
+    @torch.no_grad()
+    def score(
+        self,
+        input_batch: Tensor,
+        prompt_length: int,
+        model=None,
+        tokenizer=None,
+        reward_temperature: float = 1.0,
+        vocab_invalid_mask=None,
+        scaling_factor: float = 0.5,
+        reference_logits_scale: float = 0.5,
+        target_molecule: str | None = None,
+        agree_list: Tensor | None = None,
+        action_seq: Tensor | None = None,
+        global_step: int = 0,
+        **kwargs,
+    ) -> dict[str, Any]:
+        eos = tokenizer.eos_token_id
+
+        reference_results = eval(self.score_function)(
+            model=model,
+            encoded_input=input_batch,
+            termination_token_id=eos,
+            skip_first=prompt_length,
+            reward_temperature=reward_temperature,
+            invalid_vocab_mask=vocab_invalid_mask,
+            agree_list=agree_list,
+            illegal_vocab_penalty=self.illegal_vocab_penalty,
+            grammar_disagree_penalty=self.grammar_disagree_penalty,
+        )
+
+        reference_logP = reference_results["reward"] * float(
+            reference_logits_scale
+        )  # (B, L_state)
+        ref_log_pf = reference_results["ref_log_pf"]  # (B, T_tok)
+        ref_log_pterm = reference_results["ref_log_pterm"]  # (B, L_state)
+
+        validator_dict = None
+        reward_mixed = reference_logP
+        prefix_diag = None
+
+        pv_raw = None
+        pv_used = None
+        counts = None
+        phi_tok = None
+        phi_state = None
+        dphi = None
+
+        if self.sentence_validator is not None:
+            validator_dict = self.sentence_validator(
+                input_batch[:, prompt_length:], tokenizer, target_molecule
+            )
+            valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
+
+            if valid_score.shape[1] == reference_logP.shape[1] - 1:
+                valid_score = torch.cat(
+                    [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
+                )
+            assert valid_score.shape == reference_logP.shape
+
+            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
+
+            # final reward
+            reward_mixed = (
+                reference_logP
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+                + float(scaling_factor) * valid_score
+            )
+
+            B, L_state = reward_mixed.shape
+            T_tok = L_state - 1
+            gen_tokens = input_batch[:, prompt_length : prompt_length + T_tok]  # (B, T_tok)
+
+            active_before = compute_active_before(gen_tokens, eos=eos)  # (B,T_tok)
+
+            # update memory
+            self.pv_mem.set_step(self.global_step)
+            phi_w = self._phi_weight_schedule(self.global_step)
+
+            # credit re-assignment inside samples
+            if phi_w > 0.0:
+                # query raw prefix success rate, no backoff
+                device = gen_tokens.device
+                p0_vec = self.pv_mem.get_base_rate_vec(
+                    T_tok, device=device, dtype=reference_logP.dtype
+                )  # (T_tok,)
+                p0_mat = p0_vec.view(1, T_tok).expand(B, T_tok)
+                pv_raw, counts = self.pv_mem.query_pv(
+                    gen_tokens, active_before
+                )  # pv_raw = P(success | prefix 0:t)
+
+                # split logic: short prefixes get inverted pv (punishment)
+                pref_len = (
+                    (torch.arange(T_tok, device=device, dtype=torch.long) + 1)
+                    .view(1, T_tok)
+                    .expand(B, T_tok)
+                )
+                short_mask = pref_len <= int(self.pv_split)  # 你现在默认 inclusive
+
+                pv_used = torch.where(short_mask, 1.0 - pv_raw, pv_raw).clamp(1e-6, 1.0 - 1e-6)
+                p0_used = torch.where(
+                    short_mask,
+                    (1.0 - p0_mat).clamp(1e-6, 1.0 - 1e-6),
+                    p0_mat.clamp(1e-6, 1.0 - 1e-6),
+                )
+
+                phi_tok = build_prefix_potential(
+                    pv=pv_used,
+                    ref_log_pf=ref_log_pf,
+                    non_term_mask=active_before,
+                    counts=counts,
+                    eta=self.phi_eta,
+                    clamp=self.phi_clamp,
+                    tau_conf=self.pv_mem.tau_conf,
+                    base_rate=p0_used,
+                    center_by_base=True,
+                    conf_mode="inv_sqrt",
+                )
+
+                # entropy gate uses pv_used
+                # Gate logic is under development
+                # if self.use_entropy_gate:
+                #     g_ent = self._entropy_gate(pv_used, active_before, self.ent_lo, self.ent_hi)
+                #     phi_tok = phi_tok * g_ent
+
+                # if self.use_token_entropy_gate:
+                #     g_ent = self.token_entropy_gate_from_batch_normalized(
+                #         gen_tokens, active_before, self.ent_lo, self.ent_hi
+                #     )
+                #     phi_tok = phi_tok * g_ent
+
+                reward_mixed, phi_state, dphi = apply_phi_shaping(
+                    reward_mixed=reward_mixed,
+                    phi_tok=phi_tok,
+                    active_before=active_before,
+                    phi_weight=phi_w,
+                    mode="differential",
+                    anchor_start=0.0,
+                    anchor_end=0.0,
+                    dphi_clip=self.dphi_clip,
+                )
+
+                # diagnostics
+                mask = active_before.to(pv_raw.dtype)
+                den = mask.sum().clamp_min(1.0)
+
+                short_f = short_mask.to(mask.dtype) * mask
+                long_f = (1.0 - short_mask.to(mask.dtype)) * mask
+                den_s = short_f.sum().clamp_min(1.0)
+                den_l = long_f.sum().clamp_min(1.0)
+
+                def mmean(x: Tensor, m: Tensor, d: Tensor) -> float:
+                    return float((x * m).sum().div(d).item())
+
+                ent_raw = -(pv_raw * pv_raw.log() + (1.0 - pv_raw) * (1.0 - pv_raw).log())
+                ent_used = -(pv_used * pv_used.log() + (1.0 - pv_used) * (1.0 - pv_used).log())
+                sat_used = ((pv_used < 0.05) | (pv_used > 0.95)).to(mask.dtype)
+
+                prefix_diag = {
+                    "pv_split": float(self.pv_split),
+                    "short_frac": float(short_f.sum().div(den).item()),
+                    "pv_raw_mean": mmean(pv_raw, mask, den),
+                    "pv_used_mean": mmean(pv_used, mask, den),
+                    "pv_raw_short_mean": mmean(pv_raw, short_f, den_s),
+                    "pv_used_short_mean": mmean(pv_used, short_f, den_s),
+                    "pv_raw_long_mean": mmean(pv_raw, long_f, den_l),
+                    "pv_used_long_mean": mmean(pv_used, long_f, den_l),
+                    "entropy_raw_mean": mmean(ent_raw, mask, den),
+                    "entropy_used_mean": mmean(ent_used, mask, den),
+                    "counts_mean": mmean(counts, mask, den),
+                    "counts_short_mean": mmean(counts, short_f, den_s),
+                    "counts_long_mean": mmean(counts, long_f, den_l),
+                    "phi_abs_mean": mmean(phi_tok.abs(), mask, den),
+                    "dphi_abs_mean": mmean(dphi.abs(), mask, den),
+                    "sat_ratio_used": mmean(sat_used, mask, den),
+                    "p0_len_mean": float(
+                        (p0_mat * active_before.to(p0_mat.dtype))
+                        .sum()
+                        .div(active_before.sum().clamp_min(1))
+                        .item()
+                    ),
+                    "p0_len_short_mean": float(
+                        (p0_mat * short_mask.to(p0_mat.dtype) * active_before.to(p0_mat.dtype))
+                        .sum()
+                        .div((short_mask & active_before).sum().clamp_min(1))
+                        .item()
+                    ),
+                    "p0_len_long_mean": float(
+                        (p0_mat * (~short_mask).to(p0_mat.dtype) * active_before.to(p0_mat.dtype))
+                        .sum()
+                        .div(((~short_mask) & active_before).sum().clamp_min(1))
+                        .item()
+                    ),
+                }
+
+            # update memory after scoring
+            self.pv_mem.update(gen_tokens, y, active_before)
+
+        out = {
+            "reward": reward_mixed,
+            "reward_unpenalized": reference_logP,
+            "log_pf_ref": ref_log_pf,
+            "log_pterm_ref": ref_log_pterm,
+            "validator_dict": validator_dict,
+            "prefix_diag": prefix_diag,
+            "phi_state": phi_state,
+            "phi_tok": phi_tok,
+            "pv_raw": pv_raw,
+            "pv": pv_used,
+            "counts": counts,
         }
         return out
 

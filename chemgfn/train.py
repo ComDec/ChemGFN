@@ -135,6 +135,8 @@ def main(cfg: DictConfig) -> Optional[float]:
         cfg.logger.wandb.offline = True
         cfg.exp_name = "debug"
         cfg.trainer.devices = 1
+        os.environ.setdefault("CHEMGFN_DEBUG_SHAPES", "1")
+        os.environ.setdefault("CHEMGFN_DEBUG_SHAPES_STEPS", "1")
 
     # train the model
     metric_dict, _ = train(cfg)

@@ -67,6 +67,7 @@ model:
       alpha: 1.0
       gamma: 0.999
       min_count: 50.0
+      min_count_ngram: 2
       max_keys: 500000
       prune_every: 2000
       prune_threshold: 1.0
