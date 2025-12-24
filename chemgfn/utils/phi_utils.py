@@ -1,8 +1,8 @@
 import csv
 import math
 import random
-from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple
+from collections import Counter, defaultdict, deque
+from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -265,8 +265,6 @@ class PrefixValueMemory:
     def set_step(self, step: int) -> None:
         """Update current step (non-decreasing)."""
         step = int(step)
-        if step < self.step:
-            raise ValueError(f"step must be non-decreasing: got {step} < {self.step}")
         if step > self.step:
             self.step = step
         self._decay_global()
@@ -805,9 +803,11 @@ def compute_prefix_diagnostics(
     pv: torch.Tensor,  # (B, T_tok) in (0,1)
     phi_state: torch.Tensor,  # (B, L_state)
     active_before: torch.Tensor,  # (B, T_tok) True=该 token 动作发生时 still active（包含 EOS 那一步）
+    phi_tok: torch.Tensor | None = None,  # (B, T_tok)
     pv_sat_lo: float = 0.05,
     pv_sat_hi: float = 0.95,
     eps: float = 1e-8,
+    first_steps: int = 6,
 ):
     """
     产出：
@@ -866,7 +866,7 @@ def compute_prefix_diagnostics(
         # 你也可以额外看信号强度（和 grammar penalty 对比）
         phi_abs_mean = _masked_mean(phi_state.abs(), state_active_mask, dim=None, eps=eps)
 
-        return {
+        out = {
             # scalars (直接 log)
             "phi_var_mean": phi_var_mean.detach(),
             "phi_abs_mean": phi_abs_mean.detach(),
@@ -876,6 +876,26 @@ def compute_prefix_diagnostics(
             "pv_sat_ratio": pv_sat_ratio.detach(),
             "pv_logit_abs_mean": pv_logit_abs_mean.detach(),
         }
+
+        if first_steps > 0:
+            steps = min(int(first_steps), T_tok)
+            if steps > 0:
+                pv_var = _masked_var_across_batch(pv, active_before, eps=eps)[:steps]
+                pv_counts = active_before.sum(dim=0)[:steps]
+                if (pv_counts > 0).any():
+                    out["pv_tok_var_first_k"] = pv_var[pv_counts > 0].mean().detach()
+
+                if phi_tok is not None:
+                    phi_var = _masked_var_across_batch(phi_tok, active_before, eps=eps)[:steps]
+                    phi_counts = active_before.sum(dim=0)[:steps]
+                    if (phi_counts > 0).any():
+                        out["phi_tok_var_first_k"] = phi_var[phi_counts > 0].mean().detach()
+                        phi_abs = _masked_mean(phi_tok.abs(), active_before, dim=0, eps=eps)[
+                            :steps
+                        ]
+                        out["phi_tok_abs_mean_first_k"] = phi_abs[phi_counts > 0].mean().detach()
+
+        return out
 
 
 class PrefixValueMemoryNoBackoff:

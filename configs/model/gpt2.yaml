@@ -37,7 +37,7 @@ reward:
   invalid_start_ratio: 0.2
   invalid_end_ratio: 1.2
   sentence_validator:
-    _target_: chemgfn.models.reward.ParenthesesValidator
+    _target_: chemgfn.models.validators.ParenthesesValidator
 
 reward_config:
   reward_temp_start: 2

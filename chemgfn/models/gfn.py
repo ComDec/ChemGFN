@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import random
 import sys
@@ -37,7 +36,11 @@ from chemgfn.utils.gfn_utils import (
     lora_to_base,
     prepare_token_mask,
 )
-from chemgfn.utils.phi_utils import PrefixValueMemory, compute_active_before
+from chemgfn.utils.phi_utils import compute_active_before
+from chemgfn.utils.prefix_metrics import (
+    prefix_collapse_by_k,
+    prefix_collapse_by_position,
+)
 from chemgfn.utils.schedulers import Scheduler
 
 # Re-export Scheduler for backward compatibility with config files
@@ -125,7 +128,7 @@ class ChemGFNModule(LightningModule):
         if hasattr(reward, "illegal_vocab_penalty"):
             self.illegal_vocab_penalty = float(reward.illegal_vocab_penalty)
         else:
-            self.illegal_vocab_penalty = -99
+            self.illegal_vocab_penalty = 0
 
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -134,20 +137,26 @@ class ChemGFNModule(LightningModule):
         self.train_sentence_length: list = []
         self.train_samples: list = []
         self.val_samples: list = []
+        self.test_samples: list = []
+        self.train_samples_ids: list = []
+        self.val_samples_ids: list = []
+        self.test_samples_ids: list = []
+        self.val_samples_table: list = []
+        self.val_log_rs: list = []
+        self.val_log_pfss: list = []
+        self.test_samples_table: list = []
+        self.test_log_rs: list = []
+        self.test_log_pfss: list = []
 
-        self.opt_task = self.training_mixed_config.get("opt_task", False)
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
 
         # Initialize loss function from config
         self.loss_fn: GFNLoss = loss_fn
-        self.return_policy_logits = bool(getattr(self.loss_fn, "requires_policy_logits", False))
 
-        # Optional: loss weight schedulers（直接复用 factor_schedulers，由具体 loss 自行取用）
+        # Optional: loss weight schedulers
         self.loss_weight_schedulers = dict(self.factor_schedulers)
         if hasattr(self.loss_fn, "set_weight_schedulers"):
             self.loss_fn.set_weight_schedulers(self.loss_weight_schedulers)
-
-        self.return_policy_logits = True
 
         if hasattr(self.loss_fn, "set_alpha_reference"):
             self.loss_fn.set_alpha_reference(self.get_alpha_reference_at_step(self.global_step))
@@ -164,14 +173,12 @@ class ChemGFNModule(LightningModule):
         # phi cache
         self._pv_probe_cache = None
         self._pv_report_epoch = -1
+
+        # debug flags
         debug_shapes = os.environ.get("CHEMGFN_DEBUG_SHAPES", "0") == "1"
         debug_steps = int(os.environ.get("CHEMGFN_DEBUG_SHAPES_STEPS", "1"))
         self.debug_shapes = debug_shapes
         self._debug_shapes_remaining = debug_steps if debug_shapes else 0
-
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
 
     def set_probes(self, train_probes, val_probes):
         self.train_probes = train_probes
@@ -238,7 +245,6 @@ class ChemGFNModule(LightningModule):
             "use_buffer_sample": use_buffer_sample,
             "buffer_sample": buffer_sample,
             "buffer_mixture_ratio": buffer_mixture_ratio,
-            "return_policy_logits": self.return_policy_logits,
             "disable_grammar": getattr(self.constraint_config, "disable_grammar", False),
             "grammar_disagree_penalty": getattr(
                 self.training_mixed_config, "grammar_disagree_penalty", -80
@@ -297,11 +303,18 @@ class ChemGFNModule(LightningModule):
         buffer_sample = item["buffer_encoded_sample"]
         use_dataset_buffer = False
 
-        # Hot patch for prefix value memory
-        if self.reward.pv_mem is not None:
-            self.reward.set_step(self.global_step)
+        # Set prefix value memory if available
+        pv_mem = getattr(self.reward, "pv_mem", None)
+        if pv_mem is not None:
+            if hasattr(self.reward, "set_step"):
+                self.reward.set_step(self.global_step)
+            self.reward.pv_mem.set_step(self.global_step)
             nums_pv_keys = len(self.reward.pv_mem.stats.keys())
-            self.log("train/nums_pv_keys", nums_pv_keys, sync_dist=True, on_step=True)
+            self._log_metrics(
+                {"train/nums_pv_keys": nums_pv_keys},
+                sync_dist=True,
+                on_step=True,
+            )
 
         # Buffer 1: Try to use replay buffer
         if random.random() <= self.get_replay_buffer_at_step(self.global_step):
@@ -340,6 +353,7 @@ class ChemGFNModule(LightningModule):
         generated_text = result_dict["state"]
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
+
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
 
@@ -354,6 +368,15 @@ class ChemGFNModule(LightningModule):
         phi_state = result_dict.get("phi_state", None)
         phi_tok = result_dict.get("phi_tok", None)
         pv = result_dict.get("pv", None)
+        phi_weight = result_dict.get("phi_weight", 0)
+
+        self._log_metrics(
+            {
+                "train/phi_weight": phi_weight if phi_weight is not None else 0,
+            },
+            sync_dist=True,
+            on_step=True,
+        )
 
         if phi_state is None:
             phi_state = torch.zeros_like(log_pterm)
@@ -401,16 +424,19 @@ class ChemGFNModule(LightningModule):
             scheduled_values[key] = value(self.global_step)
 
         # Log each scheduled value separately (Lightning doesn't support logging dicts directly)
-        self.log_dict(
+        self._log_metrics(
             {f"scheduled/{key}": val for key, val in scheduled_values.items()},
             sync_dist=True,
             on_step=True,
         )
+
+        # CFG agreement metrics
         if not use_replay_buffer or not use_dataset_buffer:
             self._log_agreement_metrics(agree_list)
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
+
         weight_overrides = None
         if getattr(self, "loss_weight_schedulers", None):
             # Evaluate all loss-weight schedulers at the current step so losses can
@@ -439,7 +465,7 @@ class ChemGFNModule(LightningModule):
             # Log all component losses automatically
             component_losses = {f"train/{k}": v for k, v in loss_output.items() if k != "loss"}
             if component_losses:
-                self.log_dict(component_losses, on_step=True, sync_dist=True, prog_bar=True)
+                self._log_metrics(component_losses, on_step=True, sync_dist=True, prog_bar=True)
         else:
             loss = loss_output
 
@@ -452,11 +478,24 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
         )
-        validator_metric_dict = self.reward.sentence_validator.accuracy(
-            generated_text[:, prompt_len:],
-            self.tokenizer,
-            item.get("molecule", None),
-        )
+
+        validator_dict = result_dict.get("validator_dict")
+        valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
+        if self.reward.sentence_validator is None:
+            validator_metric_dict = {}
+        else:
+            tokens = generated_text[:, prompt_len:]
+            try:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                    item.get("molecule", None),
+                )
+            except TypeError:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                )
         self.train_sentence_length.append(sentence_len.detach().cpu())
 
         log_ps = last_log_r * self.reward.temperature
@@ -464,13 +503,12 @@ class ChemGFNModule(LightningModule):
 
         if batch_idx % 5 == 0:
             decoded = self._decode_generated_tokens(generated_text[0, prompt_len:])
-            acc = self.reward.sentence_validator.accuracy(
-                generated_text[0, prompt_len:].unsqueeze(0),
-                self.tokenizer,
-                item.get("molecule", None),
-            )
-            acc_val = acc["acc"] if isinstance(acc, dict) and "acc" in acc else float(acc)
+            if valid_flags is not None and len(valid_flags) > 0:
+                acc_val = float(valid_flags[0])
+            else:
+                acc_val = 0.0
 
+            self.train_samples_ids.extend(generated_text[:, prompt_len:].detach().cpu().tolist())
             self.train_samples.append(
                 {
                     "decoded": decoded,
@@ -522,16 +560,23 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
-        prefix_diag = result_dict.get("prefix_diag", None)
-        if prefix_diag is not None:
-            for key, value in prefix_diag.items():
-                self._log_metrics(
-                    {
-                        f"prefix_diag/{key}": value,
-                    },
-                    on_step=True,
-                    sync_dist=True,
-                )
+        prefix_value_diag = result_dict.get("prefix_value_diag", None)
+        if prefix_value_diag is not None:
+            metrics = {}
+            for key, value in prefix_value_diag.items():
+                if isinstance(value, torch.Tensor):
+                    if value.ndim == 0:
+                        metrics[f"prefix_value_diag/{key}"] = value
+                    elif value.ndim == 1:
+                        for idx, v in enumerate(value):
+                            metrics[f"prefix_value_diag/{key}/t{idx}"] = v
+                elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                    for idx, v in enumerate(value):
+                        metrics[f"prefix_value_diag/{key}/t{idx}"] = v
+                else:
+                    metrics[f"prefix_value_diag/{key}"] = value
+            if metrics:
+                self._log_metrics(metrics, on_step=True, sync_dist=True)
 
         self._log_metrics(
             {
@@ -567,11 +612,13 @@ class ChemGFNModule(LightningModule):
         log_r = result_dict["log_r"]
         log_pf_ref = result_dict["log_pf_ref"]
         log_pterm_ref = result_dict["log_pterm_ref"]
+        validator_dict = result_dict.get("validator_dict")
 
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
         self.val_samples.extend(generated_text[:, prompt_len:].tolist())
+        self.val_samples_ids.extend(generated_text[:, prompt_len:].tolist())
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
@@ -600,11 +647,11 @@ class ChemGFNModule(LightningModule):
             # Log all component losses automatically
             component_losses = {f"val/{k}": v for k, v in loss_output.items() if k != "loss"}
             if component_losses:
-                self.log_dict(component_losses, on_step=False, sync_dist=True)
+                self._log_metrics(component_losses, on_step=False, sync_dist=True)
         else:
             loss = loss_output
 
-        _, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
+        log_pfs, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
             generated_text=generated_text,
             log_pf=log_pf,
             log_pterm=log_pterm,
@@ -613,12 +660,27 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
         )
+        if log_pfs is not None:
+            self.val_log_rs.append(last_log_r.detach().cpu())
+            self.val_log_pfss.append(log_pfs.detach().cpu())
 
-        validator_metric_dict = self.reward.sentence_validator.accuracy(
-            generated_text[:, prompt_len:],
-            self.tokenizer,
-            batch.get("molecule", None),
-        )
+        validator_dict = result_dict.get("validator_dict")
+        valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
+        if self.reward.sentence_validator is None:
+            validator_metric_dict = {}
+        else:
+            tokens = generated_text[:, prompt_len:]
+            try:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                    batch.get("molecule", None),
+                )
+            except TypeError:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                )
         self._log_metrics(
             {f"val/validator_{key}": value for key, value in validator_metric_dict.items()},
             sync_dist=True,
@@ -640,6 +702,168 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
+        generated_sequences = [
+            self._decode_generated_tokens(text[prompt_len:], skip_special_tokens=False)
+            for text in generated_text
+        ]
+        if result_dict.get("full_tokens", None) is not None:
+            generated_sequences = result_dict["full_tokens"]
+
+        if valid_flags is None:
+            valid_flags = [None] * len(generated_sequences)
+
+        for idx, sequence in enumerate(generated_sequences):
+            raw_ids = generated_text[idx, prompt_len:].detach().cpu().tolist()
+            raw_ids = self._strip_special_token_ids(raw_ids)
+            self.val_samples_table.append(
+                {
+                    "Sampled sentence": sequence,
+                    "token_ids": raw_ids,
+                    "is_valid": valid_flags[idx] if idx < len(valid_flags) else None,
+                    "log_pf": log_pf[idx].detach().cpu().tolist(),
+                    "log_pterm": log_pterm[idx].detach().cpu().tolist(),
+                    "log_pf_ref": log_pf_ref[idx].detach().cpu().tolist()
+                    if log_pf_ref is not None
+                    else [],
+                    "log_pterm_ref": log_pterm_ref[idx].detach().cpu().tolist()
+                    if log_pterm_ref is not None
+                    else [],
+                    "log_r": log_r[idx].detach().cpu().tolist(),
+                    "log_r_unpenalized": log_r_unpenalized[idx].detach().cpu().tolist(),
+                }
+            )
+
+    def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
+        encoded_prompt = batch["encoded_prompt"]
+        prompt_len = encoded_prompt.shape[-1]
+        result_dict = self.forward(batch, reward_temperature=1.0, pf_temperature=1.0)
+        generated_text = result_dict["state"]
+        log_pf = result_dict["log_pf"]
+        log_pterm = result_dict["log_pterm"]
+        log_r = result_dict["log_r"]
+        log_pf_ref = result_dict["log_pf_ref"]
+        log_pterm_ref = result_dict["log_pterm_ref"]
+        validator_dict = result_dict.get("validator_dict")
+
+        log_r_reference = result_dict["log_r_reference"]
+        log_r_target = result_dict["log_r_target"]
+        log_r_unpenalized = result_dict["log_r_unpenalized"]
+        self.test_samples.extend(generated_text[:, prompt_len:].tolist())
+        self.test_samples_ids.extend(generated_text[:, prompt_len:].tolist())
+
+        if hasattr(self.loss_fn, "set_global_step"):
+            self.loss_fn.set_global_step(self.global_step)
+        weight_overrides = None
+        if getattr(self, "loss_weight_schedulers", None):
+            weight_overrides = {
+                name: sched(self.global_step)
+                for name, sched in self.loss_weight_schedulers.items()
+            }
+        loss_output = self.loss_fn(
+            log_pf=log_pf,
+            log_r=log_r,  # compatibility with old loss functions
+            log_r_reference=log_r_reference,
+            log_r_target=log_r_target,
+            log_pterm=log_pterm,
+            generated_text=generated_text,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=prompt_len,
+            global_step=self.global_step,
+            weight_overrides=weight_overrides,
+        )
+
+        if isinstance(loss_output, dict):
+            loss = loss_output["loss"]
+            component_losses = {f"test/{k}": v for k, v in loss_output.items() if k != "loss"}
+            if component_losses:
+                self._log_metrics(component_losses, on_step=False, sync_dist=True)
+        else:
+            loss = loss_output
+
+        log_pfs, last_log_r, last_log_r_unpenalized, sentence_len = get_termination_vals(
+            generated_text=generated_text,
+            log_pf=log_pf,
+            log_pterm=log_pterm,
+            log_r=log_r,
+            log_r_unpenalized=log_r_unpenalized,
+            termination_token_id=self.end_of_sentence_token_id,
+            prompt_len=prompt_len,
+        )
+        if log_pfs is not None:
+            self.test_log_rs.append(last_log_r.detach().cpu())
+            self.test_log_pfss.append(log_pfs.detach().cpu())
+
+        validator_dict = result_dict.get("validator_dict")
+        valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
+        if self.reward.sentence_validator is None:
+            validator_metric_dict = {}
+        else:
+            tokens = generated_text[:, prompt_len:]
+            try:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                    batch.get("molecule", None),
+                )
+            except TypeError:
+                validator_metric_dict = self.reward.sentence_validator.accuracy(
+                    tokens,
+                    self.tokenizer,
+                )
+        self._log_metrics(
+            {f"test/validator_{key}": value for key, value in validator_metric_dict.items()},
+            sync_dist=True,
+            on_epoch=True,
+        )
+
+        log_ps = last_log_r * self.get_reward_temp_at_step(self.global_step)
+        log_ps_unpenalized = last_log_r_unpenalized * self.get_reward_temp_at_step(
+            self.global_step
+        )
+        self._log_metrics(
+            {
+                "test/loss": (loss, {"prog_bar": True}),
+                "test/logR": last_log_r.mean(),
+                "test/logP(s) (avg)": log_ps.mean(),
+                "test/logP(s) (max)": log_ps.max(),
+                "test/logP(s) unpenalized (avg)": log_ps_unpenalized.mean(),
+                "test/logP(s) unpenalized (max)": log_ps_unpenalized.max(),
+                "test/Mean(log_pterm - log_pterm_ref)": (log_pterm - log_pterm_ref).mean(),
+            },
+            sync_dist=True,
+        )
+
+        generated_sequences = [
+            self._decode_generated_tokens(text[prompt_len:], skip_special_tokens=False)
+            for text in generated_text
+        ]
+        if result_dict.get("full_tokens", None) is not None:
+            generated_sequences = result_dict["full_tokens"]
+
+        if valid_flags is None:
+            valid_flags = [None] * len(generated_sequences)
+
+        for idx, sequence in enumerate(generated_sequences):
+            raw_ids = generated_text[idx, prompt_len:].detach().cpu().tolist()
+            raw_ids = self._strip_special_token_ids(raw_ids)
+            self.test_samples_table.append(
+                {
+                    "Sampled sentence": sequence,
+                    "token_ids": raw_ids,
+                    "is_valid": valid_flags[idx] if idx < len(valid_flags) else None,
+                    "log_pf": log_pf[idx].detach().cpu().tolist(),
+                    "log_pterm": log_pterm[idx].detach().cpu().tolist(),
+                    "log_pf_ref": log_pf_ref[idx].detach().cpu().tolist()
+                    if log_pf_ref is not None
+                    else [],
+                    "log_pterm_ref": log_pterm_ref[idx].detach().cpu().tolist()
+                    if log_pterm_ref is not None
+                    else [],
+                    "log_r": log_r[idx].detach().cpu().tolist(),
+                    "log_r_unpenalized": log_r_unpenalized[idx].detach().cpu().tolist(),
+                }
+            )
+
     def on_train_batch_start(
         self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
     ) -> None:
@@ -648,7 +872,7 @@ class ChemGFNModule(LightningModule):
         lr = self.lr_schedulers().get_lr()[0]
         self.reward.temperature = reward_temp
         self.reward.scaling_factor = scaling_factor
-        self.log("train/reward_temp", reward_temp, sync_dist=True, on_step=True)
+        self._log_metrics({"train/reward_temp": reward_temp}, sync_dist=True, on_step=True)
 
         for pg in self.optimizers().param_groups:
             pg["lr"] = lr
@@ -661,6 +885,7 @@ class ChemGFNModule(LightningModule):
         if hasattr(self, "global_rank") and self.global_rank != 0:
             return
 
+        # log training samples
         if self.train_samples:
             df = pd.DataFrame(self.train_samples)
             df = df.sort_values(by="buffer", ascending=False).reset_index(drop=True)
@@ -674,6 +899,29 @@ class ChemGFNModule(LightningModule):
             index=False,
         )
 
+        # log prefix collapse metrics
+        eos = self.end_of_sentence_token_id
+        seqs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.long) for x in self.train_samples_ids],
+            batch_first=True,
+            padding_value=eos,
+        )
+        active_before = compute_active_before(seqs, eos=eos)
+        non_eos = seqs != eos
+        mask_noeos = active_before & non_eos
+        seqs_list = seqs.detach().cpu().tolist()
+        mask_list = mask_noeos.detach().cpu().tolist()
+        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
+        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+        log = {
+            "prefix_pos_train/top1_auc": float(pos.top1_auc),
+            "prefix_pos_train/collapse_depth_095": float(pos.collapse_depth),
+        }
+        self._log_metrics(log, on_epoch=True, sync_dist=True)
+        self._log_wandb_prefix_tables("prefix_pos_train", pos, kmet)
+
+        # log training sentence length dist.
         plt.hist(self.train_sentence_length, bins=50)
         _root_dir = os.path.join(self.trainer.default_root_dir, "train_sentence_length")
         os.makedirs(_root_dir, exist_ok=True)
@@ -682,6 +930,7 @@ class ChemGFNModule(LightningModule):
         )
         plt.close()
 
+        # log replay buffer
         self.reward_buffer.save_csv(
             os.path.join(
                 self.trainer.default_root_dir,
@@ -691,11 +940,14 @@ class ChemGFNModule(LightningModule):
             self.tokenizer,
         )
 
-        if self.logger is not None:
-            self.logger.log_table("train/samples_latest", dataframe=df)
+        # if self.logger is not None:
+        #     self.logger.log_table("train/samples_latest", dataframe=df)
+
         self.train_samples.clear()
+        self.train_samples_ids.clear()
         self.train_sentence_length.clear()
 
+        # log prefix collapse metrics
         if (self._pv_probe_cache is None) or (getattr(self.reward, "pv_mem", None) is None):
             return
 
@@ -732,73 +984,161 @@ class ChemGFNModule(LightningModule):
                 short_split=getattr(self.reward, "pv_split", 2),
             )
 
-        self.log_dict({f"pv_report/{k}": v for k, v in rep.items()}, on_epoch=True, sync_dist=True)
-
-    def on_train_epoch_start(self):
-        self.log(
-            "scheduled/R_temperature",
-            self.get_reward_temp_at_step(self.global_step),
+        self._log_metrics(
+            {f"pv_report/{k}": v for k, v in rep.items()},
+            on_epoch=True,
             sync_dist=True,
         )
-        self.log("scheduled/lr", self.lr_schedulers().get_lr()[0], sync_dist=True)
+
+    def on_train_epoch_start(self):
+        self._log_metrics(
+            {"scheduled/R_temperature": self.get_reward_temp_at_step(self.global_step)},
+            sync_dist=True,
+        )
+        self._log_metrics(
+            {"scheduled/lr": self.lr_schedulers().get_lr()[0]},
+            sync_dist=True,
+        )
 
     def on_validation_epoch_start(self):
-        """Compute validation metrics at the start of validation epoch."""
-        log_rs, log_pfss = [], []
+        """Prepare validation probes and reset cached samples."""
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
         self.val_probes = torch.utils.data.Subset(
             val_dataset, random.sample(range(len(val_dataset)), 10)
         )
-        device = self.device
-        for idx, item in enumerate(self.trainer.datamodule.val_dataloader()):
-            encoded_prompt = item["encoded_prompt"]
-            # Move all tensors to device in one pass
-            for key, value in item.items():
-                if isinstance(value, torch.Tensor):
-                    item[key] = value.to(device, non_blocking=True)
-            result_dict = self.forward(item, pf_temperature=1.0)
-            generated_text = result_dict["state"]
-            log_pf = result_dict["log_pf"]
-            log_pterm = result_dict["log_pterm"]
-            log_r = result_dict["log_r"]
-            log_r_unpenalized = result_dict["log_r_unpenalized"]
-
-            log_pfs, log_r_val, _, _ = get_termination_vals(
-                generated_text=generated_text,
-                log_pf=log_pf,
-                log_pterm=log_pterm,
-                log_r=log_r,
-                log_r_unpenalized=log_r_unpenalized,
-                termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=len(encoded_prompt[0]),
-            )
-            log_rs.append(log_r_val)
-            log_pfss.append(log_pfs)
-
-            if idx == 10:
-                break
-
-        log_rs, log_pfss = torch.cat(log_rs), torch.cat(log_pfss)
-        self.log("val/Var(logR - logPf(s))", (log_rs - log_pfss).var(), sync_dist=True)
-
-        if self.val_probes is not None and self.logger is not None:
-            samples_table = self.sample_probes(self.val_probes)
-            _root_dir = os.path.join(self.trainer.default_root_dir, "validation_samples")
-            os.makedirs(_root_dir, exist_ok=True)
-            samples_table.to_csv(
-                os.path.join(
-                    _root_dir,
-                    f"samples_val_probes_{self.trainer.global_step}.csv",
-                ),
-                index=False,
-            )
-
-        self.val_samples = []
+        self.val_samples.clear()
+        self.val_samples_ids.clear()
+        self.val_samples_table.clear()
+        self.val_log_rs.clear()
+        self.val_log_pfss.clear()
 
     def on_validation_epoch_end(self):
         diversity = calculate_diversity(torch.tensor(self.val_samples))
-        self.log("val/diversity", diversity, sync_dist=True, on_epoch=True)
-        self.val_samples = []
+        self._log_metrics({"val/diversity": diversity}, sync_dist=True, on_epoch=True)
+
+        # log prefix collapse metrics
+        eos = self.end_of_sentence_token_id
+        seqs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.long) for x in self.val_samples_ids],
+            batch_first=True,
+            padding_value=eos,
+        )
+        active_before = compute_active_before(seqs, eos=eos)
+        non_eos = seqs != eos
+        mask_noeos = active_before & non_eos
+        seqs_list = seqs.detach().cpu().tolist()
+        mask_list = mask_noeos.detach().cpu().tolist()
+        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
+        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+        log = {
+            "prefix_pos_val/top1_auc": float(pos.top1_auc),
+            "prefix_pos_val/collapse_depth_095": float(pos.collapse_depth),
+        }
+        self._log_metrics(log, on_epoch=True, sync_dist=True)
+        self._log_wandb_prefix_tables("prefix_pos_val", pos, kmet)
+
+        if self.val_samples_table:
+            samples_table = pd.DataFrame(self.val_samples_table)
+        else:
+            samples_table = pd.DataFrame(
+                columns=[
+                    "Sampled sentence",
+                    "token_ids",
+                    "is_valid",
+                    "log_pf",
+                    "log_pterm",
+                    "log_pf_ref",
+                    "log_pterm_ref",
+                    "log_r",
+                    "log_r_unpenalized",
+                ]
+            )
+        _root_dir = os.path.join(self.trainer.default_root_dir, "validation_samples")
+        os.makedirs(_root_dir, exist_ok=True)
+        samples_table.to_csv(
+            os.path.join(
+                _root_dir,
+                f"samples_val_probes_{self.trainer.global_step}.csv",
+            ),
+            index=False,
+        )
+
+        if self.val_log_rs and self.val_log_pfss:
+            log_rs = torch.cat(self.val_log_rs)
+            log_pfss = torch.cat(self.val_log_pfss)
+            if log_rs.numel() > 0 and log_pfss.numel() > 0:
+                self._log_metrics(
+                    {"val/Var(logR - logPf(s))": (log_rs - log_pfss).var()},
+                    sync_dist=True,
+                )
+
+    def on_test_epoch_start(self):
+        self.test_samples.clear()
+        self.test_samples_ids.clear()
+        self.test_samples_table.clear()
+        self.test_log_rs.clear()
+        self.test_log_pfss.clear()
+
+    def on_test_epoch_end(self):
+        diversity = calculate_diversity(torch.tensor(self.test_samples))
+        self._log_metrics({"test/diversity": diversity}, sync_dist=True, on_epoch=True)
+
+        eos = self.end_of_sentence_token_id
+        seqs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.long) for x in self.test_samples_ids],
+            batch_first=True,
+            padding_value=eos,
+        )
+        active_before = compute_active_before(seqs, eos=eos)
+        non_eos = seqs != eos
+        mask_noeos = active_before & non_eos
+        seqs_list = seqs.detach().cpu().tolist()
+        mask_list = mask_noeos.detach().cpu().tolist()
+        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
+        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+        log = {
+            "prefix_pos_test/top1_auc": float(pos.top1_auc),
+            "prefix_pos_test/collapse_depth_095": float(pos.collapse_depth),
+        }
+        self._log_metrics(log, on_epoch=True, sync_dist=True)
+        self._log_wandb_prefix_tables("prefix_pos_test", pos, kmet)
+
+        if self.test_samples_table:
+            samples_table = pd.DataFrame(self.test_samples_table)
+        else:
+            samples_table = pd.DataFrame(
+                columns=[
+                    "Sampled sentence",
+                    "token_ids",
+                    "is_valid",
+                    "log_pf",
+                    "log_pterm",
+                    "log_pf_ref",
+                    "log_pterm_ref",
+                    "log_r",
+                    "log_r_unpenalized",
+                ]
+            )
+        _root_dir = os.path.join(self.trainer.default_root_dir, "test_samples")
+        os.makedirs(_root_dir, exist_ok=True)
+        samples_table.to_csv(
+            os.path.join(
+                _root_dir,
+                f"samples_test_{self.trainer.global_step}.csv",
+            ),
+            index=False,
+        )
+
+        if self.test_log_rs and self.test_log_pfss:
+            log_rs = torch.cat(self.test_log_rs)
+            log_pfss = torch.cat(self.test_log_pfss)
+            if log_rs.numel() > 0 and log_pfss.numel() > 0:
+                self._log_metrics(
+                    {"test/Var(logR - logPf(s))": (log_rs - log_pfss).var()},
+                    sync_dist=True,
+                )
 
     def on_train_start(self):
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
@@ -846,17 +1186,21 @@ class ChemGFNModule(LightningModule):
     # Sampling utilities
     # ------------------------------------------------------------------ #
 
-    def sample_probes(self, probes, n_samples=4):
+    def sample_probes(self, probes, n_samples=4, return_metrics: bool = False):
         """Sample and decode probe sequences for logging.
 
         Args:
             probes: List of probe data items.
             n_samples: Number of samples per probe (default: 4).
+            return_metrics: Whether to return logR/logPf(s) tensors for diagnostics.
 
         Returns:
             DataFrame with sampled sequences and their metrics.
+            If return_metrics=True, also returns (log_rs, log_pfss).
         """
         samples = []
+        log_rs = []
+        log_pfss = []
         device = self.device
         for probe in probes:
             encoded_prompt = probe["encoded_prompt"]
@@ -884,18 +1228,19 @@ class ChemGFNModule(LightningModule):
                 log_pf_ref = result_dict["log_pf_ref"]
                 log_pterm_ref = result_dict["log_pterm_ref"]
 
-            log_ps, log_ps_unpenalized = get_termination_vals(
-                generated_text=generated_text,
-                log_pf=None,
-                log_pterm=None,
-                log_r=log_r,
-                log_r_unpenalized=log_r_unpenalized,
-                termination_token_id=self.end_of_sentence_token_id,
-                prompt_len=prompt_len,
-            )[1:3]
-
-            log_ps *= self.get_reward_temp_at_step(self.global_step)
-            log_ps_unpenalized *= self.get_reward_temp_at_step(self.global_step)
+            if return_metrics:
+                log_pfs, log_r_val, _, _ = get_termination_vals(
+                    generated_text=generated_text,
+                    log_pf=log_pf,
+                    log_pterm=log_pterm,
+                    log_r=log_r,
+                    log_r_unpenalized=log_r_unpenalized,
+                    termination_token_id=self.end_of_sentence_token_id,
+                    prompt_len=prompt_len,
+                )
+                if log_pfs is not None:
+                    log_rs.append(log_r_val)
+                    log_pfss.append(log_pfs)
 
             generated_sequences = [
                 self._decode_generated_tokens(text[prompt_len:], skip_special_tokens=False)
@@ -919,7 +1264,16 @@ class ChemGFNModule(LightningModule):
                         "log_r_unpenalized": log_r_unpenalized[idx].tolist(),
                     }
                 )
-        return pd.DataFrame(samples)
+        df = pd.DataFrame(samples)
+        if return_metrics:
+            if log_rs:
+                log_rs_out = torch.cat(log_rs)
+                log_pfss_out = torch.cat(log_pfss)
+            else:
+                log_rs_out = torch.tensor([], device=self.device)
+                log_pfss_out = torch.tensor([], device=self.device)
+            return df, log_rs_out, log_pfss_out
+        return df
 
     def sample_probes_baselines(self, probes, n_samples=4):
         assert isinstance(probes, list) and probes[0].ndim == 1
@@ -1145,6 +1499,294 @@ class ChemGFNModule(LightningModule):
 
         self.pre_grammar_processor = self._build_pre_grammar_processor(parsed_grammar)
 
+    def _prepare_metric(self, value: Any, sync_dist: bool) -> Any:
+        if not sync_dist:
+            return value
+        if isinstance(value, torch.Tensor):
+            return value.to(self.device)
+        if isinstance(value, (float, int)):
+            return torch.tensor(value, device=self.device)
+        return value
+
+    def _strip_special_token_ids(self, token_ids: list[int]) -> list[int]:
+        special_ids = set(self.tokenizer.all_special_ids)
+        return [tok for tok in token_ids if tok not in special_ids]
+
+    def _log_wandb_prefix_tables(
+        self,
+        tag: str,
+        pos,
+        kmet: dict[int, dict[str, float]],
+    ) -> None:
+        if self.logger is None:
+            return
+        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+            return
+        try:
+            import wandb
+        except Exception:
+            return
+
+        loggers = self.loggers if getattr(self, "loggers", None) else [self.logger]
+        runs = []
+        for lg in loggers:
+            exp = getattr(lg, "experiment", None)
+            if exp is not None and hasattr(exp, "log") and hasattr(exp, "define_metric"):
+                runs.append(exp)
+        if not runs:
+            return
+
+        epoch = int(getattr(self.trainer, "current_epoch", 0))
+
+        # one-time: encourage scalar plots to use epoch as x-axis (doesn't touch wandb step monotonicity)
+        flag_name = f"_wandb_prefix_defined_{tag.replace('/', '_')}"
+        if not getattr(self, flag_name, False):
+            for run in runs:
+                try:
+                    run.define_metric(f"{tag}/*", step_metric="epoch")
+                except Exception:
+                    pass
+            setattr(self, flag_name, True)
+
+        payload = {"epoch": epoch}
+        local_tag = tag.replace("/", "_")
+        _root_dir = os.path.join(self.trainer.default_root_dir, "prefix_tables")
+        os.makedirs(_root_dir, exist_ok=True)
+        ranges = getattr(self, "_wandb_prefix_axis_ranges", None)
+        if ranges is None:
+            ranges = {}
+            setattr(self, "_wandb_prefix_axis_ranges", ranges)
+        tag_ranges = ranges.setdefault(tag, {})
+
+        def _update_range(key: str, values: list[float]) -> tuple[float, float] | None:
+            if not values:
+                return None
+            vmin = float(min(values))
+            vmax = float(max(values))
+            cur = tag_ranges.get(key)
+            if cur is None:
+                tag_ranges[key] = [vmin, vmax]
+            else:
+                cur[0] = min(cur[0], vmin)
+                cur[1] = max(cur[1], vmax)
+            return float(tag_ranges[key][0]), float(tag_ranges[key][1])
+
+        def _update_x_range(
+            key_min: str, key_max: str, xs: list[int]
+        ) -> tuple[float, float] | None:
+            if not xs:
+                return None
+            vmin = float(min(xs))
+            vmax = float(max(xs))
+            cur_min = float(tag_ranges.get(key_min, vmin))
+            cur_max = float(tag_ranges.get(key_max, vmax))
+            tag_ranges[key_min] = min(cur_min, vmin)
+            tag_ranges[key_max] = max(cur_max, vmax)
+            return float(tag_ranges[key_min]), float(tag_ranges[key_max])
+
+        def _apply_ylim(ax, rng: tuple[float, float] | None) -> None:
+            if rng is None:
+                return
+            ymin, ymax = rng
+            if ymin == ymax:
+                pad = 1e-6 if ymin == 0.0 else abs(ymin) * 0.05
+                ymin -= pad
+                ymax += pad
+            ax.set_ylim(ymin, ymax)
+
+        # -------------------------
+        # POS: local table + 3-subplot figure
+        # -------------------------
+        pos_rows = []
+        if getattr(pos, "top1_mass", None):
+            T = min(
+                len(getattr(pos, "top1_mass", [])),
+                len(getattr(pos, "entropy", [])),
+                len(getattr(pos, "eff_support", [])),
+            )
+            if T > 0:
+                cols = ["epoch", "t", "top1_mass", "entropy", "eff_support"]
+                if getattr(pos, "unique", None) is not None:
+                    cols.append("unique")
+                if getattr(pos, "support", None) is not None:
+                    cols.append("support")
+
+                for t in range(T):
+                    row = [
+                        epoch,
+                        int(t),
+                        float(pos.top1_mass[t]),
+                        float(pos.entropy[t]),
+                        float(pos.eff_support[t]),
+                    ]
+                    if getattr(pos, "unique", None) is not None:
+                        row.append(int(pos.unique[t]))
+                    if getattr(pos, "support", None) is not None:
+                        row.append(int(pos.support[t]))
+                    pos_rows.append(row)
+
+                pd.DataFrame(pos_rows, columns=cols).to_csv(
+                    os.path.join(_root_dir, f"{local_tag}_pos_{epoch}.csv"),
+                    index=False,
+                )
+
+                # 3 subplots in ONE figure
+                try:
+                    import matplotlib.pyplot as plt
+
+                    xs = list(range(T))
+                    top1_vals = [float(v) for v in pos.top1_mass[:T]]
+                    ent_vals = [float(v) for v in pos.entropy[:T]]
+                    eff_vals = [float(v) for v in pos.eff_support[:T]]
+                    fig, axes = plt.subplots(3, 1, figsize=(7, 7), sharex=True)
+
+                    axes[0].plot(xs, top1_vals)
+                    axes[0].set_ylabel("top1_mass")
+
+                    axes[1].plot(xs, ent_vals)
+                    axes[1].set_ylabel("entropy")
+
+                    axes[2].plot(xs, eff_vals)
+                    axes[2].set_ylabel("eff_support")
+                    axes[2].set_xlabel("t")
+
+                    _apply_ylim(axes[0], _update_range("pos_top1_mass", top1_vals))
+                    _apply_ylim(axes[1], _update_range("pos_entropy", ent_vals))
+                    _apply_ylim(axes[2], _update_range("pos_eff_support", eff_vals))
+                    x_rng = _update_x_range("pos_x_min", "pos_x_max", xs)
+                    if x_rng is not None:
+                        for ax in axes:
+                            ax.set_xlim(x_rng[0], x_rng[1])
+
+                    fig.suptitle(f"{tag} / prefix-by-position (epoch={epoch})")
+                    fig.tight_layout()
+
+                    payload[f"{tag}/pos_curves_img"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception:
+                    pass
+
+        # -------------------------
+        # K: local table + 4-subplot figure
+        # -------------------------
+        k_rows = []
+        if kmet:
+            ks = sorted(kmet.keys())
+            if ks:
+                cols = ["epoch", "k", "top1", "top5", "entropy", "eff", "n", "unique"]
+                for k in ks:
+                    v = kmet[k] or {}
+                    k_rows.append(
+                        [
+                            epoch,
+                            int(k),
+                            float(v.get("top1", 0.0)),
+                            float(v.get("top5", 0.0)),
+                            float(v.get("entropy", 0.0)),
+                            float(v.get("eff", 0.0)),
+                            float(v.get("n", 0.0)),
+                            float(v.get("unique", 0.0)),
+                        ]
+                    )
+                pd.DataFrame(k_rows, columns=cols).to_csv(
+                    os.path.join(_root_dir, f"{local_tag}_k_{epoch}.csv"),
+                    index=False,
+                )
+
+                # 4 subplots in ONE figure
+                try:
+                    import matplotlib.pyplot as plt
+
+                    xs = [int(k) for k in ks]
+                    top1s = [float(kmet[k].get("top1", 0.0)) for k in ks]
+                    top5s = [float(kmet[k].get("top5", 0.0)) for k in ks]
+                    ents = [float(kmet[k].get("entropy", 0.0)) for k in ks]
+                    effs = [float(kmet[k].get("eff", 0.0)) for k in ks]
+
+                    fig, axes = plt.subplots(4, 1, figsize=(7, 9), sharex=True)
+
+                    axes[0].plot(xs, top1s)
+                    axes[0].set_ylabel("top1")
+
+                    axes[1].plot(xs, top5s)
+                    axes[1].set_ylabel("top5")
+
+                    axes[2].plot(xs, ents)
+                    axes[2].set_ylabel("entropy")
+
+                    axes[3].plot(xs, effs)
+                    axes[3].set_ylabel("eff")
+                    axes[3].set_xlabel("k")
+
+                    _apply_ylim(axes[0], _update_range("k_top1", top1s))
+                    _apply_ylim(axes[1], _update_range("k_top5", top5s))
+                    _apply_ylim(axes[2], _update_range("k_entropy", ents))
+                    _apply_ylim(axes[3], _update_range("k_eff", effs))
+                    x_rng = _update_x_range("k_x_min", "k_x_max", xs)
+                    if x_rng is not None:
+                        for ax in axes:
+                            ax.set_xlim(x_rng[0], x_rng[1])
+
+                    fig.suptitle(f"{tag} / prefix-by-k (epoch={epoch})")
+                    fig.tight_layout()
+
+                    payload[f"{tag}/k_curves_img"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception:
+                    pass
+
+        # optional scalars
+        if getattr(pos, "top1_auc", None) is not None:
+            payload[f"{tag}/top1_auc"] = float(pos.top1_auc)
+        if getattr(pos, "collapse_depth", None) is not None:
+            payload[f"{tag}/collapse_depth_095"] = float(pos.collapse_depth)
+
+        # drop Nones
+        payload = {k: v for k, v in payload.items() if v is not None}
+        if len(payload) <= 1:
+            return
+
+        # IMPORTANT: do NOT set step manually (avoid non-monotonic step warnings)
+        for run in runs:
+            try:
+                run.log(payload)
+            except Exception:
+                pass
+
+    def _get_valid_flags(
+        self,
+        validator_dict: dict[str, Any] | None,
+        generated_text: torch.Tensor,
+        prompt_len: int,
+    ) -> list[bool] | None:
+        if not validator_dict:
+            return None
+
+        invalid = validator_dict.get("invalid")
+        if isinstance(invalid, torch.Tensor):
+            eos = self.end_of_sentence_token_id
+            tokens = generated_text[:, prompt_len:].detach().cpu()
+            invalid_cpu = invalid.detach().cpu()
+            seq_len = tokens.shape[1]
+            flags = []
+            for i in range(tokens.shape[0]):
+                row = tokens[i].tolist()
+                try:
+                    eos_pos = row.index(eos)
+                except ValueError:
+                    eos_pos = seq_len
+                prefix_len = min(eos_pos, invalid_cpu.shape[1] - 1)
+                flags.append(bool(invalid_cpu[i, prefix_len].item() == 0))
+            return flags
+
+        global_score = validator_dict.get("global_score")
+        if isinstance(global_score, torch.Tensor):
+            return (global_score > 0).detach().cpu().tolist()
+        if isinstance(global_score, (list, tuple)):
+            return [float(x) > 0 for x in global_score]
+
+        return None
+
     def _log_metrics(self, metrics: dict[str, Any], **common_kwargs) -> None:
         for name, value in metrics.items():
             if isinstance(value, tuple):
@@ -1153,6 +1795,7 @@ class ChemGFNModule(LightningModule):
             else:
                 metric_value = value
                 kwargs = common_kwargs
+            metric_value = self._prepare_metric(metric_value, bool(kwargs.get("sync_dist", False)))
             self.log(name, metric_value, **kwargs)
 
     def _log_agreement_metrics(self, agree_list) -> None:

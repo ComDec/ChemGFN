@@ -2,13 +2,28 @@
 
 defaults:
   - _self_
-  - data: default # choose datamodule with `test_dataloader()` for evaluation
-  - model: llama3
-  - logger: null
+  - data: parentheses
+  - model: gpt-2
+  - callbacks: default
+  - logger: wandb # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
   - trainer: default
   - paths: default
   - extras: default
   - hydra: default
+
+  # experiment configs allow for version control of specific hyperparameters
+  # e.g. best hyperparameters for given model and datamodule
+  - experiment: null
+
+  # config for hyperparameter optimization
+  - hparams_search: null
+
+  # optional local config for machine/user specific settings
+  # it's optional since it doesn't need to exist and is excluded from version control
+  - optional local: default
+
+  # debugging config (enable through command line, e.g. `python train.py debug=default)
+  - debug: null
 
 task_name: "eval"
 exp_name: "default"

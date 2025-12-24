@@ -45,10 +45,10 @@ model:
     disable_peft: ${model.disable_peft}
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
-    phi_weight: 1.0
+    phi_weight: 0
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.reward.Expr24Validator
+      _target_: chemgfn.models.validators.Expr24Validator
       amortize_valid_state: false
 
   loss_fn:
@@ -134,8 +134,7 @@ model:
 # Data Configuration
 # ============================================================================
 data:
-  num_workers: 8
-
+  num_workers: 0
 # ============================================================================
 # Logger Configuration
 # ============================================================================

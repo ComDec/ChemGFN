@@ -43,7 +43,7 @@ reward:
   illegal_vocab_penalty: -99
   grammar_disagree_penalty: 0
   sentence_validator:
-    _target_: chemgfn.models.reward.Expr24Validator
+    _target_: chemgfn.models.validators.Expr24Validator
 
 loss_fn:
   _target_: chemgfn.models.losses.ModifiedSubTBLoss

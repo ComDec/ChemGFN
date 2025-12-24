@@ -3,7 +3,7 @@ tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
 data_path: ${paths.data_dir}SMILES/prompts.txt
 buffer_sample_path: ${paths.data_dir}SMILES/buffer_smiles_test.pt
 train_size: 0.95
-num_workers: 8
+num_workers: 0
 pin_memory: True
 total_size: 10000
 prompt_size: 1

@@ -79,7 +79,7 @@ model:
 
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.reward.Expr24Validator
+      _target_: chemgfn.models.validators.Expr24Validator
       amortize_valid_state: false
 
   loss_fn:
@@ -165,8 +165,7 @@ model:
 # Data Configuration
 # ============================================================================
 data:
-  num_workers: 8
-
+  num_workers: 0
 # ============================================================================
 # Logger Configuration
 # ============================================================================

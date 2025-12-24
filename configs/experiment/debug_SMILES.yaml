@@ -29,6 +29,7 @@ trainer:
   limit_train_batches: 100
   limit_val_batches: 10
 
+
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
 # ============================================================================
@@ -46,12 +47,12 @@ model:
     phi_weight: 0
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.reward.RDKitValidator
-      scorer: "logP"
+      _target_: chemgfn.models.validators.RDKitValidator
+      scorer: "sa"
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.ModifiedSubTBLoss
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
@@ -63,7 +64,7 @@ model:
     buffer_aug_value: 0
 
   constraint_config:
-    min_sentence_len: 2
+    min_sentence_len: 1
     max_sentence_len: 10
     grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     disable_grammar: false
@@ -134,7 +135,9 @@ model:
 # Data Configuration
 # ============================================================================
 data:
-  num_workers: 8
+  num_workers: 0
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_sa.json
+  buffer_sample_path: null
 
 # ============================================================================
 # Logger Configuration
@@ -142,4 +145,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: True
+    offline: False

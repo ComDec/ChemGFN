@@ -68,7 +68,7 @@ reward:
   grammar_disagree_penalty: -99      # Grammar violation penalty
 
   sentence_validator:                # Sequence validator
-    _target_: chemgfn.models.reward.RDKitValidator
+    _target_: chemgfn.models.validators.RDKitValidator
     scorer: "logP"                   # Optimization target: logP, QED, SA, etc.
     backend: "pa"                    # Backend: rdkit or pa
 

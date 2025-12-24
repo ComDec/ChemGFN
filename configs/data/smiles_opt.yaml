@@ -1,9 +1,10 @@
-_target_: chemgfn.data.gfn_datamodule.MolOptDataModule
+_target_: chemgfn.data.gfn_datamodule.BufferDataModule
 tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
-data_path: ${paths.data_dir}SMILES/sidechain_prompts.json
-buffer_sample_path: ${paths.data_dir}SMILES/buffer_smiles_test.pt
+data_path: ${paths.data_dir}SMILES/sidechain_prompts_sa.json
+buffer_sample_path: null
+scaffold_list: ["O=C1Nc2cc(*)ccc2N1"]
 train_size: 0.95
-num_workers: 8
+num_workers: 0
 pin_memory: True
 total_size: 10000
 prompt_size: 1

@@ -31,7 +31,7 @@ model:
     lr: CUSTOMIZE_LR
   '# Add model-specific overrides here': null
 data:
-  num_workers: 8
+  num_workers: 0
 logger:
   wandb:
     project: CUSTOMIZE_PROJECT

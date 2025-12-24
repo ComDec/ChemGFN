@@ -2,17 +2,11 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from collections import defaultdict
 from contextlib import contextmanager
-from fractions import Fraction
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
-import partialsmiles as ps
 import torch
-
-# slient the warning
-from rdkit import Chem, RDLogger
 from torch import Tensor
 from transformers import PreTrainedTokenizer
 
@@ -21,11 +15,16 @@ from chemgfn.models.mcmc_prior import (
     load_q_mcmc,
     pack_q_mcmc_to_device,
 )
+from chemgfn.models.validators import (
+    BracketValidator,
+    Expr24Validator,
+    NumberValidator,
+    ParenthesesValidator,
+    RDKitValidator,
+    SentenceValidator,
+)
 from chemgfn.utils.gfn_utils import base_to_lora, lora_to_base
 from chemgfn.utils.phi_utils import compute_prefix_diagnostics
-from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING, verify_smiles, verify_smiles_pa
-
-RDLogger.DisableLog("rdApp.*")
 
 ScorePair = Tuple[Tensor, Tensor]
 
@@ -104,18 +103,39 @@ def _stack_if_not_empty(entries: Iterable[Tensor]) -> Tensor | None:
     return torch.stack(entries, dim=0)
 
 
-def _decode_tokens_to_string(sequence: Tensor, tokenizer: PreTrainedTokenizer) -> str:
-    pieces = []
-    for token in sequence:
-        token_id = token.item()
-        if token_id == tokenizer.eos_token_id:
-            break
-        pieces.append(tokenizer.decode(token, skip_special_tokens=False))
-    return "".join("".join(pieces).split())
+def _init_prefix_collapse(
+    prefix_collapse_kwargs: dict[str, Any] | None,
+) -> tuple[dict[str, Any], PrefixNoveltyTracker | None]:
+    cfg = prefix_collapse_kwargs or {}
+    k_list = tuple(int(k) for k in cfg.get("k_list", (1, 2, 3, 4, 5, 6)))
+    top1_thr = float(cfg.get("top1_thr", 0.95))
+    max_steps = cfg.get("max_steps", None)
+    if max_steps is not None:
+        max_steps = int(max_steps)
+    novelty_window = int(cfg.get("novelty_window", 200))
+    novelty_max_prefixes = int(cfg.get("novelty_max_prefixes", 200_000))
+
+    tracker = None
+    if novelty_window > 0:
+        tracker = PrefixNoveltyTracker(
+            k_list=k_list,
+            window_size=novelty_window,
+            max_prefixes=novelty_max_prefixes,
+        )
+
+    return {"k_list": k_list, "top1_thr": top1_thr, "max_steps": max_steps}, tracker
 
 
-def _merge_target(template: str | None, fragment: str) -> str:
-    return fragment if template is None else template.replace("*", fragment)
+def _merge_prefix_diag(
+    prefix_diag: dict[str, Any] | None,
+    extra: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not extra:
+        return prefix_diag
+    if prefix_diag is None:
+        return dict(extra)
+    prefix_diag.update(extra)
+    return prefix_diag
 
 
 @contextmanager
@@ -207,455 +227,6 @@ def score_fast(
 
 
 # --------------------------------------------------------------------------- #
-# Validators
-# --------------------------------------------------------------------------- #
-
-
-class SentenceValidator:
-    def __init__(self, termination_token_id: int = -1) -> None:
-        self.termination_token_id = termination_token_id
-
-    def __call__(self, sentences: Tensor, tokenizer: PreTrainedTokenizer, *args, **kwargs):
-        raise NotImplementedError
-
-
-class Expr24Validator(SentenceValidator):
-    """
-    24-points validator (CFG-guaranteed valid prefixes).
-    Format: d op d op d op d, where d ∈ {0..9}, op ∈ {+,-,*,/}, no parentheses.
-    Evaluation: standard precedence (*/ before +-). Equals 24 -> 1, else 0.
-    """
-
-    TOKEN_RE = re.compile(r"[0-9]|[+\-*/]")
-
-    def __init__(self, scorer: str = "hit24", amortize_valid_state: bool = False) -> None:
-        super().__init__(scorer)
-
-        # Whether to amortize the valid state of the expression to the entire batch
-        self.amortize_valid_state = amortize_valid_state
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-
-    def _decode_expr(self, tokens: Tensor, tokenizer: PreTrainedTokenizer) -> str | None:
-        try:
-            decoded = _decode_tokens_to_string(tokens, tokenizer)
-        except Exception:
-            return None
-        decoded = decoded.strip()
-        return decoded or None
-
-    def expression_accuracy(
-        self,
-        generated_tokens: Tensor,
-        tokenizer: PreTrainedTokenizer,
-    ) -> dict[str, float]:
-        if generated_tokens is None or generated_tokens.ndim == 0:
-            return {"acc": 0.0}
-        total = generated_tokens.shape[0]
-        if total == 0:
-            return {"acc": 0.0}
-
-        hits = 0
-        for sample in generated_tokens:
-            expr = self._decode_expr(sample, tokenizer)
-            if expr is None:
-                continue
-            hits += self._eval_full_expr_to_01(expr)
-        return {"acc": hits / total}
-
-    def accuracy(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-        **kwargs,
-    ) -> dict[str, float]:
-        return self.expression_accuracy(sentences, tokenizer)
-
-    def __call__(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-        *args,
-        **kwargs,
-    ) -> dict[str, Tensor]:
-        if sentences is None or sentences.ndim < 1:
-            return {
-                "invalid": torch.zeros(1, 1),
-                "global_score": torch.zeros(1),
-                "valid_score": torch.zeros(1, 1),
-                "full_tokens": [],
-            }
-
-        termination_token_id = tokenizer.eos_token_id
-        batch_size, seq_len = sentences.shape
-        device = sentences.device
-
-        invalid = torch.ones(batch_size, seq_len + 1, device=device)
-        valid_score = torch.zeros(batch_size, seq_len + 1, device=device)
-        global_score = torch.zeros(batch_size, device=device)
-        full_tokens_list: list[str] = []
-
-        invalid[:, 0] = 1.0  # empty prefix
-
-        for i in range(batch_size):
-            for pos in range(seq_len):
-                if sentences[i, pos] == termination_token_id:
-                    break
-
-            final_expr = self._decode_expr(sentences[i], tokenizer)
-            if final_expr is None:
-                full_tokens_list.append("")
-                continue
-            score = self._eval_full_expr_to_01(final_expr)
-
-            valid_score[i, -1] = float(score)
-            global_score[i] = float(score)
-            full_tokens_list.append(final_expr)
-
-        if self.amortize_valid_state:
-            # Vectorized: create mask for entries where global_score > 0
-            mask = global_score > 0
-            valid_score[mask, 1:] = 1.0
-
-        return {
-            "invalid": None,
-            "global_score": global_score,  # 0 or 1
-            "valid_score": valid_score,  # placeholder for future shaping
-            "full_tokens": full_tokens_list,
-        }
-
-    def _eval_full_expr_to_01(self, s: str) -> int:
-        s = s.replace("×", "*").replace("÷", "/")
-        s = "".join(s.split())
-        toks = self.TOKEN_RE.findall(s)
-        if "".join(toks) != s or len(toks) != 7:
-            return 0
-        for k, tk in enumerate(toks):
-            if k % 2 == 0:
-                if not (len(tk) == 1 and tk.isdigit()):
-                    return 0
-            else:
-                if tk not in "+-*/":
-                    return 0
-
-        nums = [Fraction(int(toks[i])) for i in (0, 2, 4, 6)]
-        ops = [toks[i] for i in (1, 3, 5)]
-
-        try:
-            v = nums[:]
-            o = ops[:]
-            i = 0
-            while i < len(o):
-                if o[i] in "*/":
-                    a, b = v[i], v[i + 1]
-                    if o[i] == "*":
-                        res = a * b
-                    else:
-                        if b == 0:
-                            return 0
-                        res = a / b
-                    v[i : i + 2] = [res]
-                    o.pop(i)
-                else:
-                    i += 1
-            acc = v[0]
-            for op, b in zip(o, v[1:]):
-                acc = acc + b if op == "+" else acc - b
-            return 1 if acc == 24 else 0
-        except Exception:
-            return 0
-
-
-class RDKitValidator(SentenceValidator):
-    def __init__(self, scorer: str = "sa", backend: Literal["rdkit", "pa"] = "rdkit") -> None:
-        super().__init__(scorer)
-        self.score_function = FUNCTION_MAPPING[scorer]
-        self.backend = backend
-        self.scorer_name = scorer
-
-    @staticmethod
-    def rdkit_validate(smiles: str) -> bool:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return False
-        try:
-            Chem.SanitizeMol(mol)
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def pa_validate(smiles: str) -> bool:
-        try:
-            ps.ParseSmiles(smiles)
-            return True
-        except Exception:
-            return False
-
-    def _is_valid_smiles(self, smiles: str) -> bool:
-        if self.backend == "rdkit":
-            return self.rdkit_validate(smiles)
-        if self.backend == "pa":
-            return self.pa_validate(smiles)
-        raise ValueError(f"Unknown backend: {self.backend}")
-
-    def _decode_batch(self, generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> list[str]:
-        return [_decode_tokens_to_string(sample, tokenizer) for sample in generated_tokens]
-
-    def smiles_accuracy(
-        self,
-        generated_tokens: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-    ) -> dict[str, float]:
-        decoded = self._decode_batch(generated_tokens, tokenizer)
-        scores = []
-        valid_flags = []
-
-        for tokens in decoded:
-            candidate = _merge_target(target_molecule, tokens)
-            if self._is_valid_smiles(candidate):
-                mol = Chem.MolFromSmiles(candidate)
-                valid_flags.append(bool(mol))
-                scores.append(self.score_function(mol) if mol else 0.0)
-            else:
-                valid_flags.append(False)
-                scores.append(0.0)
-
-        total_valid = sum(valid_flags)
-        num_samples = generated_tokens.shape[0]
-        avg_score = sum(scores) / num_samples if num_samples else 0.0
-        filtered_score = (
-            sum(score for score, flag in zip(scores, valid_flags) if flag) / total_valid
-            if total_valid
-            else 0.0
-        )
-
-        return {
-            "acc": total_valid / num_samples if num_samples else 0.0,
-            f"{self.scorer_name}": avg_score,
-            f"{self.scorer_name}_filter": filtered_score,
-        }
-
-    def accuracy(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-    ) -> dict[str, float]:
-        return self.smiles_accuracy(sentences, tokenizer, target_molecule)
-
-    def __call__(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-    ) -> dict[str, Tensor]:
-        termination_token_id = tokenizer.eos_token_id
-        batch_size, seq_len = sentences.shape
-        device = sentences.device
-
-        invalid = torch.ones(batch_size, seq_len + 1, device=device)
-        valid_score = torch.full((batch_size, seq_len + 1), -1.0, device=device)
-        valid_score[:, 0] = 0.0
-        global_score = torch.zeros(batch_size, device=device)
-        full_tokens_list = []
-
-        for batch_idx in range(batch_size):
-            for pos in range(seq_len):
-                if sentences[batch_idx, pos] == termination_token_id:
-                    break
-
-                prefix = _decode_tokens_to_string(sentences[batch_idx, : pos + 1], tokenizer)
-                candidate = _merge_target(target_molecule, prefix)
-                valid = self._is_valid_smiles(candidate)
-
-                if valid:
-                    mol = Chem.MolFromSmiles(candidate)
-                    valid_score[batch_idx, pos + 1] = self.score_function(mol) if mol else -1.0
-                    invalid[batch_idx, pos + 1] = 0.0
-                else:
-                    invalid[batch_idx, pos + 1] = 1.0
-
-            final_tokens = _decode_tokens_to_string(sentences[batch_idx], tokenizer)
-            full_smiles = _merge_target(target_molecule, final_tokens)
-            try:
-                mol = Chem.MolFromSmiles(full_smiles)
-                global_score[batch_idx] = self.score_function(mol) if mol else 0.0
-            except Exception:
-                global_score[batch_idx] = 0.0
-            full_tokens_list.append(full_smiles)
-
-        return {
-            "invalid": invalid,
-            "global_score": global_score,
-            "valid_score": valid_score,
-            "full_tokens": full_tokens_list,
-        }
-
-
-def number_reward(sampled_numbers: Iterable[int | str]) -> int:
-    values = [int(number) for number in sampled_numbers]
-    if not all(values[i] % 2 != values[i + 1] % 2 for i in range(len(values) - 1)):
-        return 0
-    return 1
-
-
-class BracketValidator:
-    def __init__(self, tokenizer: PreTrainedTokenizer):
-        self.tokenizer = tokenizer
-        self.bracket_map = {")": "(", "]": "[", ">": "<"}
-        self.left_brackets = set(self.bracket_map.values())
-        self.right_brackets = set(self.bracket_map.keys())
-
-    def preprocess(self, tokens: Tensor) -> tuple[str, bool]:
-        decoded = []
-        total_length = len(tokens)
-        for idx, token in enumerate(tokens):
-            if token.item() == self.tokenizer.eos_token_id:
-                break
-            decoded.append(self.tokenizer.decode(token))
-        decoded_string = "".join(decoded)
-        return decoded_string, total_length > idx
-
-    def is_valid(self, tokens: Tensor) -> bool:
-        sequence, _ = self.preprocess(tokens)
-        stack = []
-        for char in sequence:
-            if char in self.left_brackets:
-                stack.append(char)
-            elif char in self.right_brackets:
-                if not stack or stack[-1] != self.bracket_map[char]:
-                    return False
-                stack.pop()
-            else:
-                return False
-        return not stack
-
-    def is_valid_prefix(self, tokens: Tensor) -> bool:
-        sequence, _ = self.preprocess(tokens)
-        stack = []
-        for char in sequence:
-            if char in self.left_brackets:
-                stack.append(char)
-            elif char in self.right_brackets:
-                if not stack or stack[-1] != self.bracket_map[char]:
-                    return False
-                stack.pop()
-            else:
-                return False
-        return True
-
-    def has_multiple_nesting(self, tokens: Tensor) -> bool:
-        sequence, _ = self.preprocess(tokens)
-        stack = []
-        has_nesting = False
-        for char in sequence:
-            if char in self.left_brackets:
-                stack.append(char)
-            elif char in self.right_brackets:
-                if not stack or stack[-1] != self.bracket_map[char]:
-                    return False
-                stack.pop()
-                if len(stack) >= 1:
-                    has_nesting = True
-            else:
-                return False
-        return not stack and has_nesting
-
-
-def number_accuracy(generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> float:
-    correct = 0
-    for sample in generated_tokens:
-        decoded = []
-        for token in sample:
-            if token.item() == tokenizer.eos_token_id:
-                break
-            decoded.append(int(tokenizer.decode(token)))
-        correct += number_reward(decoded)
-    return correct / generated_tokens.shape[0]
-
-
-class NumberValidator(SentenceValidator):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-    def accuracy(self, sentences: Tensor, tokenizer: PreTrainedTokenizer) -> dict[str, float]:
-        return {"acc": number_accuracy(sentences, tokenizer)}
-
-    def __call__(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        *args,
-        **kwargs,
-    ) -> dict[str, Tensor]:
-        termination_token_id = tokenizer.eos_token_id
-        invalid = torch.zeros(
-            sentences.shape[0],
-            sentences.shape[1] + 1,
-            device=sentences.device,
-        )
-        invalid[:, 0] = 1
-
-        for i in range(sentences.shape[0]):
-            for j in range(sentences.shape[1]):
-                if sentences[i, j] == termination_token_id:
-                    break
-                tokens = [tokenizer.decode(t) for t in sentences[i, : j + 1]]
-                numbers = [int(number) for number in tokens]
-                invalid[i, j + 1] = 0 if number_reward(numbers) else 1
-
-        return {"invalid": invalid}
-
-
-class ParenthesesValidator(SentenceValidator):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-
-    def accuracy(self, sentences: Tensor, tokenizer: PreTrainedTokenizer) -> dict[str, float]:
-        validator = BracketValidator(tokenizer)
-        correct = 0
-        nested = 0
-        for sample in sentences:
-            valid = validator.is_valid(sample)
-            correct += valid
-            nested += int(validator.has_multiple_nesting(sample))
-
-        total = sentences.shape[0]
-        return {"acc": correct / total, "nest": nested / total}
-
-    def __call__(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        *args,
-        **kwargs,
-    ) -> dict[str, Tensor]:
-        termination_token_id = tokenizer.eos_token_id
-        validator = BracketValidator(tokenizer)
-
-        invalid = torch.zeros(
-            sentences.shape[0],
-            sentences.shape[1] + 1,
-            device=sentences.device,
-        )
-        invalid[:, 0] = 1
-
-        for i in range(sentences.shape[0]):
-            for j in range(sentences.shape[1]):
-                if sentences[i, j] == termination_token_id:
-                    break
-                invalid[i, j + 1] = 0 if validator.is_valid(sentences[i, : j + 1]) else 1
-
-        return {"invalid": invalid}
-
-
-# --------------------------------------------------------------------------- #
 # Reward models
 # --------------------------------------------------------------------------- #
 
@@ -738,7 +309,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
         **kwargs,
@@ -762,7 +333,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"]
             reward_mixed = (
@@ -814,7 +385,7 @@ class Target_Score_Positive:
         tokenizer: PreTrainedTokenizer,
         reward_temperature: float = 1.0,
         vocab_invalid_mask=None,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
         **kwargs,
@@ -838,7 +409,7 @@ class Target_Score_Positive:
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             global_score = validator_dict["global_score"].bool()  # [B]
 
@@ -918,7 +489,7 @@ class Target_Score_Positive_MCMCPrior:
         tokenizer: PreTrainedTokenizer,
         reward_temperature: float = 1.0,
         vocab_invalid_mask=None,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
         **kwargs,
@@ -950,7 +521,7 @@ class Target_Score_Positive_MCMCPrior:
         validator_dict = None
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
 
         for b in range(batch_size):
@@ -1003,6 +574,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
         illegal_vocab_penalty: float = -99,
         grammar_disagree_penalty: float = -99,
         phi_weight: float = 1.0,
+        prefix_collapse_kwargs: dict[str, Any] | None = None,
         score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
         **kwargs,
     ) -> None:
@@ -1022,15 +594,16 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,  # (B,T) 生成的动作 token（不含 prompt）
         **kwargs,
     ) -> dict[str, Any]:
+        eos = tokenizer.eos_token_id
         reference_results = eval(self.score_function)(
             model=model,
             encoded_input=input_batch,
-            termination_token_id=tokenizer.eos_token_id,
+            termination_token_id=eos,
             skip_first=prompt_length,
             reward_temperature=reward_temperature,
             invalid_vocab_mask=vocab_invalid_mask,
@@ -1045,10 +618,11 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
 
         validator_dict = None
         reward_mixed = reference_logP
+        prefix_diag = None
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"].to(
                 reference_logP.dtype
@@ -1061,6 +635,9 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
                 + (-1) * (reference_logP[..., -1]).unsqueeze(-1) * valid_score
                 + scaling_factor * valid_score
             )
+
+            gen_tokens = input_batch[:, prompt_length:]
+            active_before = compute_active_before(gen_tokens, eos=eos)
 
             if self.phi_weight > 0:
                 sentences = input_batch[:, prompt_length:]
@@ -1078,6 +655,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
             "log_pf_ref": ref_log_pf,
             "log_pterm_ref": ref_log_pterm,
             "validator_dict": validator_dict,
+            "prefix_diag": prefix_diag,
         }
 
 
@@ -1125,7 +703,7 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
         **kwargs,
@@ -1156,7 +734,7 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
 
@@ -1210,6 +788,7 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
             prefix_diag = compute_prefix_diagnostics(
                 pv=pv,
                 phi_state=phi_state,
+                phi_tok=phi_tok,
                 active_before=active_before,
                 pv_sat_lo=0.05,
                 pv_sat_hi=0.95,
@@ -1223,7 +802,7 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
             "validator_dict": validator_dict,
         }
         if prefix_diag is not None:
-            out["prefix_diag"] = prefix_diag
+            out["prefix_value_diag"] = prefix_diag
         return out
 
 
@@ -1318,7 +897,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
         global_step: int = 0,
@@ -1350,7 +929,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
 
@@ -1423,6 +1002,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
                 prefix_diag = compute_prefix_diagnostics(
                     pv=pv,
                     phi_state=phi_state,
+                    phi_tok=phi_tok,
                     active_before=active_before,
                     pv_sat_lo=0.05,
                     pv_sat_hi=0.95,
@@ -1439,7 +1019,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
             "log_pf_ref": ref_log_pf,
             "log_pterm_ref": ref_log_pterm,
             "validator_dict": validator_dict,
-            "prefix_diag": prefix_diag if prefix_diag is not None else None,
+            "prefix_value_diag": prefix_diag if prefix_diag is not None else None,
             "phi_state": phi_state,
             "phi_tok": phi_tok,
             "pv": pv,
@@ -1449,8 +1029,13 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
 
 class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
     """
-    PrefixValueMemoryNoBackoff + PrefixShaping + Entropy Gate
+    PrefixValueMemoryNoBackoff + PrefixShaping (+ optional Entropy Gate)
+      - "legacy": expr24
+      - "smiles_absorbing": SMILES absorbing reward
     """
+
+    RewardStrategy = Literal["legacy", "smiles_absorbing"]
+    PVUpdateStrategy = Literal["legacy_last_valid_score", "smiles_global_score"]
 
     def __init__(
         self,
@@ -1472,10 +1057,16 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         phi_eta: float = 1.0,
         phi_clamp: float = 2.0,
         # split logic
-        pv_split: int = 2,  # split point
-        pv_split_inclusive: bool = True,  # True: len<=split is short prefix
+        pv_split: int = 2,
+        pv_split_inclusive: bool = True,
         pv_memory_kwargs: dict[str, Any] | None = None,
         score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
+        # ---- NEW: reward strategy ----
+        reward_strategy: RewardStrategy = "legacy",
+        # SMILES absorbing reward options
+        smiles_len_weight: float = 0.0,  # length prior (optional)
+        smiles_score_clip: tuple[float, float] = (0.0, 1.0),  # global_score 归一化到 [0,1] 的 clip
+        pv_update_strategy: PVUpdateStrategy | None = None,  # None => follow reward_strategy
         **kwargs,
     ) -> None:
         self.sentence_validator = sentence_validator
@@ -1483,41 +1074,62 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         self.grammar_disagree_penalty = grammar_disagree_penalty
         self.score_function = score_function
 
-        self.phi_weight_max = phi_weight
-        self.phi_warmup = phi_warmup
-        self.phi_ramp_steps = phi_ramp_steps
-        self.phi_decay_start = phi_decay_start
-        self.phi_decay_gamma = phi_decay_gamma
+        self.phi_weight_max = float(phi_weight)
+        self.phi_warmup = int(phi_warmup)
+        self.phi_ramp_steps = int(phi_ramp_steps)
+        self.phi_decay_start = (
+            phi_decay_start if (phi_decay_start is None) else int(phi_decay_start)
+        )
+        self.phi_decay_gamma = float(phi_decay_gamma)
         self.dphi_clip = dphi_clip if dphi_clip is not None else None
 
-        self.use_entropy_gate = use_entropy_gate
-        self.use_token_entropy_gate = use_token_entropy_gate
-        self.ent_lo = ent_lo
-        self.ent_hi = ent_hi
+        self.use_entropy_gate = bool(use_entropy_gate)
+        self.use_token_entropy_gate = bool(use_token_entropy_gate)
+        self.ent_lo = float(ent_lo)
+        self.ent_hi = float(ent_hi)
 
-        self.phi_eta = phi_eta
-        self.phi_clamp = phi_clamp
+        self.phi_eta = float(phi_eta)
+        self.phi_clamp = float(phi_clamp)
 
-        self.pv_split = pv_split
-        self.pv_split_inclusive = pv_split_inclusive
+        self.pv_split = int(pv_split)
+        self.pv_split_inclusive = bool(pv_split_inclusive)
 
-        self.global_step = 0
+        self.reward_strategy: Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff.RewardStrategy = (
+            reward_strategy
+        )
+        self.smiles_len_weight = float(smiles_len_weight)
+        self.smiles_score_clip = (float(smiles_score_clip[0]), float(smiles_score_clip[1]))
+
+        if pv_update_strategy is None:
+            self.pv_update_strategy: Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff.PVUpdateStrategy = (
+                "legacy_last_valid_score" if reward_strategy == "legacy" else "smiles_global_score"
+            )
+        else:
+            self.pv_update_strategy = pv_update_strategy
+
+        self.cur_step = 0
         self.pv_mem = PrefixValueMemoryNoBackoff(**(pv_memory_kwargs or {}))
 
-    def set_step(self, step: int) -> None:
-        self.global_step = int(step)
+        self._reward_mixers = {
+            "legacy": self._mix_reward_legacy,
+            "smiles_absorbing": self._mix_reward_smiles_absorbing,
+        }
+        if self.reward_strategy not in self._reward_mixers:
+            raise ValueError(f"Unknown reward_strategy={self.reward_strategy}")
 
-    def _phi_weight_schedule(self, step: int) -> float:
-        step = int(step)
-        if step < self.phi_warmup:
+    def set_step(self, step: int) -> None:
+        self.cur_step = int(step)
+
+    def _phi_weight_schedule(self, cur_step: int) -> float:
+        if cur_step < self.phi_warmup:
             return 0.0
-        t = step - self.phi_warmup
+        t = cur_step - self.phi_warmup
         if self.phi_ramp_steps > 0:
             w = self.phi_weight_max * min(1.0, t / float(self.phi_ramp_steps))
         else:
             w = self.phi_weight_max
-        if (self.phi_decay_start is not None) and (step >= self.phi_decay_start):
-            w = w * (self.phi_decay_gamma ** (step - self.phi_decay_start))
+        if (self.phi_decay_start is not None) and (cur_step >= self.phi_decay_start):
+            w = w * (self.phi_decay_gamma ** (cur_step - self.phi_decay_start))
         return float(w)
 
     @staticmethod
@@ -1538,10 +1150,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
     ) -> Tensor:
         """
         Normalized batch token-frequency entropy gate.
-        Returns gate (B,T) in [0,1].
-
-        Normalization uses log(U_t), where U_t is #unique tokens among active samples at step t.
-        This makes entropy scale invariant to batch size and varying support size.
+        gate[t] = normalize_entropy( token_freq_at_t ) mapped to [0,1].
         """
         B, T = gen_tokens.shape
         device = gen_tokens.device
@@ -1554,7 +1163,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                 gate_t[t] = 0.0
                 continue
 
-            toks = gen_tokens[m, t]  # (n_active,)
+            toks = gen_tokens[m, t]
             uniq, cnt = toks.unique(return_counts=True)
             U = int(uniq.numel())
             if U <= 1:
@@ -1562,7 +1171,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                 continue
 
             q = cnt.to(torch.float32) / cnt.sum().to(torch.float32)
-            H = -(q * (q + eps).log()).sum()  # Shannon entropy (nats)
+            H = -(q * (q + eps).log()).sum()  # nats
             H_norm = H / (torch.log(torch.tensor(float(U), device=device)) + eps)  # in [0,1]
 
             gate = (H_norm - float(ent_lo)) / max(1e-8, float(ent_hi) - float(ent_lo))
@@ -1570,6 +1179,94 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
 
         gate = gate_t.view(1, T).expand(B, T)
         return gate * active_before.to(torch.float32)
+
+    # ----------------------------- Reward mixers -----------------------------
+
+    def _mix_reward_legacy(
+        self,
+        *,
+        reference_logP: Tensor,  # (B, L_state)
+        valid_score: Tensor,  # (B, L_state)
+        scaling_factor: float,
+        active_before: Tensor | None,  # unused in legacy
+        validator_dict: dict[str, Any] | None,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        reward = reference_logP + |reference_logP_last| * valid_score + scaling_factor * valid_score
+        """
+        y = valid_score[:, -1].clamp(0.0, 1.0)
+
+        reward_mixed = (
+            reference_logP
+            + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
+            + float(scaling_factor) * valid_score
+        )
+        return reward_mixed, y
+
+    def _mix_reward_smiles_absorbing(
+        self,
+        *,
+        reference_logP: Tensor,  # (B, L_state)
+        valid_score: Tensor,  # (B, L_state) (prefix score, invalid -> -1)
+        scaling_factor: float,  # beta
+        active_before: Tensor,  # (B, T_tok) bool
+        validator_dict: dict[str, Any],
+    ) -> tuple[Tensor, Tensor]:
+        """
+        reward = reference_logP + beta * score_state + length_prior(optional)
+        """
+        dtype = reference_logP.dtype
+        device = reference_logP.device
+
+        B, L_state = reference_logP.shape
+        T_tok = L_state - 1
+        assert active_before.shape == (
+            B,
+            T_tok,
+        ), f"active_before {active_before.shape} vs (B,T)={(B,T_tok)}"
+
+        # ---- y_final from global_score ----
+        gs = validator_dict["global_score"].to(dtype)  # (B,)
+        lo, hi = self.smiles_score_clip
+        if hi <= lo:
+            raise ValueError(f"smiles_score_clip invalid: {self.smiles_score_clip}")
+        y_final = gs.clamp(lo, hi)
+        # 可选：若你希望 PV 是严格概率，可强制映射到 [0,1]
+        # 这里默认 lo=0, hi=1，因此就是 [0,1]
+        y_final_01 = (y_final - lo) / (hi - lo) if (lo != 0.0 or hi != 1.0) else y_final
+        y_final_01 = y_final_01.clamp(0.0, 1.0)
+
+        # ---- active_state (B,L_state) ----
+        active_state = torch.cat(
+            [torch.ones((B, 1), device=device, dtype=dtype), active_before.to(dtype)],
+            dim=1,
+        )  # state 0 always reachable
+
+        # ---- tau_state: first EOS terminal state index ----
+        tau_state = active_before.to(torch.long).sum(dim=1).clamp(0, L_state - 1)  # (B,)
+
+        # ---- score_state from valid_score, then absorb after tau ----
+        score_state = valid_score.to(dtype).clamp_min(0.0)  # invalid=-1 -> 0
+        pos = torch.arange(L_state, device=device).view(1, L_state)  # (1,L_state)
+        fill_after_tau = pos >= tau_state.view(B, 1)
+        score_state = torch.where(fill_after_tau, y_final_01.view(B, 1), score_state)
+        score_state = score_state * active_state  # only reachable states
+
+        # ---- optional length prior ----
+        if self.smiles_len_weight != 0.0:
+            len_state = pos.to(dtype) / float(max(1, T_tok))  # 0..1
+            length_term = -float(self.smiles_len_weight) * len_state
+        else:
+            length_term = 0.0
+
+        beta = float(scaling_factor)
+        reward_mixed = reference_logP + beta * score_state + length_term
+
+        # PV update y
+        y = y_final_01
+        return reward_mixed, y
+
+    # ----------------------------- Main score -----------------------------
 
     @torch.no_grad()
     def score(
@@ -1582,14 +1279,12 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,
-        global_step: int = 0,
         **kwargs,
     ) -> dict[str, Any]:
         eos = tokenizer.eos_token_id
-
         reference_results = eval(self.score_function)(
             model=model,
             encoded_input=input_batch,
@@ -1610,7 +1305,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
 
         validator_dict = None
         reward_mixed = reference_logP
-        prefix_diag = None
+        prefix_value_diag = None
 
         pv_raw = None
         pv_used = None
@@ -1621,54 +1316,58 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
 
+            # align to (B, L_state)
             if valid_score.shape[1] == reference_logP.shape[1] - 1:
                 valid_score = torch.cat(
                     [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
                 )
-            assert valid_score.shape == reference_logP.shape
+            assert (
+                valid_score.shape == reference_logP.shape
+            ), f"valid_score {valid_score.shape} vs reference_logP {reference_logP.shape}"
 
-            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
-
-            # final reward
-            reward_mixed = (
-                reference_logP
-                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
-                + float(scaling_factor) * valid_score
-            )
-
-            B, L_state = reward_mixed.shape
+            # tokens / masks
+            B, L_state = reference_logP.shape
             T_tok = L_state - 1
             gen_tokens = input_batch[:, prompt_length : prompt_length + T_tok]  # (B, T_tok)
+            active_before = compute_active_before(gen_tokens, eos=eos)  # (B, T_tok) bool
 
-            active_before = compute_active_before(gen_tokens, eos=eos)  # (B,T_tok)
+            # ---- reward mixing strategy (mapping) ----
+            mixer = self._reward_mixers[self.reward_strategy]
+            reward_mixed, y = mixer(
+                reference_logP=reference_logP,
+                valid_score=valid_score,
+                scaling_factor=float(scaling_factor),
+                active_before=active_before,
+                validator_dict=validator_dict,
+            )
 
-            # update memory
-            self.pv_mem.set_step(self.global_step)
-            phi_w = self._phi_weight_schedule(self.global_step)
+            # ---- PV memory / shaping ----
+            self.pv_mem.set_step(self.cur_step)
+            phi_w = self._phi_weight_schedule(self.cur_step)
 
-            # credit re-assignment inside samples
             if phi_w > 0.0:
-                # query raw prefix success rate, no backoff
                 device = gen_tokens.device
                 p0_vec = self.pv_mem.get_base_rate_vec(
                     T_tok, device=device, dtype=reference_logP.dtype
-                )  # (T_tok,)
+                )
                 p0_mat = p0_vec.view(1, T_tok).expand(B, T_tok)
-                pv_raw, counts = self.pv_mem.query_pv(
-                    gen_tokens, active_before
-                )  # pv_raw = P(success | prefix 0:t)
 
-                # split logic: short prefixes get inverted pv (punishment)
+                # raw pv without backoff
+                pv_raw, counts = self.pv_mem.query_pv(gen_tokens, active_before)
+
                 pref_len = (
                     (torch.arange(T_tok, device=device, dtype=torch.long) + 1)
                     .view(1, T_tok)
                     .expand(B, T_tok)
                 )
-                short_mask = pref_len <= int(self.pv_split)  # 你现在默认 inclusive
+                if self.pv_split_inclusive:
+                    short_mask = pref_len <= int(self.pv_split)
+                else:
+                    short_mask = pref_len < int(self.pv_split)
 
                 pv_used = torch.where(short_mask, 1.0 - pv_raw, pv_raw).clamp(1e-6, 1.0 - 1e-6)
                 p0_used = torch.where(
@@ -1690,12 +1389,11 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                     conf_mode="inv_sqrt",
                 )
 
-                # entropy gate uses pv_used
-                # Gate logic is under development
+                # gates (optional; keep your current development status)
                 # if self.use_entropy_gate:
                 #     g_ent = self._entropy_gate(pv_used, active_before, self.ent_lo, self.ent_hi)
                 #     phi_tok = phi_tok * g_ent
-
+                #
                 # if self.use_token_entropy_gate:
                 #     g_ent = self.token_entropy_gate_from_batch_normalized(
                 #         gen_tokens, active_before, self.ent_lo, self.ent_hi
@@ -1713,7 +1411,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                     dphi_clip=self.dphi_clip,
                 )
 
-                # diagnostics
+                # ---- diagnostics ----
                 mask = active_before.to(pv_raw.dtype)
                 den = mask.sum().clamp_min(1.0)
 
@@ -1729,7 +1427,8 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                 ent_used = -(pv_used * pv_used.log() + (1.0 - pv_used) * (1.0 - pv_used).log())
                 sat_used = ((pv_used < 0.05) | (pv_used > 0.95)).to(mask.dtype)
 
-                prefix_diag = {
+                prefix_value_diag = {
+                    "reward_strategy": float(0.0 if self.reward_strategy == "legacy" else 1.0),
                     "pv_split": float(self.pv_split),
                     "short_frac": float(short_f.sum().div(den).item()),
                     "pv_raw_mean": mmean(pv_raw, mask, den),
@@ -1747,27 +1446,15 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                     "dphi_abs_mean": mmean(dphi.abs(), mask, den),
                     "sat_ratio_used": mmean(sat_used, mask, den),
                     "p0_len_mean": float(
-                        (p0_mat * active_before.to(p0_mat.dtype))
-                        .sum()
-                        .div(active_before.sum().clamp_min(1))
-                        .item()
+                        (p0_mat * mask).sum().div(mask.sum().clamp_min(1)).item()
                     ),
-                    "p0_len_short_mean": float(
-                        (p0_mat * short_mask.to(p0_mat.dtype) * active_before.to(p0_mat.dtype))
-                        .sum()
-                        .div((short_mask & active_before).sum().clamp_min(1))
-                        .item()
-                    ),
-                    "p0_len_long_mean": float(
-                        (p0_mat * (~short_mask).to(p0_mat.dtype) * active_before.to(p0_mat.dtype))
-                        .sum()
-                        .div(((~short_mask) & active_before).sum().clamp_min(1))
-                        .item()
-                    ),
+                    "p0_len_short_mean": float((p0_mat * short_f).sum().div(den_s).item()),
+                    "p0_len_long_mean": float((p0_mat * long_f).sum().div(den_l).item()),
                 }
 
-            # update memory after scoring
-            self.pv_mem.update(gen_tokens, y, active_before)
+            # update memory after scoring, disable when phi_weight is 0
+            if self.phi_weight_max > 0.0:
+                self.pv_mem.update(gen_tokens, y, active_before)
 
         out = {
             "reward": reward_mixed,
@@ -1775,11 +1462,12 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
             "log_pf_ref": ref_log_pf,
             "log_pterm_ref": ref_log_pterm,
             "validator_dict": validator_dict,
-            "prefix_diag": prefix_diag,
+            "prefix_value_diag": prefix_value_diag,
             "phi_state": phi_state,
             "phi_tok": phi_tok,
             "pv_raw": pv_raw,
             "pv": pv_used,
+            "phi_weight": phi_w,
             "counts": counts,
         }
         return out
@@ -1811,7 +1499,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping_TestInval
         vocab_invalid_mask=None,
         scaling_factor: float = 0.5,
         reference_logits_scale: float = 0.5,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         agree_list: Tensor | None = None,
         action_seq: Tensor | None = None,  # (B,T) 生成的动作 token（不含 prompt）
         **kwargs,
@@ -1837,7 +1525,7 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping_TestInval
 
         if self.sentence_validator is not None:
             validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, target_molecule
+                input_batch[:, prompt_length:], tokenizer, scaffold
             )
             valid_score = validator_dict["valid_score"].to(
                 reference_logP.dtype

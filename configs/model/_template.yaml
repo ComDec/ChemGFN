@@ -58,7 +58,7 @@ reward:
   illegal_vocab_penalty: -50             # Log penalty for illegal vocabulary tokens
   grammar_disagree_penalty: -99          # Log penalty for grammar-disagreeing tokens
   sentence_validator:                    # Validator for checking sequence validity
-    _target_: chemgfn.models.reward.RDKitValidator
+    _target_: chemgfn.models.validators.RDKitValidator
     scorer: "logP"                       # Molecular property to optimize
     backend: "pa"                        # Backend: "rdkit" or "pa" (partialsmiles)
 

@@ -31,7 +31,7 @@ model:
     invalid_start_ratio: 3
     invalid_end_ratio: 5.0
     sentence_validator:
-      _target_: chemgfn.models.reward.RDKitValidator
+      _target_: chemgfn.models.validators.RDKitValidator
       scorer: "logP"
       backend: "pa"
 
@@ -60,8 +60,7 @@ model:
     scaling_factor_horizon: 50000
 
 data:
-  num_workers: 8
-
+  num_workers: 0
 logger:
   wandb:
     project: "ChemGFN"

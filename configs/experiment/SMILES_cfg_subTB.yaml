@@ -4,30 +4,31 @@
 # Run with: python chemgfn/train.py experiment=debug_expr24
 
 defaults:
-  - override /data: expr24
-  - override /model: llama3_expr24
+  - override /data: smiles_opt
+  - override /model: llama3_smiles_opt
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "expr24"]
+tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "subTB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "debug_expr24_TB_diff_phi_1"
+exp_name: "smiles_CFG_subTB"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 60000
+  max_steps: 10000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 30
-  limit_val_batches: 5
+  limit_train_batches: 100
+  limit_val_batches: 10
+
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -39,20 +40,53 @@ model:
     lr: 0.0001
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shaping
-    invalid_start_ratio: 0.2
-    invalid_end_ratio: 1.2
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
     disable_peft: ${model.disable_peft}
+
+     # config params
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
-    phi_weight: 1.0
+
+    # phi params
+    phi_weight: 0
+
+    # reward strategy
+    reward_strategy: "smiles_absorbing"
+    smiles_len_weight: 0.0
+    smiles_score_clip: [0.0, 1.0]
+    pv_update_strategy: smiles_global_score
+
+    # entropy gate, UNDER DEVELOPMENT
+    use_entropy_gate: false
+    use_token_entropy_gate: false
+    ent_lo: 0.10
+    ent_hi: 0.55
+
+    # phi build params
+    phi_eta: 1.0
+    phi_clamp: 2.0
+
+    # split logic
+    pv_split: 2
+    pv_split_inclusive: true
+
+    # pv memory params
+    pv_memory_kwargs:
+      alpha: 1.0
+      gamma: 0.999
+      max_keys: 500000
+      prune_every: 200
+      prune_threshold: 1.0
+      tau_conf: 20.0
+
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.reward.Expr24Validator
-      amortize_valid_state: false
+      _target_: chemgfn.models.validators.RDKitValidator
+      scorer: "qed"
+      backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
+    _target_: chemgfn.models.losses.ModifiedSubTBLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
@@ -64,12 +98,12 @@ model:
     buffer_aug_value: 0
 
   constraint_config:
-    min_sentence_len: 7
-    max_sentence_len: 7
-    grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
+    min_sentence_len: 1
+    max_sentence_len: 10
+    grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     disable_grammar: false
     processor_type: "prefix"
-    legal_tokens: ${paths.assets_dir}/token_list/24_points/general
+    legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
     illegal_vocab_penalty: -50
     parse_mode: "limited"
 
@@ -82,6 +116,7 @@ model:
     buffer_mixture_ratio: 0.7
     skip_baseline_sampling: true
     opt_task: false
+    # without applying grammar disagree penalty to forward side
     grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
 
   factor_schedulers:
@@ -134,7 +169,9 @@ model:
 # Data Configuration
 # ============================================================================
 data:
-  num_workers: 8
+  num_workers: 0
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
+  buffer_sample_path: null
 
 # ============================================================================
 # Logger Configuration
@@ -142,4 +179,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: false
+    offline: False

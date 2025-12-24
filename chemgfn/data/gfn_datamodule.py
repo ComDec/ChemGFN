@@ -31,10 +31,10 @@ class BufferDataPipe(Dataset):
         allowed_vocab: list = None,
         n_samples: int = 4,
         buffer_tokenization: bool = False,
+        scaffolds=None,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.prompts = prompts
         self.total_size = total_size
 
         self.is_instruct = is_instruct
@@ -42,7 +42,15 @@ class BufferDataPipe(Dataset):
         self.buffer_tokenization = buffer_tokenization
 
         # Generate prompts by randomly sampling with replacement
-        self.prompts = random.choices(prompts, k=self.total_size)
+        if scaffolds is not None:
+            if len(scaffolds) != len(prompts):
+                raise ValueError("scaffolds length must match prompts length")
+            indices = random.choices(range(len(prompts)), k=self.total_size)
+            self.prompts = [prompts[i] for i in indices]
+            self.scaffolds = [scaffolds[i] for i in indices]
+        else:
+            self.prompts = random.choices(prompts, k=self.total_size)
+            self.scaffolds = None
         self.buffer_sample = buffer_sample
         self.allowed_vocab = allowed_vocab
         self.n_samples = n_samples
@@ -86,15 +94,7 @@ class BufferDataPipe(Dataset):
         else:
             _prompt = self.prompts[index]
 
-        if False:
-            message = self.generate_message(_prompt)
-            encoded_prompt = self.tokenizer.apply_chat_template(
-                message,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
+        encoded_prompt = self.tokenizer(_prompt, return_tensors="pt")["input_ids"]
 
         buffer_encoded_samples = None
 
@@ -117,67 +117,79 @@ class BufferDataPipe(Dataset):
                     buffer_encoded_samples = None
             elif isinstance(self.buffer_sample, (list, tuple)):
                 # For list/tuple: use random.sample
-                num_samples = min(self.n_samples, len(self.buffer_sample))
-                sampled_buffer = random.sample(list(self.buffer_sample), num_samples)
-                buffer_encoded_samples = []
-
-                for sample in sampled_buffer:
-                    # Check if sample is already a tensor (token ids)
-                    if isinstance(sample, torch.Tensor):
-                        # Already tokenized, use directly
-                        buffer_encoded_sample = sample.reshape(-1)
-                    elif (
-                        isinstance(sample, (list, tuple))
-                        and len(sample) > 0
-                        and isinstance(sample[0], (int, torch.Tensor))
-                    ):
-                        # List of token ids
-                        buffer_encoded_sample = torch.tensor(sample).reshape(-1)
-                    elif isinstance(sample, str):
-                        # Pure text, need to process with allowed_vocab and merge_chars_fast
-                        if self.allowed_vocab is not None:
-                            if self.buffer_tokenization:
-                                # Use standard tokenization
-                                buffer_encoded_sample = torch.tensor(
-                                    self.tokenizer.encode(sample, add_special_tokens=False)
-                                ).reshape(-1)
-                            else:
-                                # Use merge_chars_fast with allowed_vocab
-                                merged_chars = self.merge_chars_fast(sample, self.allowed_vocab)
-                                buffer_encoded_sample = torch.tensor(
-                                    [
-                                        self.tokenizer.encode(x, add_special_tokens=False)
-                                        for x in merged_chars
-                                    ]
-                                ).reshape(-1)
-                        else:
-                            # No allowed_vocab, use standard tokenization
-                            buffer_encoded_sample = torch.tensor(
-                                self.tokenizer.encode(sample, add_special_tokens=False)
-                            ).reshape(-1)
+                if len(self.buffer_sample) > 0:
+                    num_samples = min(self.n_samples, len(self.buffer_sample))
+                    if num_samples == 0:
+                        buffer_encoded_samples = None
                     else:
-                        # Unknown type, skip this sample
-                        continue
+                        sampled_buffer = random.sample(list(self.buffer_sample), num_samples)
+                        first_sample = sampled_buffer[0]
 
-                    buffer_encoded_samples.append(buffer_encoded_sample)
+                        # Tokenized tensor list: use directly
+                        if isinstance(first_sample, torch.Tensor):
+                            buffer_encoded_samples = pad_sequence(
+                                [sample.reshape(-1) for sample in sampled_buffer],
+                                batch_first=True,
+                                padding_value=self.tokenizer.eos_token_id,
+                            )
+                        # Tokenized ids list
+                        elif (
+                            isinstance(first_sample, (list, tuple))
+                            and len(first_sample) > 0
+                            and isinstance(first_sample[0], (int, torch.Tensor))
+                        ):
+                            buffer_encoded_samples = pad_sequence(
+                                [torch.tensor(sample).reshape(-1) for sample in sampled_buffer],
+                                batch_first=True,
+                                padding_value=self.tokenizer.eos_token_id,
+                            )
+                        else:
+                            # Pure text list, use existing tokenization logic
+                            buffer_encoded_samples = []
+                            for sample in sampled_buffer:
+                                if not isinstance(sample, str):
+                                    continue
+                                if self.allowed_vocab is not None:
+                                    if self.buffer_tokenization:
+                                        buffer_encoded_sample = torch.tensor(
+                                            self.tokenizer.encode(sample, add_special_tokens=False)
+                                        ).reshape(-1)
+                                    else:
+                                        merged_chars = self.merge_chars_fast(
+                                            sample, self.allowed_vocab
+                                        )
+                                        buffer_encoded_sample = torch.tensor(
+                                            [
+                                                self.tokenizer.encode(x, add_special_tokens=False)
+                                                for x in merged_chars
+                                            ]
+                                        ).reshape(-1)
+                                else:
+                                    buffer_encoded_sample = torch.tensor(
+                                        self.tokenizer.encode(sample, add_special_tokens=False)
+                                    ).reshape(-1)
 
-                # Pad sequences if we have any valid samples
-                if buffer_encoded_samples:
-                    buffer_encoded_samples = pad_sequence(
-                        buffer_encoded_samples,
-                        batch_first=True,
-                        padding_value=self.tokenizer.eos_token_id,
-                    )
-                else:
-                    buffer_encoded_samples = None
+                                buffer_encoded_samples.append(buffer_encoded_sample)
+
+                            if buffer_encoded_samples:
+                                buffer_encoded_samples = pad_sequence(
+                                    buffer_encoded_samples,
+                                    batch_first=True,
+                                    padding_value=self.tokenizer.eos_token_id,
+                                )
+                            else:
+                                buffer_encoded_samples = None
             else:
                 # Unknown buffer type, skip
                 buffer_encoded_samples = None
 
-        return {
+        result = {
             "encoded_prompt": encoded_prompt,
             "buffer_encoded_sample": buffer_encoded_samples,
         }
+        if self.scaffolds is not None:
+            result["scaffold"] = self.scaffolds[index]
+        return result
 
 
 class BufferDataModule(LightningDataModule):
@@ -185,22 +197,26 @@ class BufferDataModule(LightningDataModule):
         self,
         data_path,
         buffer_sample_path: Optional[str] = None,
-        tokenizer_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+        tokenizer_name: str = "meta-llama/Meta-Llama-3.2-1B",
         prompt_size: int = 1,
         total_size: int = 10000,
         train_size: float = 0.95,
-        num_workers: int = 8,
+        num_workers: int = 0,
         pin_memory: bool = True,
         add_prompt: bool = False,
         allowed_vocab_path: Optional[str] = None,
         n_samples: int = 8,
         buffer_tokenization: bool = False,
+        scaffold_path: Optional[str] = None,
+        scaffold_list: Optional[list] = None,
     ):
         """
         Data module for handling buffer data, which includes prompts and optional buffer samples.
         Args:
             data_path: Path to the file containing prompts.
             buffer_sample_path: Path to the buffer sample file.
+            scaffold_path: Path to the scaffold list file (ignored if JSON data provides scaffold).
+            scaffold_list: Optional scaffold list aligned with prompts.
             buffer_tokenization: If True, tokenizes the buffer samples. Else, construct tokens from vocabulary list
         """
         super().__init__()
@@ -210,6 +226,8 @@ class BufferDataModule(LightningDataModule):
         self.train_size = train_size
         self.train_data = None
         self.val_data = None
+        self.scaffold_path = scaffold_path
+        self.scaffold_list = scaffold_list
 
         self.prompt_size = prompt_size
         self.total_size = total_size
@@ -238,12 +256,48 @@ class BufferDataModule(LightningDataModule):
     def prepare_data(self) -> None:
         pass
 
-    def setup(self, stage):
-        with open(self.data_path) as f:
-            prompts = f.readlines()
+    def _load_prompts_and_scaffolds(self):
+        data = None
+        try:
+            with open(self.data_path) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError, TypeError):
+            data = None
 
-        # strip all the \n
-        prompts = [prompt.strip() for prompt in prompts][: self.prompt_size]
+        if isinstance(data, list):
+            if len(data) == 0:
+                return [], None
+            first = data[0]
+            if not isinstance(first, dict):
+                raise ValueError("JSON prompt file must contain a list of dict entries.")
+            prompts = []
+            scaffolds = []
+            for item in data:
+                if "prompt" not in item or "scaffold" not in item:
+                    raise ValueError("JSON prompt entries must contain 'prompt' and 'scaffold'.")
+                prompts.append(item["prompt"])
+                scaffolds.append(item["scaffold"])
+            return prompts, scaffolds
+
+        with open(self.data_path) as f:
+            prompts = [p.strip() for p in f.readlines()]
+        return prompts, None
+
+    def setup(self, stage):
+        prompts, json_scaffolds = self._load_prompts_and_scaffolds()
+        prompts = prompts[: self.prompt_size]
+
+        if json_scaffolds is not None:
+            scaffolds = json_scaffolds[: self.prompt_size]
+        else:
+            scaffolds = None
+            if self.scaffold_list is not None:
+                scaffolds = list(self.scaffold_list)
+            elif self.scaffold_path and os.path.exists(self.scaffold_path):
+                with open(self.scaffold_path) as f:
+                    scaffolds = [line.strip() for line in f]
+            if scaffolds is not None:
+                scaffolds = scaffolds[: self.prompt_size]
         num_train = int(self.total_size * self.train_size)
 
         self.train_data = BufferDataPipe(
@@ -256,6 +310,7 @@ class BufferDataModule(LightningDataModule):
             allowed_vocab=self.allowed_tokens,
             n_samples=self.n_samples,
             buffer_tokenization=self.buffer_tokenization,
+            scaffolds=scaffolds,
         )
         self.val_data = BufferDataPipe(
             prompts,
@@ -263,6 +318,15 @@ class BufferDataModule(LightningDataModule):
             self.total_size - num_train,
             is_instruct=self.is_instruct,
             add_prompt=self.add_prompt,
+            scaffolds=scaffolds,
+        )
+        self.test_data = BufferDataPipe(
+            prompts,
+            self.tokenizer,
+            self.total_size - num_train,
+            is_instruct=self.is_instruct,
+            add_prompt=self.add_prompt,
+            scaffolds=scaffolds,
         )
 
     def train_dataloader(self):
@@ -272,7 +336,7 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            prefetch_factor=4 if self.num_workers > 0 else 2,
+            prefetch_factor=4 if self.num_workers > 0 else None,
             persistent_workers=True if self.num_workers > 0 else False,
         )
 
@@ -282,6 +346,16 @@ class BufferDataModule(LightningDataModule):
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            prefetch_factor=4 if self.num_workers > 0 else 2,
+            prefetch_factor=4 if self.num_workers > 0 else None,
+            persistent_workers=True if self.num_workers > 0 else False,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_data,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            prefetch_factor=4 if self.num_workers > 0 else None,
             persistent_workers=True if self.num_workers > 0 else False,
         )

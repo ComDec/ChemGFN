@@ -243,6 +243,16 @@ def generate_and_return_termination_logprob(
                 modified_logits[mask] = -torch.inf
                 modified_logits[:, termination_token_id] = 0
 
+            if (~active_seqs).any():
+                inactive = ~active_seqs
+                modified_logits[inactive] = -torch.inf
+                modified_logits[inactive, termination_token_id] = 0.0
+
+            no_valid = ~torch.isfinite(modified_logits).any(dim=-1)
+            if no_valid.any():
+                modified_logits[no_valid] = -torch.inf
+                modified_logits[no_valid, termination_token_id] = 0.0
+
             prob = (modified_logits / temperature).softmax(dim=-1)
             token_ids = torch.multinomial(prob, num_samples=1)
             if use_buffer_sample and buffer_sample is not None:
@@ -343,6 +353,7 @@ def generate_and_return_termination_logprob(
             phi_diag = reward_results.get("prefix_diag", None)
             phi_state = reward_results.get("phi_state", None)
             phi_tok = reward_results.get("phi_tok", None)
+            phi_weight = reward_results.get("phi_weight", None)
             pv = reward_results.get("pv", None)
 
         else:
@@ -366,6 +377,7 @@ def generate_and_return_termination_logprob(
         "phi_state": phi_state,
         "phi_tok": phi_tok,
         "pv": pv,
+        "phi_weight": phi_weight,
     }
 
 
