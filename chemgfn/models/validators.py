@@ -8,8 +8,8 @@ from typing import Iterable, Literal
 
 import partialsmiles as ps
 import torch
-from rdkit import Chem, RDLogger
-from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit import Chem, DataStructs, RDLogger
+from rdkit.Chem import AllChem
 from torch import Tensor
 from transformers import PreTrainedTokenizer
 
@@ -212,11 +212,23 @@ class Expr24Validator(SentenceValidator):
 class RDKitValidator(SentenceValidator):
     requires_target_molecule = False
 
-    def __init__(self, scorer: str = "sa", backend: Literal["rdkit", "pa"] = "rdkit") -> None:
+    def __init__(
+        self,
+        scorer: str = "sa",
+        backend: Literal["rdkit", "pa"] = "rdkit",
+        fp_radius: int = 2,
+        fp_nbits: int = 2048,
+        topk_diversity: int = 20,
+    ) -> None:
         super().__init__(scorer)
         self.score_function = FUNCTION_MAPPING[scorer]
         self.backend = backend
         self.scorer_name = scorer
+
+        # FP diversity config
+        self.fp_radius = int(fp_radius)
+        self.fp_nbits = int(fp_nbits)
+        self.topk_diversity = int(topk_diversity)
 
     @staticmethod
     def rdkit_validate(smiles: str) -> bool:
@@ -244,36 +256,30 @@ class RDKitValidator(SentenceValidator):
             return self.pa_validate(smiles)
         raise ValueError(f"Unknown backend: {self.backend}")
 
-    @staticmethod
-    def _murcko_scaffold_smiles(mol: Chem.Mol | None) -> str | None:
-        """
-        Return Bemis-Murcko scaffold as SMILES (canonical). None if fails.
-        Note: Murcko scaffold can be empty for some molecules; treat empty as None.
-        """
-        if mol is None:
-            return None
-        try:
-            scaf = MurckoScaffold.GetScaffoldForMol(mol)
-            if scaf is None or scaf.GetNumAtoms() == 0:
-                return None
-            # canonical scaffold smiles
-            return Chem.MolToSmiles(scaf, isomericSmiles=False)
-        except Exception:
-            return None
-
     def _decode_batch(self, generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> list[str]:
         return [_decode_tokens_to_string(sample, tokenizer) for sample in generated_tokens]
 
+    def _morgan_fp(self, mol: Chem.Mol) -> DataStructs.cDataStructs.ExplicitBitVect:
+        return AllChem.GetMorganFingerprintAsBitVect(mol, self.fp_radius, nBits=self.fp_nbits)
+
     @staticmethod
-    def _entropy_from_counts(counter: Counter) -> float:
-        n = sum(counter.values())
-        if n <= 0:
-            return 0.0
-        ent = 0.0
-        for c in counter.values():
-            p = c / n
-            ent -= p * math.log(p + 1e-12)
-        return float(ent)
+    def _mean_pairwise_tanimoto(
+        fps: list[DataStructs.cDataStructs.ExplicitBitVect],
+    ) -> float:
+        """
+        Mean_{i<j} Tanimoto(fp_i, fp_j). Returns 1.0 if <2 fps (so diversity becomes 0.0).
+        Uses BulkTanimotoSimilarity for speed.
+        """
+        n = len(fps)
+        if n <= 1:
+            return 1.0
+        s = 0.0
+        cnt = 0
+        for i in range(n - 1):
+            sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[i + 1 :])
+            s += float(sum(sims))
+            cnt += len(sims)
+        return s / max(1, cnt)
 
     def smiles_accuracy(
         self,
@@ -283,14 +289,23 @@ class RDKitValidator(SentenceValidator):
     ) -> dict[str, float]:
         decoded = self._decode_batch(generated_tokens, tokenizer)
 
-        scores: list[float] = []
-        valid_flags: list[bool] = []
+        num_samples = int(generated_tokens.shape[0])
+        if num_samples == 0:
+            return {
+                "acc": 0.0,
+                f"{self.scorer_name}": 0.0,
+                f"{self.scorer_name}_filter": 0.0,
+                "fp_div_internal_valid": 0.0,
+                "fp_div_topk_valid": 0.0,
+            }
 
-        # scaffold tracking
-        scaffolds_all: list[str | None] = []  # include invalid as None
-        scaffolds_valid: list[str] = []  # valid only
+        # one pass: build mols, validity, scores
+        valid_flags: list[bool] = [False] * num_samples
+        scores: list[float] = [0.0] * num_samples
+        valid_mols: list[Chem.Mol] = []
+        valid_scores: list[float] = []
 
-        for s in decoded:
+        for i, s in enumerate(decoded):
             candidate = _merge_target(scaffold, s)
 
             mol = None
@@ -298,56 +313,48 @@ class RDKitValidator(SentenceValidator):
                 mol = Chem.MolFromSmiles(candidate)
 
             is_valid = bool(mol)
-            valid_flags.append(is_valid)
+            valid_flags[i] = is_valid
 
             if is_valid:
-                scores.append(float(self.score_function(mol)))
+                sc = float(self.score_function(mol))
+                scores[i] = sc
+                valid_mols.append(mol)
+                valid_scores.append(sc)
             else:
-                scores.append(0.0)
+                scores[i] = 0.0
 
-            scaf = self._murcko_scaffold_smiles(mol)
-            scaffolds_all.append(scaf)
-            if (scaf is not None) and is_valid:
-                scaffolds_valid.append(scaf)
-
-        num_samples = int(generated_tokens.shape[0])
         total_valid = int(sum(valid_flags))
 
-        avg_score = (sum(scores) / num_samples) if num_samples else 0.0
-        filtered_score = (
-            sum(score for score, flag in zip(scores, valid_flags) if flag) / total_valid
-            if total_valid
-            else 0.0
-        )
+        avg_score = float(sum(scores) / num_samples)
+        filtered_score = float(sum(valid_scores) / total_valid) if total_valid else 0.0
 
-        # ---- scaffold diversity metrics ----
-        # Unique fraction (all) treats None as "no scaffold"; often you'd rather exclude None.
-        # Here we provide both all + valid-only.
-        uniq_all = len(set(scaffolds_all)) if num_samples else 0
-        uniq_valid = len(set(scaffolds_valid)) if total_valid else 0
+        # ---- whole-molecule FP diversity (valid-only) ----
+        if total_valid >= 2:
+            fps = [self._morgan_fp(m) for m in valid_mols]
+            mean_sim = self._mean_pairwise_tanimoto(fps)
+            fp_div_internal_valid = 1.0 - float(mean_sim)
 
-        scaffold_unique_frac_all = (uniq_all / num_samples) if num_samples else 0.0
-        scaffold_unique_frac_valid = (uniq_valid / total_valid) if total_valid else 0.0
-
-        # Valid-only distribution stats (more meaningful)
-        if total_valid > 0 and len(scaffolds_valid) > 0:
-            c = Counter(scaffolds_valid)
-            ent = self._entropy_from_counts(c)
-            eff = math.exp(ent)
-            top1 = max(c.values()) / max(1, len(scaffolds_valid))
+            # top-k diversity (by score) within valid set
+            k = min(self.topk_diversity, total_valid)
+            if k >= 2:
+                top_idx = sorted(range(total_valid), key=lambda j: valid_scores[j], reverse=True)[
+                    :k
+                ]
+                top_fps = [fps[j] for j in top_idx]  # reuse computed fps
+                top_mean_sim = self._mean_pairwise_tanimoto(top_fps)
+                fp_div_topk_valid = 1.0 - float(top_mean_sim)
+            else:
+                fp_div_topk_valid = 0.0
         else:
-            ent, eff, top1 = 0.0, 0.0, 0.0
+            fp_div_internal_valid = 0.0
+            fp_div_topk_valid = 0.0
 
         return {
-            "acc": (total_valid / num_samples) if num_samples else 0.0,
+            "acc": float(total_valid / num_samples),
             f"{self.scorer_name}": float(avg_score),
             f"{self.scorer_name}_filter": float(filtered_score),
-            # scaffold diversity
-            "scaffold_unique_frac_all": float(scaffold_unique_frac_all),
-            "scaffold_unique_frac_valid": float(scaffold_unique_frac_valid),
-            "scaffold_entropy_valid": float(ent),
-            "scaffold_eff_valid": float(eff),
-            "scaffold_top1_valid": float(top1),
+            "fp_div_internal_valid": float(fp_div_internal_valid),
+            "fp_div_topk_valid": float(fp_div_topk_valid),
         }
 
     def accuracy(
@@ -369,34 +376,48 @@ class RDKitValidator(SentenceValidator):
         device = sentences.device
 
         invalid = torch.ones(batch_size, seq_len + 1, device=device)
-        valid_score = torch.full((batch_size, seq_len + 1), -1.0, device=device)
+        valid_score = torch.full((batch_size, seq_len + 1), 0.0, device=device)
         valid_score[:, 0] = 0.0
         global_score = torch.zeros(batch_size, device=device)
         full_tokens_list: list[str] = []
 
-        for batch_idx in range(batch_size):
+        # small micro-opt: cache decoded prefixes per batch element to avoid repeated decode of same span
+        # (still O(seq_len^2) tokens processed, but fewer Python calls in practice)
+        for b in range(batch_size):
+            # prefix decoding cache: pos -> string
+            prefix_cache: dict[int, str] = {}
+
             for pos in range(seq_len):
-                if sentences[batch_idx, pos] == termination_token_id:
+                tok = int(sentences[b, pos].item())
+                if tok == termination_token_id:
                     break
 
-                prefix = _decode_tokens_to_string(sentences[batch_idx, : pos + 1], tokenizer)
-                candidate = _merge_target(scaffold, prefix)
-                valid = self._is_valid_smiles(candidate)
+                # decode prefix [0:pos+1]
+                if pos not in prefix_cache:
+                    prefix_cache[pos] = _decode_tokens_to_string(
+                        sentences[b, : pos + 1], tokenizer
+                    )
 
-                if valid:
+                candidate = _merge_target(scaffold, prefix_cache[pos])
+
+                if self._is_valid_smiles(candidate):
                     mol = Chem.MolFromSmiles(candidate)
-                    valid_score[batch_idx, pos + 1] = self.score_function(mol) if mol else -1.0
-                    invalid[batch_idx, pos + 1] = 0.0
+                    if mol:
+                        valid_score[b, pos + 1] = float(self.score_function(mol))
+                        invalid[b, pos + 1] = 0.0
+                    else:
+                        invalid[b, pos + 1] = 1.0
                 else:
-                    invalid[batch_idx, pos + 1] = 1.0
+                    invalid[b, pos + 1] = 1.0
 
-            final_tokens = _decode_tokens_to_string(sentences[batch_idx], tokenizer)
+            final_tokens = _decode_tokens_to_string(sentences[b], tokenizer)
             full_smiles = _merge_target(scaffold, final_tokens)
             try:
                 mol = Chem.MolFromSmiles(full_smiles)
-                global_score[batch_idx] = self.score_function(mol) if mol else 0.0
+                global_score[b] = float(self.score_function(mol)) if mol else 0.0
             except Exception:
-                global_score[batch_idx] = 0.0
+                global_score[b] = 0.0
+
             full_tokens_list.append(full_smiles)
 
         return {
