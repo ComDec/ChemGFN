@@ -67,6 +67,7 @@ class ChemGFNModule(LightningModule):
         reward_buffer,
         reward_config: dict[str, Any],
         training_mixed_config: dict[str, Any],
+        ema_config: dict[str, Any],
         constraint_config: dict[str, Any],
         optimizer: torch.optim.Optimizer,
         scheduler: torch.optim.lr_scheduler,
@@ -92,7 +93,10 @@ class ChemGFNModule(LightningModule):
             self.net = model
 
         self.net_frozen = model_frozen
+        self._net_frozen_raw = model_frozen
         self.tokenizer = tokenizer
+        self.disable_peft = disable_peft
+        self.lora_config = lora_config
 
         self.reward_config = reward_config
         self.constraint_config = constraint_config
@@ -136,19 +140,38 @@ class ChemGFNModule(LightningModule):
 
         self.train_sentence_length: list = []
         self.train_samples: list = []
-        self.val_samples: list = []
-        self.test_samples: list = []
+
         self.train_samples_ids: list = []
         self.val_samples_ids: list = []
         self.test_samples_ids: list = []
+
         self.val_samples_table: list = []
         self.val_log_rs: list = []
         self.val_log_pfss: list = []
+
         self.test_samples_table: list = []
         self.test_log_rs: list = []
         self.test_log_pfss: list = []
 
+        self.train_samples_valid_flags: list = []
+        self.val_samples_valid_flags: list = []
+        self.test_samples_valid_flags: list = []
+
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
+
+        self.ema_config = ema_config
+        self._ema_enabled = bool(self._ema_cfg("enabled", False))
+        self._ema_decay = float(self._ema_cfg("decay", 0.999))
+        self._ema_start_epoch = int(self._ema_cfg("ema_start_epoch", 0))
+        self._ema_reference_start_epoch = int(
+            self._ema_cfg("reference_start_epoch", self._ema_start_epoch)
+        )
+        self._ema_reference_interval = int(self._ema_cfg("reference_update_interval", 1))
+        self._ema_log_param_delta = bool(self._ema_cfg("log_param_delta", False))
+        self._ema_log_reference_delta = bool(self._ema_cfg("log_reference_delta", False))
+        self._ema_state: dict[str, torch.Tensor] = {}
+        self._ema_reference_update_count = 0
+        self._ema_reference_prev_state: dict[str, torch.Tensor] = {}
 
         # Initialize loss function from config
         self.loss_fn: GFNLoss = loss_fn
@@ -509,6 +532,8 @@ class ChemGFNModule(LightningModule):
                 acc_val = 0.0
 
             self.train_samples_ids.extend(generated_text[:, prompt_len:].detach().cpu().tolist())
+            self.train_samples_valid_flags.extend(valid_flags)
+
             self.train_samples.append(
                 {
                     "decoded": decoded,
@@ -617,8 +642,6 @@ class ChemGFNModule(LightningModule):
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
-        self.val_samples.extend(generated_text[:, prompt_len:].tolist())
-        self.val_samples_ids.extend(generated_text[:, prompt_len:].tolist())
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
@@ -666,6 +689,10 @@ class ChemGFNModule(LightningModule):
 
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
+
+        self.val_samples_ids.extend(generated_text[:, prompt_len:].tolist())
+        self.val_samples_valid_flags.extend(valid_flags)
+
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
         else:
@@ -687,8 +714,10 @@ class ChemGFNModule(LightningModule):
             on_epoch=True,
         )
 
-        log_ps = last_log_r * self.reward.temperature
-        log_ps_unpenalized = last_log_r_unpenalized * self.reward.temperature
+        log_ps = last_log_r * self.get_reward_temp_at_step(self.global_step)
+        log_ps_unpenalized = last_log_r_unpenalized * self.get_reward_temp_at_step(
+            self.global_step
+        )
         self._log_metrics(
             {
                 "val/loss": (loss, {"prog_bar": True}),
@@ -748,7 +777,7 @@ class ChemGFNModule(LightningModule):
         log_r_reference = result_dict["log_r_reference"]
         log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
-        self.test_samples.extend(generated_text[:, prompt_len:].tolist())
+
         self.test_samples_ids.extend(generated_text[:, prompt_len:].tolist())
 
         if hasattr(self.loss_fn, "set_global_step"):
@@ -795,6 +824,8 @@ class ChemGFNModule(LightningModule):
 
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
+        self.test_samples_valid_flags.extend(valid_flags)
+
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
         else:
@@ -882,6 +913,8 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
 
     def on_train_epoch_end(self):
+        self._maybe_update_ema()
+
         if hasattr(self, "global_rank") and self.global_rank != 0:
             return
 
@@ -906,18 +939,25 @@ class ChemGFNModule(LightningModule):
             batch_first=True,
             padding_value=eos,
         )
+        valid_flags = torch.tensor(self.train_samples_valid_flags)
         active_before = compute_active_before(seqs, eos=eos)
         non_eos = seqs != eos
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
-        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
-        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+        pos = prefix_collapse_by_position(
+            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+        )
+        kmet = prefix_collapse_by_k(
+            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+        )
 
         log = {
-            "prefix_pos_train/top1_auc": float(pos.top1_auc),
-            "prefix_pos_train/collapse_depth_095": float(pos.collapse_depth),
+            "prefix_pos/top1_auc_train": float(pos.top1_auc),
+            "prefix_pos/top1_auc_correct_train": float(pos.top1_auc_correct),
         }
+
         self._log_metrics(log, on_epoch=True, sync_dist=True)
         self._log_wandb_prefix_tables("prefix_pos_train", pos, kmet)
 
@@ -1006,18 +1046,19 @@ class ChemGFNModule(LightningModule):
         self.val_probes = torch.utils.data.Subset(
             val_dataset, random.sample(range(len(val_dataset)), 10)
         )
-        self.val_samples.clear()
+
         self.val_samples_ids.clear()
         self.val_samples_table.clear()
         self.val_log_rs.clear()
         self.val_log_pfss.clear()
 
     def on_validation_epoch_end(self):
-        diversity = calculate_diversity(torch.tensor(self.val_samples))
+        diversity = calculate_diversity(torch.tensor(self.val_samples_ids))
         self._log_metrics({"val/diversity": diversity}, sync_dist=True, on_epoch=True)
 
         # log prefix collapse metrics
         eos = self.end_of_sentence_token_id
+        valid_flags = torch.tensor(self.val_samples_valid_flags)
         seqs = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(x, dtype=torch.long) for x in self.val_samples_ids],
             batch_first=True,
@@ -1028,12 +1069,16 @@ class ChemGFNModule(LightningModule):
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
-        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
-        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        pos = prefix_collapse_by_position(
+            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+        )
+        kmet = prefix_collapse_by_k(
+            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+        )
 
         log = {
-            "prefix_pos_val/top1_auc": float(pos.top1_auc),
-            "prefix_pos_val/collapse_depth_095": float(pos.collapse_depth),
+            "prefix_pos/top1_auc_val": float(pos.top1_auc),
+            "prefix_pos/top1_auc_correct_val": float(pos.top1_auc_correct),
         }
         self._log_metrics(log, on_epoch=True, sync_dist=True)
         self._log_wandb_prefix_tables("prefix_pos_val", pos, kmet)
@@ -1074,17 +1119,17 @@ class ChemGFNModule(LightningModule):
                 )
 
     def on_test_epoch_start(self):
-        self.test_samples.clear()
         self.test_samples_ids.clear()
         self.test_samples_table.clear()
         self.test_log_rs.clear()
         self.test_log_pfss.clear()
 
     def on_test_epoch_end(self):
-        diversity = calculate_diversity(torch.tensor(self.test_samples))
+        diversity = calculate_diversity(torch.tensor(self.test_samples_ids))
         self._log_metrics({"test/diversity": diversity}, sync_dist=True, on_epoch=True)
 
         eos = self.end_of_sentence_token_id
+        valid_flags = torch.tensor(self.test_samples_valid_flags)
         seqs = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(x, dtype=torch.long) for x in self.test_samples_ids],
             batch_first=True,
@@ -1095,12 +1140,16 @@ class ChemGFNModule(LightningModule):
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
-        pos = prefix_collapse_by_position(seqs_list, mask_list, collapse_thr=0.95)
-        kmet = prefix_collapse_by_k(seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        pos = prefix_collapse_by_position(
+            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+        )
+        kmet = prefix_collapse_by_k(
+            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+        )
 
         log = {
-            "prefix_pos_test/top1_auc": float(pos.top1_auc),
-            "prefix_pos_test/collapse_depth_095": float(pos.collapse_depth),
+            "prefix_pos/top1_auc_test": float(pos.top1_auc),
+            "prefix_pos/top1_auc_correct_test": float(pos.top1_auc_correct),
         }
         self._log_metrics(log, on_epoch=True, sync_dist=True)
         self._log_wandb_prefix_tables("prefix_pos_test", pos, kmet)
@@ -1475,15 +1524,6 @@ class ChemGFNModule(LightningModule):
         )
 
     def _setup_grammar_processors(self):
-        # we have a elegant way to disable grammar, but it is not used in the code
-
-        # if not getattr(self.constraint_config, "apply_grammar", False):
-        #     self.string_grammar = None
-        #     self.grammar = None
-        #     self.pre_grammar_processor = None
-        #     self.grammar_processor = None
-        #     return
-
         with open(self.constraint_config.grammar_path) as file:
             grammar_str = file.read()
 
@@ -1538,7 +1578,7 @@ class ChemGFNModule(LightningModule):
 
         epoch = int(getattr(self.trainer, "current_epoch", 0))
 
-        # one-time: encourage scalar plots to use epoch as x-axis (doesn't touch wandb step monotonicity)
+        # one-time: encourage scalar plots to use epoch as x-axis
         flag_name = f"_wandb_prefix_defined_{tag.replace('/', '_')}"
         if not getattr(self, flag_name, False):
             for run in runs:
@@ -1552,6 +1592,7 @@ class ChemGFNModule(LightningModule):
         local_tag = tag.replace("/", "_")
         _root_dir = os.path.join(self.trainer.default_root_dir, "prefix_tables")
         os.makedirs(_root_dir, exist_ok=True)
+
         ranges = getattr(self, "_wandb_prefix_axis_ranges", None)
         if ranges is None:
             ranges = {}
@@ -1594,159 +1635,244 @@ class ChemGFNModule(LightningModule):
                 ymax += pad
             ax.set_ylim(ymin, ymax)
 
-        # -------------------------
-        # POS: local table + 3-subplot figure
-        # -------------------------
-        pos_rows = []
-        if getattr(pos, "top1_mass", None):
-            T = min(
-                len(getattr(pos, "top1_mass", [])),
-                len(getattr(pos, "entropy", [])),
-                len(getattr(pos, "eff_support", [])),
+        def _log_pos_variant(
+            *,
+            suffix: str,  # "" or "_correct"
+            top1_mass: list[float],
+            entropy: list[float],
+            eff_support: list[float],
+            unique: list[int] | None,
+            support: list[int] | None,
+            correct_frac: list[float] | None = None,  # only for correct variant (optional)
+        ) -> None:
+            if not top1_mass:
+                return
+            T = min(len(top1_mass), len(entropy), len(eff_support))
+            if T <= 0:
+                return
+
+            # ---- table ----
+            cols = ["epoch", "t", "top1_mass", "entropy", "eff_support"]
+            if unique is not None:
+                cols.append("unique")
+            if support is not None:
+                cols.append("support")
+            if correct_frac is not None:
+                cols.append("correct_frac")
+
+            rows = []
+            for t in range(T):
+                row = [
+                    epoch,
+                    int(t),
+                    float(top1_mass[t]),
+                    float(entropy[t]),
+                    float(eff_support[t]),
+                ]
+                if unique is not None:
+                    row.append(int(unique[t]) if t < len(unique) else 0)
+                if support is not None:
+                    row.append(int(support[t]) if t < len(support) else 0)
+                if correct_frac is not None:
+                    row.append(float(correct_frac[t]) if t < len(correct_frac) else 0.0)
+                rows.append(row)
+
+            pd.DataFrame(rows, columns=cols).to_csv(
+                os.path.join(_root_dir, f"{local_tag}_pos{suffix}_{epoch}.csv"),
+                index=False,
             )
-            if T > 0:
-                cols = ["epoch", "t", "top1_mass", "entropy", "eff_support"]
-                if getattr(pos, "unique", None) is not None:
-                    cols.append("unique")
-                if getattr(pos, "support", None) is not None:
-                    cols.append("support")
 
-                for t in range(T):
-                    row = [
-                        epoch,
-                        int(t),
-                        float(pos.top1_mass[t]),
-                        float(pos.entropy[t]),
-                        float(pos.eff_support[t]),
-                    ]
-                    if getattr(pos, "unique", None) is not None:
-                        row.append(int(pos.unique[t]))
-                    if getattr(pos, "support", None) is not None:
-                        row.append(int(pos.support[t]))
-                    pos_rows.append(row)
+            # ---- figure: 3 subplots ----
+            try:
+                import matplotlib.pyplot as plt
 
-                pd.DataFrame(pos_rows, columns=cols).to_csv(
-                    os.path.join(_root_dir, f"{local_tag}_pos_{epoch}.csv"),
-                    index=False,
+                xs = list(range(T))
+                top1_vals = [float(v) for v in top1_mass[:T]]
+                ent_vals = [float(v) for v in entropy[:T]]
+                eff_vals = [float(v) for v in eff_support[:T]]
+
+                fig, axes = plt.subplots(3, 1, figsize=(7, 7), sharex=True)
+
+                axes[0].plot(xs, top1_vals)
+                axes[0].set_ylabel("top1_mass")
+
+                axes[1].plot(xs, ent_vals)
+                axes[1].set_ylabel("entropy")
+
+                axes[2].plot(xs, eff_vals)
+                axes[2].set_ylabel("eff_support")
+                axes[2].set_xlabel("t")
+
+                _apply_ylim(axes[0], _update_range(f"pos{suffix}_top1_mass", top1_vals))
+                _apply_ylim(axes[1], _update_range(f"pos{suffix}_entropy", ent_vals))
+                _apply_ylim(axes[2], _update_range(f"pos{suffix}_eff_support", eff_vals))
+                x_rng = _update_x_range(f"pos{suffix}_x_min", f"pos{suffix}_x_max", xs)
+                if x_rng is not None:
+                    for ax in axes:
+                        ax.set_xlim(x_rng[0], x_rng[1])
+
+                title_extra = "" if suffix == "" else " (correct-only)"
+                fig.suptitle(f"{tag} / prefix-by-position{title_extra} (epoch={epoch})")
+                fig.tight_layout()
+
+                key = f"{tag}/pos{suffix}_curves_img" if suffix else f"{tag}/pos_curves_img"
+                if suffix:
+                    key = f"{tag}/pos_correct_curves_img"
+                payload[key] = wandb.Image(fig)
+                plt.close(fig)
+            except Exception:
+                pass
+
+        def _log_k_variant(*, suffix: str) -> None:
+            if not kmet:
+                return
+            ks = sorted(kmet.keys())
+            if not ks:
+                return
+
+            # pick fields
+            if suffix == "":
+                f_top1, f_top5, f_ent, f_eff, f_n, f_uniq = (
+                    "top1",
+                    "top5",
+                    "entropy",
+                    "eff",
+                    "n",
+                    "unique",
+                )
+            else:
+                f_top1, f_top5, f_ent, f_eff, f_n, f_uniq = (
+                    "top1_correct",
+                    "top5_correct",
+                    "entropy_correct",
+                    "eff_correct",
+                    "n_correct",
+                    "unique_correct",
                 )
 
-                # 3 subplots in ONE figure
-                try:
-                    import matplotlib.pyplot as plt
-
-                    xs = list(range(T))
-                    top1_vals = [float(v) for v in pos.top1_mass[:T]]
-                    ent_vals = [float(v) for v in pos.entropy[:T]]
-                    eff_vals = [float(v) for v in pos.eff_support[:T]]
-                    fig, axes = plt.subplots(3, 1, figsize=(7, 7), sharex=True)
-
-                    axes[0].plot(xs, top1_vals)
-                    axes[0].set_ylabel("top1_mass")
-
-                    axes[1].plot(xs, ent_vals)
-                    axes[1].set_ylabel("entropy")
-
-                    axes[2].plot(xs, eff_vals)
-                    axes[2].set_ylabel("eff_support")
-                    axes[2].set_xlabel("t")
-
-                    _apply_ylim(axes[0], _update_range("pos_top1_mass", top1_vals))
-                    _apply_ylim(axes[1], _update_range("pos_entropy", ent_vals))
-                    _apply_ylim(axes[2], _update_range("pos_eff_support", eff_vals))
-                    x_rng = _update_x_range("pos_x_min", "pos_x_max", xs)
-                    if x_rng is not None:
-                        for ax in axes:
-                            ax.set_xlim(x_rng[0], x_rng[1])
-
-                    fig.suptitle(f"{tag} / prefix-by-position (epoch={epoch})")
-                    fig.tight_layout()
-
-                    payload[f"{tag}/pos_curves_img"] = wandb.Image(fig)
-                    plt.close(fig)
-                except Exception:
-                    pass
-
-        # -------------------------
-        # K: local table + 4-subplot figure
-        # -------------------------
-        k_rows = []
-        if kmet:
-            ks = sorted(kmet.keys())
-            if ks:
-                cols = ["epoch", "k", "top1", "top5", "entropy", "eff", "n", "unique"]
+            # if correct variant but none exists, skip quietly
+            if suffix != "":
+                any_has = False
                 for k in ks:
                     v = kmet[k] or {}
-                    k_rows.append(
-                        [
-                            epoch,
-                            int(k),
-                            float(v.get("top1", 0.0)),
-                            float(v.get("top5", 0.0)),
-                            float(v.get("entropy", 0.0)),
-                            float(v.get("eff", 0.0)),
-                            float(v.get("n", 0.0)),
-                            float(v.get("unique", 0.0)),
-                        ]
-                    )
-                pd.DataFrame(k_rows, columns=cols).to_csv(
-                    os.path.join(_root_dir, f"{local_tag}_k_{epoch}.csv"),
-                    index=False,
+                    if (f_n in v) or (f_top1 in v) or (f_top5 in v):
+                        any_has = True
+                        break
+                if not any_has:
+                    return
+
+            cols = ["epoch", "k", "top1", "top5", "entropy", "eff", "n", "unique"]
+            rows = []
+            for k in ks:
+                v = kmet[k] or {}
+                rows.append(
+                    [
+                        epoch,
+                        int(k),
+                        float(v.get(f_top1, 0.0)),
+                        float(v.get(f_top5, 0.0)),
+                        float(v.get(f_ent, 0.0)),
+                        float(v.get(f_eff, 0.0)),
+                        float(v.get(f_n, 0.0)),
+                        float(v.get(f_uniq, 0.0)),
+                    ]
                 )
 
-                # 4 subplots in ONE figure
-                try:
-                    import matplotlib.pyplot as plt
+            pd.DataFrame(rows, columns=cols).to_csv(
+                os.path.join(_root_dir, f"{local_tag}_k{suffix}_{epoch}.csv"),
+                index=False,
+            )
 
-                    xs = [int(k) for k in ks]
-                    top1s = [float(kmet[k].get("top1", 0.0)) for k in ks]
-                    top5s = [float(kmet[k].get("top5", 0.0)) for k in ks]
-                    ents = [float(kmet[k].get("entropy", 0.0)) for k in ks]
-                    effs = [float(kmet[k].get("eff", 0.0)) for k in ks]
+            try:
+                import matplotlib.pyplot as plt
 
-                    fig, axes = plt.subplots(4, 1, figsize=(7, 9), sharex=True)
+                xs = [int(k) for k in ks]
+                top1s = [float((kmet[k] or {}).get(f_top1, 0.0)) for k in ks]
+                top5s = [float((kmet[k] or {}).get(f_top5, 0.0)) for k in ks]
+                ents = [float((kmet[k] or {}).get(f_ent, 0.0)) for k in ks]
+                effs = [float((kmet[k] or {}).get(f_eff, 0.0)) for k in ks]
 
-                    axes[0].plot(xs, top1s)
-                    axes[0].set_ylabel("top1")
+                fig, axes = plt.subplots(4, 1, figsize=(7, 9), sharex=True)
 
-                    axes[1].plot(xs, top5s)
-                    axes[1].set_ylabel("top5")
+                axes[0].plot(xs, top1s)
+                axes[0].set_ylabel("top1")
 
-                    axes[2].plot(xs, ents)
-                    axes[2].set_ylabel("entropy")
+                axes[1].plot(xs, top5s)
+                axes[1].set_ylabel("top5")
 
-                    axes[3].plot(xs, effs)
-                    axes[3].set_ylabel("eff")
-                    axes[3].set_xlabel("k")
+                axes[2].plot(xs, ents)
+                axes[2].set_ylabel("entropy")
 
-                    _apply_ylim(axes[0], _update_range("k_top1", top1s))
-                    _apply_ylim(axes[1], _update_range("k_top5", top5s))
-                    _apply_ylim(axes[2], _update_range("k_entropy", ents))
-                    _apply_ylim(axes[3], _update_range("k_eff", effs))
-                    x_rng = _update_x_range("k_x_min", "k_x_max", xs)
-                    if x_rng is not None:
-                        for ax in axes:
-                            ax.set_xlim(x_rng[0], x_rng[1])
+                axes[3].plot(xs, effs)
+                axes[3].set_ylabel("eff")
+                axes[3].set_xlabel("k")
 
-                    fig.suptitle(f"{tag} / prefix-by-k (epoch={epoch})")
-                    fig.tight_layout()
+                _apply_ylim(axes[0], _update_range(f"k{suffix}_top1", top1s))
+                _apply_ylim(axes[1], _update_range(f"k{suffix}_top5", top5s))
+                _apply_ylim(axes[2], _update_range(f"k{suffix}_entropy", ents))
+                _apply_ylim(axes[3], _update_range(f"k{suffix}_eff", effs))
+                x_rng = _update_x_range(f"k{suffix}_x_min", f"k{suffix}_x_max", xs)
+                if x_rng is not None:
+                    for ax in axes:
+                        ax.set_xlim(x_rng[0], x_rng[1])
 
-                    payload[f"{tag}/k_curves_img"] = wandb.Image(fig)
-                    plt.close(fig)
-                except Exception:
-                    pass
+                title_extra = "" if suffix == "" else " (correct-only)"
+                fig.suptitle(f"{tag} / prefix-by-k{title_extra} (epoch={epoch})")
+                fig.tight_layout()
 
-        # optional scalars
+                key = f"{tag}/k_curves_img" if suffix == "" else f"{tag}/k_correct_curves_img"
+                payload[key] = wandb.Image(fig)
+                plt.close(fig)
+            except Exception:
+                pass
+
+        # -------------------------
+        # POS: all + correct
+        # -------------------------
+        if getattr(pos, "top1_mass", None):
+            _log_pos_variant(
+                suffix="",
+                top1_mass=[float(v) for v in pos.top1_mass],
+                entropy=[float(v) for v in getattr(pos, "entropy", [])],
+                eff_support=[float(v) for v in getattr(pos, "eff_support", [])],
+                unique=getattr(pos, "unique", None),
+                support=getattr(pos, "support", None),
+                correct_frac=None,
+            )
+
+        if getattr(pos, "top1_mass_correct", None):
+            _log_pos_variant(
+                suffix="_correct",
+                top1_mass=[float(v) for v in pos.top1_mass_correct],
+                entropy=[float(v) for v in getattr(pos, "entropy_correct", [])],
+                eff_support=[float(v) for v in getattr(pos, "eff_support_correct", [])],
+                unique=getattr(pos, "unique_correct", None),
+                support=getattr(pos, "support_correct", None),
+                correct_frac=getattr(pos, "correct_frac", None),
+            )
+
+        # -------------------------
+        # K: all + correct
+        # -------------------------
+        if kmet:
+            _log_k_variant(suffix="")
+            _log_k_variant(suffix="_correct")
+
+        # -------------------------
+        # Scalars (all + correct)
+        # -------------------------
         if getattr(pos, "top1_auc", None) is not None:
             payload[f"{tag}/top1_auc"] = float(pos.top1_auc)
-        if getattr(pos, "collapse_depth", None) is not None:
-            payload[f"{tag}/collapse_depth_095"] = float(pos.collapse_depth)
+
+        if getattr(pos, "top1_auc_correct", None) is not None:
+            payload[f"{tag}/top1_auc_correct"] = float(pos.top1_auc_correct)
 
         # drop Nones
         payload = {k: v for k, v in payload.items() if v is not None}
         if len(payload) <= 1:
             return
 
-        # IMPORTANT: do NOT set step manually (avoid non-monotonic step warnings)
+        # IMPORTANT: do NOT set step manually
         for run in runs:
             try:
                 run.log(payload)
@@ -1892,3 +2018,198 @@ class ChemGFNModule(LightningModule):
             return ",".join(pieces)
 
         return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+
+    def _ema_cfg(self, key: str, default: Any) -> Any:
+        cfg = self.ema_config
+        if cfg is None:
+            return default
+        if hasattr(cfg, "get"):
+            value = cfg.get(key, default)
+        else:
+            value = getattr(cfg, key, default)
+        return default if value is None else value
+
+    def _maybe_update_ema(self) -> None:
+        if not self._ema_enabled:
+            return
+        epoch = int(getattr(self.trainer, "current_epoch", 0))
+        completed_epochs = epoch + 1
+        ema_updated = False
+        reference_updated = False
+        reference_delta = None
+        if completed_epochs >= self._ema_start_epoch:
+            self._update_ema_state()
+            ema_updated = True
+            if self._should_update_reference(completed_epochs):
+                reference_delta = self._apply_ema_to_reference()
+                self._ema_reference_update_count += 1
+                reference_updated = True
+        self._log_ema_metrics(ema_updated, reference_updated, reference_delta)
+
+    def _update_ema_state(self) -> None:
+        with torch.no_grad():
+            for name, param in self.net.named_parameters():
+                if not param.requires_grad:
+                    continue
+                param_cpu = param.detach().cpu()
+                if name not in self._ema_state:
+                    self._ema_state[name] = param_cpu.clone()
+                else:
+                    self._ema_state[name].mul_(self._ema_decay).add_(
+                        param_cpu, alpha=1 - self._ema_decay
+                    )
+
+    def _should_update_reference(self, completed_epochs: int) -> bool:
+        if completed_epochs < self._ema_reference_start_epoch:
+            return False
+        if self._ema_reference_interval <= 0:
+            return False
+        return (
+            (completed_epochs - self._ema_reference_start_epoch) % self._ema_reference_interval
+        ) == 0
+
+    def _apply_ema_to_reference(self) -> tuple[float, float] | None:
+        if not self._ema_state:
+            return None
+        target_model = self._net_frozen_raw
+        reference_delta = None
+        if self._ema_log_reference_delta:
+            if self.disable_peft:
+                reference_delta = self._compute_reference_delta_vs_model(target_model)
+            else:
+                reference_delta = self._compute_reference_delta_vs_prev()
+        if self.disable_peft:
+            target_model.load_state_dict(self._ema_state, strict=False)
+        else:
+            if hasattr(target_model, "merge_and_unload"):
+                ema_peft = target_model
+            else:
+                if hasattr(target_model, "peft_config"):
+                    try:
+                        delattr(target_model, "peft_config")
+                    except Exception:
+                        pass
+                ema_peft = get_peft_model(target_model, self.lora_config)
+            ema_peft.load_state_dict(self._ema_state, strict=False)
+            if hasattr(ema_peft, "merge_and_unload"):
+                merged_model = ema_peft.merge_and_unload()
+                if merged_model is not target_model:
+                    target_model.load_state_dict(merged_model.state_dict())
+            else:
+                if hasattr(ema_peft, "base_model"):
+                    ema_peft.base_model.disable_adapter_layers()
+        target_model.eval()
+        target_model.requires_grad_(False)
+        if self._ema_log_reference_delta and not self.disable_peft:
+            self._ema_reference_prev_state = self._capture_ema_state()
+        return reference_delta
+
+    def _log_ema_metrics(
+        self,
+        ema_updated: bool,
+        reference_updated: bool,
+        reference_delta: tuple[float, float] | None,
+    ) -> None:
+        metrics = {
+            "ema/updated": float(ema_updated),
+            "ema/reference_updated": float(reference_updated),
+            "ema/reference_update_count": float(self._ema_reference_update_count),
+            "ema/decay": float(self._ema_decay),
+        }
+        if self._ema_log_param_delta:
+            stats = self._compute_ema_param_delta()
+            if stats is not None:
+                mean, var = stats
+                metrics["ema/param_delta_mean_abs"] = mean
+                metrics["ema/param_delta_var_abs"] = var
+        if reference_delta is not None:
+            mean, var = reference_delta
+            metrics["ema/reference_param_delta_mean_abs"] = mean
+            metrics["ema/reference_param_delta_var_abs"] = var
+        self._log_metrics(metrics, on_epoch=True, sync_dist=True)
+
+    def _compute_ema_param_delta(self) -> tuple[float, float] | None:
+        if not self._ema_state:
+            return None
+        total = 0.0
+        total_sq = 0.0
+        count = 0
+        param_map = dict(self.net.named_parameters())
+        for name, ema_tensor in self._ema_state.items():
+            if not self._should_track_ema_name(name):
+                continue
+            param = param_map.get(name)
+            if param is None:
+                continue
+            param_cpu = param.detach().cpu()
+            delta = (param_cpu - ema_tensor).float().abs()
+            total += delta.sum().item()
+            total_sq += (delta * delta).sum().item()
+            count += delta.numel()
+        if count == 0:
+            return None
+        mean = total / count
+        var = total_sq / count - mean * mean
+        if var < 0:
+            var = 0.0
+        return mean, var
+
+    def _compute_reference_delta_vs_prev(self) -> tuple[float, float] | None:
+        if not self._ema_reference_prev_state:
+            return None
+        total = 0.0
+        total_sq = 0.0
+        count = 0
+        for name, ema_tensor in self._ema_state.items():
+            if not self._should_track_ema_name(name):
+                continue
+            prev_tensor = self._ema_reference_prev_state.get(name)
+            if prev_tensor is None:
+                continue
+            delta = (ema_tensor - prev_tensor).float().abs()
+            total += delta.sum().item()
+            total_sq += (delta * delta).sum().item()
+            count += delta.numel()
+        if count == 0:
+            return None
+        mean = total / count
+        var = total_sq / count - mean * mean
+        if var < 0:
+            var = 0.0
+        return mean, var
+
+    def _compute_reference_delta_vs_model(self, model) -> tuple[float, float] | None:
+        total = 0.0
+        total_sq = 0.0
+        count = 0
+        param_map = dict(model.named_parameters())
+        for name, ema_tensor in self._ema_state.items():
+            if not self._should_track_ema_name(name):
+                continue
+            param = param_map.get(name)
+            if param is None:
+                continue
+            param_cpu = param.detach().cpu()
+            delta = (ema_tensor - param_cpu).float().abs()
+            total += delta.sum().item()
+            total_sq += (delta * delta).sum().item()
+            count += delta.numel()
+        if count == 0:
+            return None
+        mean = total / count
+        var = total_sq / count - mean * mean
+        if var < 0:
+            var = 0.0
+        return mean, var
+
+    def _capture_ema_state(self) -> dict[str, torch.Tensor]:
+        snapshot: dict[str, torch.Tensor] = {}
+        for name, ema_tensor in self._ema_state.items():
+            if self._should_track_ema_name(name):
+                snapshot[name] = ema_tensor.clone()
+        return snapshot
+
+    def _should_track_ema_name(self, name: str) -> bool:
+        if self.disable_peft:
+            return True
+        return "lora_" in name
