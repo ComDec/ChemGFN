@@ -1188,8 +1188,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         reference_logP: Tensor,  # (B, L_state)
         valid_score: Tensor,  # (B, L_state)
         scaling_factor: float,
-        active_before: Tensor | None,  # unused in legacy
-        validator_dict: dict[str, Any] | None,
+        **kwargs,
     ) -> tuple[Tensor, Tensor]:
         """
         reward = reference_logP + |reference_logP_last| * valid_score + scaling_factor * valid_score
@@ -1207,63 +1206,82 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         self,
         *,
         reference_logP: Tensor,  # (B, L_state)
-        valid_score: Tensor,  # (B, L_state) (prefix score, invalid -> -1)
+        valid_score: Tensor,  # (B, L_state) prefix score, invalid -> -1 (or any sentinel)
         scaling_factor: float,  # beta
-        active_before: Tensor,  # (B, T_tok) bool
-        validator_dict: dict[str, Any],
+        gen_tokens: Tensor,  # (B, T_tok) prompt后 tokens（用于 eos 判定）
+        eos: int,  # eos token id
+        active_before: Tensor,  # (B, T_tok) bool, 你定义的 compute_active_before 输出
+        validator_dict: dict[str, Any] | None = None,  # 可留作未来扩展，这里不依赖
     ) -> tuple[Tensor, Tensor]:
-        """
-        reward = reference_logP + beta * score_state + length_prior(optional)
-        """
         dtype = reference_logP.dtype
         device = reference_logP.device
 
         B, L_state = reference_logP.shape
         T_tok = L_state - 1
+
+        assert gen_tokens.shape == (
+            B,
+            T_tok,
+        ), f"gen_tokens {gen_tokens.shape} vs (B,T)={(B,T_tok)}"
         assert active_before.shape == (
             B,
             T_tok,
         ), f"active_before {active_before.shape} vs (B,T)={(B,T_tok)}"
+        assert valid_score.shape == (
+            B,
+            T_tok + 1,
+        ), f"valid_score {valid_score.shape} vs (B,L)={(B, T_tok+1)}"
 
-        # ---- y_final from global_score ----
-        gs = validator_dict["global_score"].to(dtype)  # (B,)
-        lo, hi = self.smiles_score_clip
-        if hi <= lo:
-            raise ValueError(f"smiles_score_clip invalid: {self.smiles_score_clip}")
-        y_final = gs.clamp(lo, hi)
-        # 可选：若你希望 PV 是严格概率，可强制映射到 [0,1]
-        # 这里默认 lo=0, hi=1，因此就是 [0,1]
-        y_final_01 = (y_final - lo) / (hi - lo) if (lo != 0.0 or hi != 1.0) else y_final
-        y_final_01 = y_final_01.clamp(0.0, 1.0)
+        # -------------------------
+        # 1) L_term: #non-eos tokens before termination (first EOS semantics)
+        # -------------------------
+        non_eos = gen_tokens.ne(int(eos))  # (B, T_tok)
+        len_mask = active_before & non_eos  # (B, T_tok)
+        L_term = len_mask.sum(dim=1).to(torch.long)  # (B,) in [0, T_tok]
 
-        # ---- active_state (B,L_state) ----
+        # y: score at termination-length state (NO clip)
+        y = valid_score.gather(1, L_term.view(B, 1)).squeeze(1).to(dtype)  # (B,)
+
+        # -------------------------
+        # 2) active_state: reachable state mask (B, L_state)
+        #   state 0 always reachable
+        #   state (t+1) reachable iff active_before[t] is True
+        # -------------------------
         active_state = torch.cat(
             [torch.ones((B, 1), device=device, dtype=dtype), active_before.to(dtype)],
             dim=1,
-        )  # state 0 always reachable
+        )  # (B, L_state)
 
-        # ---- tau_state: first EOS terminal state index ----
+        # -------------------------
+        # 3) tau_state: terminal state index (includes EOS action)
+        #    sum(active_before) == first_eos_pos+1 ; if no eos => T_tok
+        # -------------------------
         tau_state = active_before.to(torch.long).sum(dim=1).clamp(0, L_state - 1)  # (B,)
 
-        # ---- score_state from valid_score, then absorb after tau ----
-        score_state = valid_score.to(dtype).clamp_min(0.0)  # invalid=-1 -> 0
-        pos = torch.arange(L_state, device=device).view(1, L_state)  # (1,L_state)
-        fill_after_tau = pos >= tau_state.view(B, 1)
-        score_state = torch.where(fill_after_tau, y_final_01.view(B, 1), score_state)
-        score_state = score_state * active_state  # only reachable states
+        # -------------------------
+        # 4) score_state: per-state score, absorbing after tau_state
+        # -------------------------
+        score_state = valid_score.to(dtype)  # (B, L_state)
 
-        # ---- optional length prior ----
-        if self.smiles_len_weight != 0.0:
+        pos = torch.arange(L_state, device=device).view(1, L_state)  # (1, L_state)
+        fill_after_tau = pos >= tau_state.view(B, 1)  # (B, L_state)
+        score_state = torch.where(fill_after_tau, y.view(B, 1), score_state)  # absorb after tau
+
+        score_state = score_state * active_state
+
+        # -------------------------
+        # 5) optional length prior
+        # -------------------------
+        if getattr(self, "smiles_len_weight", 0.0) != 0.0:
             len_state = pos.to(dtype) / float(max(1, T_tok))  # 0..1
-            length_term = -float(self.smiles_len_weight) * len_state
+            length_term = (-float(self.smiles_len_weight)) * len_state
+            length_term = length_term * active_state
         else:
             length_term = 0.0
 
         beta = float(scaling_factor)
         reward_mixed = reference_logP + beta * score_state + length_term
 
-        # PV update y
-        y = y_final_01
         return reward_mixed, y
 
     # ----------------------------- Main score -----------------------------
@@ -1343,6 +1361,8 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
                 scaling_factor=float(scaling_factor),
                 active_before=active_before,
                 validator_dict=validator_dict,
+                gen_tokens=gen_tokens,
+                eos=eos,
             )
 
             # ---- PV memory / shaping ----
