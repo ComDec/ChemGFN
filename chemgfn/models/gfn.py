@@ -115,6 +115,7 @@ class ChemGFNModule(LightningModule):
         self.get_dataset_buffer_at_step = self.factor_schedulers["dataset_buffer"]
         self.get_pf_temp_low_at_step = getattr(self.factor_schedulers, "pf_temp_low", None)
         self.get_pf_temp_high_at_step = getattr(self.factor_schedulers, "pf_temp_high", None)
+        self.get_prefix_len_at_step = getattr(self.factor_schedulers, "prefix_len", None)
 
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
@@ -377,9 +378,6 @@ class ChemGFNModule(LightningModule):
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
 
-        log_r_reference = result_dict["log_r_reference"]
-        log_r_target = result_dict["log_r_target"]
-
         log_pf_ref = result_dict["log_pf_ref"]
         log_pterm_ref = result_dict["log_pterm_ref"]
 
@@ -460,26 +458,19 @@ class ChemGFNModule(LightningModule):
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
 
-        weight_overrides = None
-        if getattr(self, "loss_weight_schedulers", None):
-            # Evaluate all loss-weight schedulers at the current step so losses can
-            # resolve their weights without reaching back into the module.
-            weight_overrides = {
-                name: sched(self.global_step)
-                for name, sched in self.loss_weight_schedulers.items()
-            }
-
         loss_output = self.loss_fn(
             log_pf=log_pf,
-            log_r=log_r,  # compatibility with old loss functions
-            log_r_reference=log_r_reference,
-            log_r_target=log_r_target,
+            log_r=log_r,
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            global_step=self.global_step,
-            weight_overrides=weight_overrides,
+            ref_log_pf=log_pf_ref,
+            ref_log_pterm=log_pterm_ref,
+            ref_scale=1.0,
+            max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
+            if self.get_prefix_len_at_step is not None
+            else None,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -639,29 +630,24 @@ class ChemGFNModule(LightningModule):
         log_pterm_ref = result_dict["log_pterm_ref"]
         validator_dict = result_dict.get("validator_dict")
 
-        log_r_reference = result_dict["log_r_reference"]
-        log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
-        weight_overrides = None
-        if getattr(self, "loss_weight_schedulers", None):
-            weight_overrides = {
-                name: sched(self.global_step)
-                for name, sched in self.loss_weight_schedulers.items()
-            }
+
         loss_output = self.loss_fn(
             log_pf=log_pf,
-            log_r=log_r,  # compatibility with old loss functions
-            log_r_reference=log_r_reference,
-            log_r_target=log_r_target,
+            log_r=log_r,
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            global_step=self.global_step,
-            weight_overrides=weight_overrides,
+            ref_log_pf=log_pf_ref,
+            ref_log_pterm=log_pterm_ref,
+            ref_scale=1.0,
+            max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
+            if self.get_prefix_len_at_step is not None
+            else None,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -774,31 +760,26 @@ class ChemGFNModule(LightningModule):
         log_pterm_ref = result_dict["log_pterm_ref"]
         validator_dict = result_dict.get("validator_dict")
 
-        log_r_reference = result_dict["log_r_reference"]
-        log_r_target = result_dict["log_r_target"]
         log_r_unpenalized = result_dict["log_r_unpenalized"]
 
         self.test_samples_ids.extend(generated_text[:, prompt_len:].tolist())
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
-        weight_overrides = None
-        if getattr(self, "loss_weight_schedulers", None):
-            weight_overrides = {
-                name: sched(self.global_step)
-                for name, sched in self.loss_weight_schedulers.items()
-            }
+
         loss_output = self.loss_fn(
             log_pf=log_pf,
-            log_r=log_r,  # compatibility with old loss functions
-            log_r_reference=log_r_reference,
-            log_r_target=log_r_target,
+            log_r=log_r,
             log_pterm=log_pterm,
             generated_text=generated_text,
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
-            global_step=self.global_step,
-            weight_overrides=weight_overrides,
+            ref_log_pf=log_pf_ref,
+            ref_log_pterm=log_pterm_ref,
+            ref_scale=1.0,
+            max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
+            if self.get_prefix_len_at_step is not None
+            else None,
         )
 
         if isinstance(loss_output, dict):

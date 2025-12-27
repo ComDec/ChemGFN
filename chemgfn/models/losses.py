@@ -6,7 +6,7 @@ including SubTrajectory Balance (SubTB) losses with various enhancements.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -198,11 +198,263 @@ class ModifiedSubTBLoss(GFNLoss):
         return {"loss": batch_loss}
 
 
+class RootAbsorbExtraSubTBLoss(GFNLoss):
+    """
+    L = (1-eta)*L_TB_terminal + eta*L_aux_rooted_absorb_extra(K)
+
+    Key semantics you requested:
+    - K is an absorption horizon (scheduler-controlled).
+      For prefixes k < K with (approximately) no extra reward signal, we absorb a future target
+      computed from extra rewards in [k..K] (or [k..tau] if K is None).
+    - If a trajectory terminates before K (tau < K), we do NOT absorb (keep original).
+    - Length decay is mandatory: alpha_k = gamma^(horizon - k), gamma < 1.
+    - Target supports: future-max and discounted softmax; default is a mix.
+    - Aux detaches log_pterm to avoid short-length bias.
+    """
+
+    def __init__(
+        self,
+        subtb_lambda: float = 1.0,  # w_k = lambda^(k-1)
+        aux_weight: float = 0.25,  # eta in [0,1] if you use convex combo
+        gamma: float = 0.99,  # MUST be < 1 for length decay
+        detach_pterm_in_aux: bool = True,
+        eps: float = 1e-8,
+        # absorption behavior
+        extra_absorb_eps: float = 1e-6,  # treat |extra_k| <= eps as "no reward"
+        target_mode: Literal["future_max", "future_soft", "mix"] = "mix",
+        mix_weight: float = 0.5,  # mix: w*max + (1-w)*soft
+        soft_beta: float = 5.0,  # softmax temperature in logsumexp
+        soft_rho: float = 0.0,  # per-step distance penalty (>=0)
+    ):
+        super().__init__()
+        self.subtb_lambda = float(subtb_lambda)
+        self.aux_weight = float(aux_weight)
+        self.gamma = float(gamma)
+        self.detach_pterm_in_aux = bool(detach_pterm_in_aux)
+        self.eps = float(eps)
+
+        self.extra_absorb_eps = float(extra_absorb_eps)
+        self.target_mode = target_mode
+        self.mix_weight = float(mix_weight)
+        self.soft_beta = float(soft_beta)
+        self.soft_rho = float(soft_rho)
+
+        # enforce "length decay is mandatory"
+        if not (self.gamma < 1.0):
+            raise ValueError(
+                f"gamma must be < 1.0 for mandatory length decay, got gamma={self.gamma}"
+            )
+
+    def _delta_cumsum(self, log_pf, log_r, log_pterm):
+        delta = (
+            log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
+        )  # [B, L-1]
+        return torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(dim=1)  # [B, L]
+
+    @staticmethod
+    def _reconstruct_ref_logP(ref_log_pf: torch.Tensor, ref_log_pterm: torch.Tensor):
+        B, T = ref_log_pf.shape
+        B2, L = ref_log_pterm.shape
+        assert (
+            B == B2 and L == T + 1
+        ), f"shape mismatch: pf {ref_log_pf.shape}, pterm {ref_log_pterm.shape}"
+        prefix = ref_log_pf.cumsum(dim=-1)  # [B, T]
+        ref_logP = ref_log_pterm.clone()
+        ref_logP[:, 1:] = ref_logP[:, 1:] + prefix
+        return ref_logP
+
+    @staticmethod
+    def _suffix_future_max(u: torch.Tensor, valid: torch.Tensor):
+        """
+        u: [B, L]
+        valid: [B, L] bool, True means position is allowed in the suffix set.
+        returns v: [B, L] where v[b,k] = max_{t>=k, valid[b,t]} u[b,t]
+        """
+        dtype = u.dtype
+        device = u.device
+        neg_inf = torch.finfo(dtype).min
+        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
+        rev = torch.flip(u_mask, dims=[1])
+        rev_max = torch.cummax(rev, dim=1).values
+        return torch.flip(rev_max, dims=[1])
+
+    @staticmethod
+    def _suffix_future_soft(u: torch.Tensor, valid: torch.Tensor, beta: float, rho: float):
+        """
+        v_k = (1/beta) logsumexp_{t>=k, valid[t]} exp(beta*(u_t - rho*(t-k))).
+        Implemented by reverse scan:
+          Z_k = logaddexp(beta*u_k, Z_{k+1} - beta*rho)
+        """
+        B, L = u.shape
+        dtype = u.dtype
+        device = u.device
+        neg_inf = torch.finfo(dtype).min
+
+        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
+        out = torch.empty_like(u_mask)
+
+        b = float(beta)
+        r = float(rho)
+
+        Z = b * u_mask[:, -1]  # [B]
+        out[:, -1] = Z / b
+
+        step_pen = b * r
+        for t in range(L - 2, -1, -1):
+            Z = torch.logaddexp(b * u_mask[:, t], Z - step_pen)
+            out[:, t] = Z / b
+        return out
+
+    def forward(
+        self,
+        log_pf: torch.Tensor,  # [B, L]
+        log_r: torch.Tensor,  # [B, L]
+        log_pterm: torch.Tensor,  # [B, L]
+        generated_text: torch.Tensor,  # [B, prompt_len + L]
+        termination_token_id: int,
+        prompt_len: int,
+        ref_log_pf: Optional[torch.Tensor] = None,  # [B, L-1]
+        ref_log_pterm: Optional[torch.Tensor] = None,  # [B, L]
+        ref_scale: float = 1.0,
+        max_prefix_len: Optional[
+            int
+        ] = None,  # <-- K: absorb horizon (scheduler). None => horizon=tau
+        **kwargs,
+    ):
+        B, L = log_pf.shape
+        assert log_r.shape == (B, L) and log_pterm.shape == (B, L)
+        assert generated_text.shape[1] - prompt_len == L
+        assert L > 1
+
+        # ---- tau from EOS mask ----
+        eos_or_after = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(
+            dim=-1
+        ) >= 1  # [B, L-1]
+        valid_end = ~eos_or_after  # [B, L-1] valid prefix ends (k=1..)
+        tau = valid_end.sum(dim=1).clamp(0, L - 1)  # [B] first EOS state index
+
+        # ---- main TB at terminal (keeps pterm grads) ----
+        C_main = self._delta_cumsum(log_pf, log_r, log_pterm)  # [B, L]
+        C_tau = C_main.gather(1, tau.view(B, 1)).squeeze(1)
+        loss_tb = (C_tau**2).mean()
+
+        # ---- auxiliary rooted absorbed prefixes (extra-only, horizon K) ----
+        loss_aux = torch.zeros((), device=log_pf.device, dtype=log_pf.dtype)
+        if self.aux_weight > 0.0:
+            # horizon K: if None => per-sample horizon = tau (absorb everywhere until terminal)
+            if max_prefix_len is None:
+                K = None
+            else:
+                K = int(max_prefix_len)
+                K = max(1, min(K, L - 1))
+
+            lp_aux = log_pterm.detach() if self.detach_pterm_in_aux else log_pterm
+            C_aux = self._delta_cumsum(log_pf, log_r, lp_aux)  # [B, L]
+            Ck = C_aux[:, 1:]  # [B, L-1], k=1..L-1
+
+            # prefix indices k=1..L-1
+            k_idx = torch.arange(1, L, device=log_pf.device).view(1, L - 1)  # [1, L-1]
+
+            # aux is only computed on reachable prefixes and within horizon h:
+            # - if K is None: h = tau
+            # - else: h = min(K, tau)  (so we only use prefixes <= K; if tau<K, we only have <=tau)
+            if K is None:
+                h = tau
+            else:
+                h = torch.minimum(tau, tau.new_full(tau.shape, K))
+
+            within_tau = k_idx <= tau.view(B, 1)  # [B, L-1]
+            within_h = k_idx <= h.view(B, 1)  # [B, L-1]
+            m = (within_tau & within_h & valid_end).to(log_pf.dtype)  # [B, L-1]
+
+            # weights w_k = lambda^(k-1)
+            w = (
+                self.subtb_lambda
+                ** torch.arange(0, L - 1, device=log_pf.device, dtype=log_pf.dtype)
+            ).view(1, -1)
+
+            # ---------- compute extra u ----------
+            if (ref_log_pf is not None) and (ref_log_pterm is not None):
+                ref_logP = self._reconstruct_ref_logP(ref_log_pf, ref_log_pterm)  # [B, L]
+                u = log_r - float(ref_scale) * ref_logP  # [B, L]
+            else:
+                # fallback: treat log_r itself as "extra" (less principled, but keeps training running)
+                u = log_r
+
+            u_k = u[:, 1:]  # [B, L-1]
+
+            # "no reward" prefixes: only these get absorption correction
+            no_reward = u_k.abs() <= self.extra_absorb_eps  # [B, L-1]
+
+            # If K is given, sequences with tau < K should remain unchanged (no absorption).
+            if K is None:
+                can_absorb_seq = torch.ones((B, 1), device=log_pf.device, dtype=torch.bool)
+            else:
+                can_absorb_seq = tau.view(B, 1) >= K
+
+            # We only absorb for k < K (strictly before horizon) when K is given.
+            # If K is None (absorb to terminal), we absorb for k <= tau; strictness isn't important.
+            if K is None:
+                before_horizon = within_h
+            else:
+                before_horizon = k_idx < K  # [1, L-1], broadcast
+
+            # ---------- build per-position target u_target[k] from future in [k..h] ----------
+            # valid states for future aggregation: state index t is valid iff t <= h (per sample) and t <= tau.
+            pos = torch.arange(L, device=log_pf.device).view(1, L)  # [1, L]
+            valid_future = (pos <= h.view(B, 1)) & (pos <= tau.view(B, 1))  # [B, L]
+
+            # Compute two targets over suffix (k..):
+            u_max = self._suffix_future_max(u.detach(), valid_future)  # [B, L]
+            u_soft = self._suffix_future_soft(
+                u.detach(), valid_future, beta=self.soft_beta, rho=self.soft_rho
+            )  # [B, L]
+
+            if self.target_mode == "future_max":
+                u_target = u_max
+            elif self.target_mode == "future_soft":
+                u_target = u_soft
+            elif self.target_mode == "mix":
+                mw = float(self.mix_weight)
+                u_target = mw * u_max + (1.0 - mw) * u_soft
+            else:
+                raise ValueError(f"Unknown target_mode: {self.target_mode}")
+
+            u_tk = u_target[:, 1:]  # [B, L-1] aligned with k=1..L-1
+
+            # ---------- mandatory length decay alpha_k = gamma^(horizon - k) ----------
+            # horizon for decay: if K is given, use K; else use h (which is tau)
+            if K is None:
+                horizon_for_decay = h
+            else:
+                horizon_for_decay = h  # equals K for sequences with tau>=K; equals tau otherwise (but those won't absorb)
+
+            exp = (horizon_for_decay.view(B, 1) - k_idx).clamp_min(0).to(log_pf.dtype)  # [B, L-1]
+            alpha = (self.gamma**exp) * within_h.to(log_pf.dtype)  # [B, L-1]
+
+            # ---------- apply absorption correction only where you asked ----------
+            # condition:
+            #   (1) prefix is in aux mask (reachable & <=h)
+            #   (2) prefix has no reward signal
+            #   (3) prefix is before horizon (k<K when K given)
+            #   (4) sequence can absorb (tau>=K when K given)
+            apply_absorb = m.bool() & no_reward & before_horizon & can_absorb_seq  # [B, L-1]
+
+            alpha_eff = alpha * apply_absorb.to(log_pf.dtype)
+
+            # correction: replace boundary extra u_k by future target u_tk (stopgrad target)
+            corr = alpha_eff * (u_k - u_tk)  # [B, L-1]
+            Ck_abs = Ck + corr
+
+            num = ((Ck_abs**2) * m * w).sum()
+            den = (m * w).sum().clamp_min(self.eps)
+            loss_aux = num / den
+
+        loss = (1 - self.aux_weight) * loss_tb + self.aux_weight * loss_aux
+        return {"loss": loss, "loss_tb": loss_tb.detach(), "loss_aux": loss_aux.detach()}
+
+
 def _first_eos_index(gen_tokens: torch.Tensor, eos_id: int) -> torch.Tensor:
-    """
-    gen_tokens: (B, S) prompt 之后的 token 序列（长度 = S = log_pterm.size(1)）
-    返回: (B,) 每条序列第一次出现 eos 的位置；若没有 eos，则返回 S-1
-    """
     B, S = gen_tokens.shape
     is_eos = gen_tokens == eos_id
     has_eos = is_eos.any(dim=1)
