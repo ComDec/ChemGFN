@@ -117,6 +117,18 @@ training_mixed_config:
   opt_task: false                        # Whether this is an optimization task (sidechain)
 
 # ============================================================================
+# EMA Configuration
+# ============================================================================
+ema_config:
+  enabled: false                         # Enable EMA tracking + reference update
+  decay: 0.999                           # EMA decay (higher = smoother)
+  ema_start_epoch: 0                     # Start EMA after this many completed epochs
+  reference_start_epoch: 0               # Start updating reference model after this many epochs
+  reference_update_interval: 1           # Update reference model every N epochs
+  log_param_delta: false                 # Log EMA vs current param delta (trainable params only)
+  log_reference_delta: false             # Log reference vs previous ref (delta at update time)
+
+# ============================================================================
 # Compilation and PEFT Settings
 # ============================================================================
 compile: false                           # Whether to use torch.compile

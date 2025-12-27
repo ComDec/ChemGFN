@@ -769,9 +769,8 @@ class PrefixValueMemory:
 
 def compute_active_before(gen_tokens: torch.Tensor, eos: int) -> torch.Tensor:
     """
-    gen_tokens: (B, T_tok) prompt 后 tokens
+    gen_tokens: (B, T_tok)
     active_before[:, t] = Π_{j < t} 1[token_j != eos]
-    注意：采样 eos 的那一步 t 仍然 active_before=True（因为 eos 是“这一步采出来的”）
     """
     B, T = gen_tokens.shape
     active_before = torch.ones((B, T), device=gen_tokens.device, dtype=torch.bool)
@@ -809,11 +808,6 @@ def compute_prefix_diagnostics(
     eps: float = 1e-8,
     first_steps: int = 6,
 ):
-    """
-    产出：
-      - 标量：phi_var_mean, dphi_abs_mean, d2phi_abs_mean, pv_entropy_mean, pv_sat_ratio, pv_logit_abs_mean
-      - 向量：phi_var_per_step, dphi_abs_per_step, d2phi_abs_per_step, pv_entropy_per_step
-    """
     with torch.no_grad():
         B, T_tok = pv.shape
         L_state = phi_state.shape[1]

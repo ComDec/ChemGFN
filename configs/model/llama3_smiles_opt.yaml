@@ -33,6 +33,13 @@ loss_fn:
   subtb_lambda: 1.0
   eps: 1e-8
 
+ema_config:
+  enabled: false
+  decay: 0.999
+  ema_start_epoch: 0
+  reference_start_epoch: 0
+  reference_update_interval: 1
+
 reward:
   _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
   invalid_start_ratio: 0.2

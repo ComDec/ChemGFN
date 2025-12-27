@@ -28,7 +28,7 @@ trainer:
   num_sanity_val_steps: 0
   limit_train_batches: 30
   limit_val_batches: 5
-  log_every_n_steps: 10
+  log_every_n_steps: 1
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)

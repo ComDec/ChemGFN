@@ -35,6 +35,13 @@ scheduler:
   total_iters: 100000
   power: 1.0
 
+ema_config:
+  enabled: false
+  decay: 0.999
+  ema_start_epoch: 0
+  reference_start_epoch: 0
+  reference_update_interval: 1
+
 reward:
   _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
   invalid_start_ratio: 0.2

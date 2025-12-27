@@ -19,14 +19,14 @@ seed: 42
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 60000
+  max_steps: 1000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 100
+  limit_train_batches: 10
   limit_val_batches: 10
 
 
@@ -39,16 +39,62 @@ model:
     _partial_: true
     lr: 0.0001
 
+  ema_config:
+    enabled: false
+    decay: 0.999
+    ema_start_epoch: 0
+    reference_start_epoch: 0
+    reference_update_interval: 1
+
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
     disable_peft: ${model.disable_peft}
+
+     # config params
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+
+    # phi params
     phi_weight: 0
+    phi_warmup: 100
+    phi_ramp_steps: 200
+    phi_decay_start: null
+    phi_decay_gamma: 0.995
+    dphi_clip: 2.0
+
+    # reward strategy
+    reward_strategy: "smiles_absorbing"
+    smiles_len_weight: 0.0
+    smiles_score_clip: [0.0, 1.0]
+    pv_update_strategy: smiles_global_score
+
+    # entropy gate, UNDER DEVELOPMENT
+    use_entropy_gate: false
+    use_token_entropy_gate: false
+    ent_lo: 0.10
+    ent_hi: 0.55
+
+    # phi build params
+    phi_eta: 1.0
+    phi_clamp: 2.0
+
+    # split logic
+    pv_split: 2
+    pv_split_inclusive: true
+
+    # pv memory params
+    pv_memory_kwargs:
+      alpha: 1.0
+      gamma: 0.999
+      max_keys: 500000
+      prune_every: 200
+      prune_threshold: 1.0
+      tau_conf: 20.0
+
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.RDKitValidator
-      scorer: "sa"
+      scorer: "qed"
       backend: "pa"
 
   loss_fn:
@@ -145,4 +191,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: False
+    offline: True
