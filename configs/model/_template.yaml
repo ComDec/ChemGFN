@@ -125,6 +125,7 @@ ema_config:
   ema_start_epoch: 0                     # Start EMA after this many completed epochs
   reference_start_epoch: 0               # Start updating reference model after this many epochs
   reference_update_interval: 1           # Update reference model every N epochs
+  reference_delay_epochs: 0              # Use EMA weights from N epochs ago when updating reference
   log_param_delta: false                 # Log EMA vs current param delta (trainable params only)
   log_reference_delta: false             # Log reference vs previous ref (delta at update time)
 

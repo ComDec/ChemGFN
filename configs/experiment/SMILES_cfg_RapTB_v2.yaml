@@ -9,24 +9,24 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt"]
+tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "debug_smiles_opt"
+exp_name: "smiles_RapTB_v2"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 1000
+  max_steps: 10000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 10
+  limit_train_batches: 100
   limit_val_batches: 10
 
 
@@ -42,9 +42,9 @@ model:
   ema_config:
     enabled: false
     decay: 0.999
-    ema_start_epoch: 0
-    reference_start_epoch: 0
-    reference_update_interval: 1
+    ema_start_epoch: 10
+    reference_start_epoch: 20
+    reference_update_interval: 10
 
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
@@ -56,11 +56,6 @@ model:
 
     # phi params
     phi_weight: 0
-    phi_warmup: 100
-    phi_ramp_steps: 200
-    phi_decay_start: null
-    phi_decay_gamma: 0.995
-    dphi_clip: 2.0
 
     # reward strategy
     reward_strategy: "smiles_absorbing"
@@ -98,7 +93,7 @@ model:
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLoss
+    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
     aux_weight: 0.25
     gamma: 0.99
@@ -106,6 +101,7 @@ model:
     eps: 1e-8
     extra_absorb_eps: 1e-6
     target_mode: "future_max"
+    k_min: 2
     # mix mode params
     mix_weight: 0.5
     soft_beta: 5.0
@@ -138,7 +134,7 @@ model:
     skip_baseline_sampling: true
     opt_task: false
     # without applying grammar disagree penalty to forward side
-    grammar_disagree_penalty: 0
+    grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
 
   factor_schedulers:
     reward_temp:
@@ -180,9 +176,15 @@ model:
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 10
+      start: 50
       end: 50
       horizon: 10000
+    k_min:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 5
+      end: 2
+      horizon: 5000
 
   disable_peft: false
 
@@ -191,7 +193,7 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  data_path: ${paths.data_dir}SMILES/sidechain_prompts_sa.json
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
   buffer_sample_path: null
 
 # ============================================================================
@@ -200,4 +202,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: True
+    offline: False
