@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import sys
+from collections import deque
 from functools import partial
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
@@ -30,7 +32,7 @@ from chemgfn.models.losses import GFNLoss
 from chemgfn.utils.gfn_utils import (
     ReplayBuffer,
     base_to_lora,
-    calculate_diversity,
+    calculate_diversity_by_length,
     generate_and_return_termination_logprob,
     get_termination_vals,
     lora_to_base,
@@ -116,6 +118,7 @@ class ChemGFNModule(LightningModule):
         self.get_pf_temp_low_at_step = getattr(self.factor_schedulers, "pf_temp_low", None)
         self.get_pf_temp_high_at_step = getattr(self.factor_schedulers, "pf_temp_high", None)
         self.get_prefix_len_at_step = getattr(self.factor_schedulers, "prefix_len", None)
+        self.get_k_min_at_step = getattr(self.factor_schedulers, "k_min", None)
 
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
 
@@ -157,6 +160,42 @@ class ChemGFNModule(LightningModule):
         self.train_samples_valid_flags: list = []
         self.val_samples_valid_flags: list = []
         self.test_samples_valid_flags: list = []
+        self.train_len_counts: dict[int, int] = {}
+        self.train_score_sum_by_len: dict[int, float] = {}
+        self.train_score_count_by_len: dict[int, int] = {}
+        self.train_len_counts_valid: dict[int, int] = {}
+        self.train_score_sum_by_len_valid: dict[int, float] = {}
+        self.train_score_count_by_len_valid: dict[int, int] = {}
+        self.val_len_counts: dict[int, int] = {}
+        self.val_score_sum_by_len: dict[int, float] = {}
+        self.val_score_count_by_len: dict[int, int] = {}
+        self.val_len_counts_valid: dict[int, int] = {}
+        self.val_score_sum_by_len_valid: dict[int, float] = {}
+        self.val_score_count_by_len_valid: dict[int, int] = {}
+        self.test_len_counts: dict[int, int] = {}
+        self.test_score_sum_by_len: dict[int, float] = {}
+        self.test_score_count_by_len: dict[int, int] = {}
+        self.test_len_counts_valid: dict[int, int] = {}
+        self.test_score_sum_by_len_valid: dict[int, float] = {}
+        self.test_score_count_by_len_valid: dict[int, int] = {}
+        self.train_log_pterm_sum: dict[int, float] = {}
+        self.train_log_pterm_count: dict[int, int] = {}
+        self.val_log_pterm_sum: dict[int, float] = {}
+        self.val_log_pterm_count: dict[int, int] = {}
+        self.test_log_pterm_sum: dict[int, float] = {}
+        self.test_log_pterm_count: dict[int, int] = {}
+        self.val_batch_diversity_sum = 0.0
+        self.val_batch_diversity_count = 0
+        self.val_batch_fp_div_internal_sum = 0.0
+        self.val_batch_fp_div_internal_count = 0
+        self.val_batch_fp_div_topk_sum = 0.0
+        self.val_batch_fp_div_topk_count = 0
+        self.test_batch_diversity_sum = 0.0
+        self.test_batch_diversity_count = 0
+        self.test_batch_fp_div_internal_sum = 0.0
+        self.test_batch_fp_div_internal_count = 0
+        self.test_batch_fp_div_topk_sum = 0.0
+        self.test_batch_fp_div_topk_count = 0
 
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
 
@@ -168,11 +207,17 @@ class ChemGFNModule(LightningModule):
             self._ema_cfg("reference_start_epoch", self._ema_start_epoch)
         )
         self._ema_reference_interval = int(self._ema_cfg("reference_update_interval", 1))
+        self._ema_reference_delay_epochs = int(self._ema_cfg("reference_delay_epochs", 0))
         self._ema_log_param_delta = bool(self._ema_cfg("log_param_delta", False))
         self._ema_log_reference_delta = bool(self._ema_cfg("log_reference_delta", False))
         self._ema_state: dict[str, torch.Tensor] = {}
         self._ema_reference_update_count = 0
         self._ema_reference_prev_state: dict[str, torch.Tensor] = {}
+        self._ema_state_history = (
+            deque(maxlen=self._ema_reference_delay_epochs + 1)
+            if self._ema_reference_delay_epochs > 0
+            else None
+        )
 
         # Initialize loss function from config
         self.loss_fn: GFNLoss = loss_fn
@@ -203,10 +248,6 @@ class ChemGFNModule(LightningModule):
         debug_steps = int(os.environ.get("CHEMGFN_DEBUG_SHAPES_STEPS", "1"))
         self.debug_shapes = debug_shapes
         self._debug_shapes_remaining = debug_steps if debug_shapes else 0
-
-    def set_probes(self, train_probes, val_probes):
-        self.train_probes = train_probes
-        self.val_probes = val_probes
 
     def forward(
         self,
@@ -471,6 +512,9 @@ class ChemGFNModule(LightningModule):
             max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
             if self.get_prefix_len_at_step is not None
             else None,
+            k_min=int(self.get_k_min_at_step(self.global_step))
+            if self.get_k_min_at_step is not None
+            else None,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -492,23 +536,103 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
         )
+        tokens = generated_text[:, prompt_len:]
+        self._accumulate_log_pterm_by_length(
+            tokens,
+            log_pterm,
+            self.train_log_pterm_sum,
+            self.train_log_pterm_count,
+        )
 
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
         else:
-            tokens = generated_text[:, prompt_len:]
+            # compatibility for SMILES and expr24 validators
             try:
                 validator_metric_dict = self.reward.sentence_validator.accuracy(
                     tokens,
                     self.tokenizer,
-                    item.get("molecule", None),
+                    item.get("scaffold", None),
+                    return_hist=True,
                 )
             except TypeError:
-                validator_metric_dict = self.reward.sentence_validator.accuracy(
-                    tokens,
-                    self.tokenizer,
+                try:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                        item.get("scaffold", None),
+                    )
+                except TypeError:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                    )
+        self._log_validator_core_metrics(
+            "train",
+            validator_metric_dict,
+            sync_dist=True,
+            on_step=True,
+        )
+        if validator_metric_dict:
+            len_hist = validator_metric_dict.pop("len_tok_hist", None)
+            score_hist = validator_metric_dict.pop("score_hist", None)
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            if isinstance(len_hist, list):
+                scores_src = score_hist if isinstance(score_hist, list) else scores
+                self._accumulate_length_stats(
+                    len_hist,
+                    scores_src,
+                    self.train_len_counts,
+                    self.train_score_sum_by_len,
+                    self.train_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        len_hist,
+                        scores_src,
+                        self.train_len_counts_valid,
+                        self.train_score_sum_by_len_valid,
+                        self.train_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+            else:
+                lengths = self._lengths_from_tokens(tokens)
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.train_len_counts,
+                    self.train_score_sum_by_len,
+                    self.train_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        lengths,
+                        scores,
+                        self.train_len_counts_valid,
+                        self.train_score_sum_by_len_valid,
+                        self.train_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+        else:
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            lengths = self._lengths_from_tokens(tokens)
+            self._accumulate_length_stats(
+                lengths,
+                scores,
+                self.train_len_counts,
+                self.train_score_sum_by_len,
+                self.train_score_count_by_len,
+            )
+            if valid_flags is not None:
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.train_len_counts_valid,
+                    self.train_score_sum_by_len_valid,
+                    self.train_score_count_by_len_valid,
+                    valid_flags=valid_flags,
                 )
         self.train_sentence_length.append(sentence_len.detach().cpu())
 
@@ -596,15 +720,6 @@ class ChemGFNModule(LightningModule):
 
         self._log_metrics(
             {
-                f"train/validator_{key}": (value, {"prog_bar": True})
-                for key, value in validator_metric_dict.items()
-            },
-            on_step=True,
-            sync_dist=True,
-        )
-
-        self._log_metrics(
-            {
                 "train/logR": last_log_r.mean(),
                 "train/logP(s) (avg)": log_ps.mean(),
                 "train/logP(s) (max)": log_ps.max(),
@@ -648,6 +763,9 @@ class ChemGFNModule(LightningModule):
             max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
             if self.get_prefix_len_at_step is not None
             else None,
+            k_min=int(self.get_k_min_at_step(self.global_step))
+            if self.get_k_min_at_step is not None
+            else None,
         )
 
         # Handle dict or scalar output for backward compatibility
@@ -669,6 +787,13 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
         )
+        tokens = generated_text[:, prompt_len:]
+        self._accumulate_log_pterm_by_length(
+            tokens,
+            log_pterm,
+            self.val_log_pterm_sum,
+            self.val_log_pterm_count,
+        )
         if log_pfs is not None:
             self.val_log_rs.append(last_log_r.detach().cpu())
             self.val_log_pfss.append(log_pfs.detach().cpu())
@@ -676,29 +801,114 @@ class ChemGFNModule(LightningModule):
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
 
-        self.val_samples_ids.extend(generated_text[:, prompt_len:].tolist())
+        batch_sequences = self._strip_eos_from_batch(generated_text[:, prompt_len:])
+        self.val_samples_ids.extend(batch_sequences)
         self.val_samples_valid_flags.extend(valid_flags)
+        batch_diversity = self._calculate_diversity_ragged(batch_sequences)
+        self.val_batch_diversity_sum += float(batch_diversity)
+        self.val_batch_diversity_count += 1
 
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
         else:
-            tokens = generated_text[:, prompt_len:]
             try:
                 validator_metric_dict = self.reward.sentence_validator.accuracy(
                     tokens,
                     self.tokenizer,
-                    batch.get("molecule", None),
+                    batch.get("scaffold", None),
+                    return_hist=True,
                 )
             except TypeError:
-                validator_metric_dict = self.reward.sentence_validator.accuracy(
-                    tokens,
-                    self.tokenizer,
-                )
-        self._log_metrics(
-            {f"val/validator_{key}": value for key, value in validator_metric_dict.items()},
+                try:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                        batch.get("scaffold", None),
+                    )
+                except TypeError:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                    )
+        fp_div_internal = None
+        fp_div_topk = None
+        if validator_metric_dict:
+            fp_div_internal = validator_metric_dict.get("fp_div_internal_valid")
+            fp_div_topk = validator_metric_dict.get("fp_div_topk_valid")
+        if validator_metric_dict:
+            validator_metric_dict.pop("fp_div_internal_valid", None)
+            validator_metric_dict.pop("fp_div_topk_valid", None)
+        if fp_div_internal is not None:
+            self.val_batch_fp_div_internal_sum += float(fp_div_internal)
+            self.val_batch_fp_div_internal_count += 1
+        if fp_div_topk is not None:
+            self.val_batch_fp_div_topk_sum += float(fp_div_topk)
+            self.val_batch_fp_div_topk_count += 1
+        self._log_validator_core_metrics(
+            "val",
+            validator_metric_dict,
             sync_dist=True,
             on_epoch=True,
         )
+        if validator_metric_dict:
+            len_hist = validator_metric_dict.pop("len_tok_hist", None)
+            score_hist = validator_metric_dict.pop("score_hist", None)
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            if isinstance(len_hist, list):
+                scores_src = score_hist if isinstance(score_hist, list) else scores
+                self._accumulate_length_stats(
+                    len_hist,
+                    scores_src,
+                    self.val_len_counts,
+                    self.val_score_sum_by_len,
+                    self.val_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        len_hist,
+                        scores_src,
+                        self.val_len_counts_valid,
+                        self.val_score_sum_by_len_valid,
+                        self.val_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+            else:
+                lengths = self._lengths_from_tokens(tokens)
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.val_len_counts,
+                    self.val_score_sum_by_len,
+                    self.val_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        lengths,
+                        scores,
+                        self.val_len_counts_valid,
+                        self.val_score_sum_by_len_valid,
+                        self.val_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+        else:
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            lengths = self._lengths_from_tokens(tokens)
+            self._accumulate_length_stats(
+                lengths,
+                scores,
+                self.val_len_counts,
+                self.val_score_sum_by_len,
+                self.val_score_count_by_len,
+            )
+            if valid_flags is not None:
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.val_len_counts_valid,
+                    self.val_score_sum_by_len_valid,
+                    self.val_score_count_by_len_valid,
+                    valid_flags=valid_flags,
+                )
 
         log_ps = last_log_r * self.get_reward_temp_at_step(self.global_step)
         log_ps_unpenalized = last_log_r_unpenalized * self.get_reward_temp_at_step(
@@ -762,7 +972,11 @@ class ChemGFNModule(LightningModule):
 
         log_r_unpenalized = result_dict["log_r_unpenalized"]
 
-        self.test_samples_ids.extend(generated_text[:, prompt_len:].tolist())
+        batch_sequences = self._strip_eos_from_batch(generated_text[:, prompt_len:])
+        self.test_samples_ids.extend(batch_sequences)
+        batch_diversity = self._calculate_diversity_ragged(batch_sequences)
+        self.test_batch_diversity_sum += float(batch_diversity)
+        self.test_batch_diversity_count += 1
 
         if hasattr(self.loss_fn, "set_global_step"):
             self.loss_fn.set_global_step(self.global_step)
@@ -779,6 +993,9 @@ class ChemGFNModule(LightningModule):
             ref_scale=1.0,
             max_prefix_len=int(self.get_prefix_len_at_step(self.global_step))
             if self.get_prefix_len_at_step is not None
+            else None,
+            k_min=int(self.get_k_min_at_step(self.global_step))
+            if self.get_k_min_at_step is not None
             else None,
         )
 
@@ -799,6 +1016,13 @@ class ChemGFNModule(LightningModule):
             termination_token_id=self.end_of_sentence_token_id,
             prompt_len=prompt_len,
         )
+        tokens = generated_text[:, prompt_len:]
+        self._accumulate_log_pterm_by_length(
+            tokens,
+            log_pterm,
+            self.test_log_pterm_sum,
+            self.test_log_pterm_count,
+        )
         if log_pfs is not None:
             self.test_log_rs.append(last_log_r.detach().cpu())
             self.test_log_pfss.append(log_pfs.detach().cpu())
@@ -806,27 +1030,115 @@ class ChemGFNModule(LightningModule):
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
         self.test_samples_valid_flags.extend(valid_flags)
-
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
         else:
-            tokens = generated_text[:, prompt_len:]
             try:
                 validator_metric_dict = self.reward.sentence_validator.accuracy(
                     tokens,
                     self.tokenizer,
-                    batch.get("molecule", None),
+                    batch.get("scaffold", None),
+                    return_hist=True,
                 )
             except TypeError:
-                validator_metric_dict = self.reward.sentence_validator.accuracy(
-                    tokens,
-                    self.tokenizer,
-                )
-        self._log_metrics(
-            {f"test/validator_{key}": value for key, value in validator_metric_dict.items()},
+                try:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                        batch.get("scaffold", None),
+                    )
+                except TypeError:
+                    validator_metric_dict = self.reward.sentence_validator.accuracy(
+                        tokens,
+                        self.tokenizer,
+                    )
+        fp_div_internal = None
+        fp_div_topk = None
+        if validator_metric_dict:
+            fp_div_internal = validator_metric_dict.get("fp_div_internal_valid")
+            fp_div_topk = validator_metric_dict.get("fp_div_topk_valid")
+        if validator_metric_dict:
+            validator_metric_dict.pop("fp_div_internal_valid", None)
+            validator_metric_dict.pop("fp_div_topk_valid", None)
+        if fp_div_internal is not None:
+            self.test_batch_fp_div_internal_sum += float(fp_div_internal)
+            self.test_batch_fp_div_internal_count += 1
+        if fp_div_topk is not None:
+            self.test_batch_fp_div_topk_sum += float(fp_div_topk)
+            self.test_batch_fp_div_topk_count += 1
+
+        self._log_validator_core_metrics(
+            "test",
+            validator_metric_dict,
             sync_dist=True,
             on_epoch=True,
         )
+        self._log_validator_full_metrics(
+            "test/validator",
+            validator_metric_dict,
+            sync_dist=True,
+            on_epoch=True,
+        )
+        if validator_metric_dict:
+            len_hist = validator_metric_dict.pop("len_tok_hist", None)
+            score_hist = validator_metric_dict.pop("score_hist", None)
+
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            if isinstance(len_hist, list):
+                scores_src = score_hist if isinstance(score_hist, list) else scores
+                self._accumulate_length_stats(
+                    len_hist,
+                    scores_src,
+                    self.test_len_counts,
+                    self.test_score_sum_by_len,
+                    self.test_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        len_hist,
+                        scores_src,
+                        self.test_len_counts_valid,
+                        self.test_score_sum_by_len_valid,
+                        self.test_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+            else:
+                lengths = self._lengths_from_tokens(tokens)
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.test_len_counts,
+                    self.test_score_sum_by_len,
+                    self.test_score_count_by_len,
+                )
+                if valid_flags is not None:
+                    self._accumulate_length_stats(
+                        lengths,
+                        scores,
+                        self.test_len_counts_valid,
+                        self.test_score_sum_by_len_valid,
+                        self.test_score_count_by_len_valid,
+                        valid_flags=valid_flags,
+                    )
+        else:
+            scores = validator_dict.get("global_score") if validator_dict is not None else None
+            lengths = self._lengths_from_tokens(tokens)
+            self._accumulate_length_stats(
+                lengths,
+                scores,
+                self.test_len_counts,
+                self.test_score_sum_by_len,
+                self.test_score_count_by_len,
+            )
+            if valid_flags is not None:
+                self._accumulate_length_stats(
+                    lengths,
+                    scores,
+                    self.test_len_counts_valid,
+                    self.test_score_sum_by_len_valid,
+                    self.test_score_count_by_len_valid,
+                    valid_flags=valid_flags,
+                )
 
         log_ps = last_log_r * self.get_reward_temp_at_step(self.global_step)
         log_ps_unpenalized = last_log_r_unpenalized * self.get_reward_temp_at_step(
@@ -892,6 +1204,25 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
     # Epoch hooks
     # ------------------------------------------------------------------ #
+
+    def on_train_epoch_start(self):
+        self._log_metrics(
+            {"scheduled/R_temperature": self.get_reward_temp_at_step(self.global_step)},
+            sync_dist=True,
+        )
+        self._log_metrics(
+            {"scheduled/lr": self.lr_schedulers().get_lr()[0]},
+            sync_dist=True,
+        )
+        self.train_len_counts.clear()
+        self.train_score_sum_by_len.clear()
+        self.train_score_count_by_len.clear()
+        self.train_len_counts_valid.clear()
+        self.train_score_sum_by_len_valid.clear()
+        self.train_score_count_by_len_valid.clear()
+        self.train_log_pterm_sum.clear()
+        self.train_log_pterm_count.clear()
+        self.train_samples_valid_flags.clear()
 
     def on_train_epoch_end(self):
         self._maybe_update_ema()
@@ -1011,16 +1342,6 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
 
-    def on_train_epoch_start(self):
-        self._log_metrics(
-            {"scheduled/R_temperature": self.get_reward_temp_at_step(self.global_step)},
-            sync_dist=True,
-        )
-        self._log_metrics(
-            {"scheduled/lr": self.lr_schedulers().get_lr()[0]},
-            sync_dist=True,
-        )
-
     def on_validation_epoch_start(self):
         """Prepare validation probes and reset cached samples."""
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
@@ -1032,10 +1353,83 @@ class ChemGFNModule(LightningModule):
         self.val_samples_table.clear()
         self.val_log_rs.clear()
         self.val_log_pfss.clear()
+        self.val_samples_valid_flags.clear()
+        self.val_len_counts.clear()
+        self.val_score_sum_by_len.clear()
+        self.val_score_count_by_len.clear()
+        self.val_len_counts_valid.clear()
+        self.val_score_sum_by_len_valid.clear()
+        self.val_score_count_by_len_valid.clear()
+        self.val_log_pterm_sum.clear()
+        self.val_log_pterm_count.clear()
+        self.val_batch_diversity_sum = 0.0
+        self.val_batch_diversity_count = 0
+        self.val_batch_fp_div_internal_sum = 0.0
+        self.val_batch_fp_div_internal_count = 0
+        self.val_batch_fp_div_topk_sum = 0.0
+        self.val_batch_fp_div_topk_count = 0
 
     def on_validation_epoch_end(self):
-        diversity = calculate_diversity(torch.tensor(self.val_samples_ids))
+        diversity = self._calculate_diversity_ragged(self.val_samples_ids)
         self._log_metrics({"val/diversity": diversity}, sync_dist=True, on_epoch=True)
+        valid_val_sequences = self._filter_valid_sequences(
+            self.val_samples_ids, self.val_samples_valid_flags
+        )
+        diversity_val_valid = self._calculate_diversity_ragged(valid_val_sequences)
+        self._log_metrics(
+            {"val/diversity_valid": diversity_val_valid}, sync_dist=True, on_epoch=True
+        )
+        if self.val_batch_diversity_count > 0:
+            self._log_metrics(
+                {
+                    "val/diversity_batch_mean": self.val_batch_diversity_sum
+                    / float(self.val_batch_diversity_count)
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        if self.val_batch_fp_div_internal_count > 0:
+            mean_internal = self.val_batch_fp_div_internal_sum / float(
+                self.val_batch_fp_div_internal_count
+            )
+            self._log_metrics(
+                {
+                    "val/fp_div_internal_valid_batch_mean": mean_internal,
+                    "val/validator/fp_div_internal_valid_batch_mean": mean_internal,
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        if self.val_batch_fp_div_topk_count > 0:
+            mean_topk = self.val_batch_fp_div_topk_sum / float(self.val_batch_fp_div_topk_count)
+            self._log_metrics(
+                {
+                    "val/fp_div_topk_valid_batch_mean": mean_topk,
+                    "val/validator/fp_div_topk_valid_batch_mean": mean_topk,
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        diversity_by_len = calculate_diversity_by_length(
+            self.val_samples_ids, self.end_of_sentence_token_id
+        )
+        diversity_by_len_valid = calculate_diversity_by_length(
+            valid_val_sequences, self.end_of_sentence_token_id
+        )
+        fp_div = self._compute_global_fp_diversity(self.val_samples_ids)
+        if fp_div:
+            self._log_metrics(
+                {
+                    "val/fp_div_internal_valid": fp_div.get("fp_div_internal_valid", 0.0),
+                    "val/fp_div_topk_valid": fp_div.get("fp_div_topk_valid", 0.0),
+                    "val/validator/fp_div_internal_valid": fp_div.get(
+                        "fp_div_internal_valid", 0.0
+                    ),
+                    "val/validator/fp_div_topk_valid": fp_div.get("fp_div_topk_valid", 0.0),
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
 
         # log prefix collapse metrics
         eos = self.end_of_sentence_token_id
@@ -1063,6 +1457,24 @@ class ChemGFNModule(LightningModule):
         }
         self._log_metrics(log, on_epoch=True, sync_dist=True)
         self._log_wandb_prefix_tables("prefix_pos_val", pos, kmet)
+        self._log_wandb_length_metrics(
+            "length_metrics_val",
+            self.val_len_counts,
+            self.val_score_sum_by_len,
+            self.val_score_count_by_len,
+            diversity_by_len,
+            self.val_log_pterm_sum,
+            self.val_log_pterm_count,
+        )
+        self._log_wandb_length_metrics(
+            "length_metrics_val_valid",
+            self.val_len_counts_valid,
+            self.val_score_sum_by_len_valid,
+            self.val_score_count_by_len_valid,
+            diversity_by_len_valid,
+            {},
+            {},
+        )
 
         if self.val_samples_table:
             samples_table = pd.DataFrame(self.val_samples_table)
@@ -1104,10 +1516,91 @@ class ChemGFNModule(LightningModule):
         self.test_samples_table.clear()
         self.test_log_rs.clear()
         self.test_log_pfss.clear()
+        self.test_samples_valid_flags.clear()
+        self.test_len_counts.clear()
+        self.test_score_sum_by_len.clear()
+        self.test_score_count_by_len.clear()
+        self.test_len_counts_valid.clear()
+        self.test_score_sum_by_len_valid.clear()
+        self.test_score_count_by_len_valid.clear()
+        self.test_log_pterm_sum.clear()
+        self.test_log_pterm_count.clear()
+        self.test_batch_diversity_sum = 0.0
+        self.test_batch_diversity_count = 0
+        self.test_batch_fp_div_internal_sum = 0.0
+        self.test_batch_fp_div_internal_count = 0
+        self.test_batch_fp_div_topk_sum = 0.0
+        self.test_batch_fp_div_topk_count = 0
 
     def on_test_epoch_end(self):
-        diversity = calculate_diversity(torch.tensor(self.test_samples_ids))
+        diversity = self._calculate_diversity_ragged(self.test_samples_ids)
         self._log_metrics({"test/diversity": diversity}, sync_dist=True, on_epoch=True)
+        valid_test_sequences = self._filter_valid_sequences(
+            self.test_samples_ids, self.test_samples_valid_flags
+        )
+        diversity_test_valid = self._calculate_diversity_ragged(valid_test_sequences)
+        self._log_metrics(
+            {"test/diversity_valid": diversity_test_valid}, sync_dist=True, on_epoch=True
+        )
+        if self.test_batch_diversity_count > 0:
+            self._log_metrics(
+                {
+                    "test/diversity_batch_mean": self.test_batch_diversity_sum
+                    / float(self.test_batch_diversity_count)
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        if self.test_batch_fp_div_internal_count > 0:
+            mean_internal = self.test_batch_fp_div_internal_sum / float(
+                self.test_batch_fp_div_internal_count
+            )
+            self._log_metrics(
+                {"test/fp_div_internal_valid_batch_mean": mean_internal},
+                sync_dist=True,
+                on_epoch=True,
+            )
+        if self.test_batch_fp_div_topk_count > 0:
+            mean_topk = self.test_batch_fp_div_topk_sum / float(self.test_batch_fp_div_topk_count)
+            self._log_metrics(
+                {"test/fp_div_topk_valid_batch_mean": mean_topk},
+                sync_dist=True,
+                on_epoch=True,
+            )
+        diversity_by_len = calculate_diversity_by_length(
+            self.test_samples_ids, self.end_of_sentence_token_id
+        )
+        diversity_by_len_valid = calculate_diversity_by_length(
+            valid_test_sequences, self.end_of_sentence_token_id
+        )
+        fp_div = self._compute_global_fp_diversity(self.test_samples_ids)
+        if fp_div:
+            self._log_metrics(
+                {
+                    "test/fp_div_internal_valid": fp_div.get("fp_div_internal_valid", 0.0),
+                    "test/fp_div_topk_valid": fp_div.get("fp_div_topk_valid", 0.0),
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        self._log_wandb_length_metrics(
+            "length_metrics_test",
+            self.test_len_counts,
+            self.test_score_sum_by_len,
+            self.test_score_count_by_len,
+            diversity_by_len,
+            self.test_log_pterm_sum,
+            self.test_log_pterm_count,
+        )
+        self._log_wandb_length_metrics(
+            "length_metrics_test_valid",
+            self.test_len_counts_valid,
+            self.test_score_sum_by_len_valid,
+            self.test_score_count_by_len_valid,
+            diversity_by_len_valid,
+            {},
+            {},
+        )
 
         eos = self.end_of_sentence_token_id
         valid_flags = torch.tensor(self.test_samples_valid_flags)
@@ -1169,6 +1662,98 @@ class ChemGFNModule(LightningModule):
                     {"test/Var(logR - logPf(s))": (log_rs - log_pfss).var()},
                     sync_dist=True,
                 )
+
+        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+            return
+
+        # save as json file
+        callback_metrics = getattr(self.trainer, "callback_metrics", {})
+        if callback_metrics:
+            metrics = {}
+            for key, value in callback_metrics.items():
+                if not isinstance(key, str) or not key.startswith("test/"):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    if value.ndim == 0:
+                        metrics[key] = float(value.detach().cpu().item())
+                    else:
+                        metrics[key] = value.detach().cpu().tolist()
+                elif isinstance(value, (float, int)):
+                    metrics[key] = float(value)
+                elif isinstance(value, bool):
+                    metrics[key] = bool(value)
+            if metrics:
+                epoch = int(getattr(self.trainer, "current_epoch", 0))
+                global_step = int(getattr(self.trainer, "global_step", 0))
+                metrics["epoch"] = epoch
+                metrics["global_step"] = global_step
+                if fp_div:
+                    metrics["test/fp_div_internal_valid"] = fp_div.get(
+                        "fp_div_internal_valid", 0.0
+                    )
+                    metrics["test/fp_div_topk_valid"] = fp_div.get("fp_div_topk_valid", 0.0)
+                    metrics["test/validator/fp_div_internal_valid"] = fp_div.get(
+                        "fp_div_internal_valid", 0.0
+                    )
+                    metrics["test/validator/fp_div_topk_valid"] = fp_div.get(
+                        "fp_div_topk_valid", 0.0
+                    )
+                metrics["len_counts"] = self.test_len_counts
+                metrics["score_sum_by_len"] = self.test_score_sum_by_len
+                metrics["score_count_by_len"] = self.test_score_count_by_len
+                score_mean_by_len = {}
+                for length, total in self.test_score_sum_by_len.items():
+                    count = self.test_score_count_by_len.get(length, 0)
+                    score_mean_by_len[int(length)] = float(total) / float(count) if count else 0.0
+                metrics["score_mean_by_len"] = score_mean_by_len
+                metrics["len_counts_valid"] = self.test_len_counts_valid
+                metrics["score_sum_by_len_valid"] = self.test_score_sum_by_len_valid
+                metrics["score_count_by_len_valid"] = self.test_score_count_by_len_valid
+                score_mean_by_len_valid = {}
+                for length, total in self.test_score_sum_by_len_valid.items():
+                    count = self.test_score_count_by_len_valid.get(length, 0)
+                    score_mean_by_len_valid[int(length)] = (
+                        float(total) / float(count) if count else 0.0
+                    )
+                metrics["score_mean_by_len_valid"] = score_mean_by_len_valid
+                metrics["diversity_by_len"] = diversity_by_len
+                metrics["diversity_valid"] = diversity_test_valid
+                metrics["diversity_by_len_valid"] = diversity_by_len_valid
+                metrics["log_pterm_sum"] = self.test_log_pterm_sum
+                metrics["log_pterm_count"] = self.test_log_pterm_count
+                log_pterm_by_len = {}
+                for length, total in self.test_log_pterm_sum.items():
+                    count = self.test_log_pterm_count.get(length, 0)
+                    log_pterm_by_len[int(length)] = float(total) / float(count) if count else 0.0
+                metrics["log_pterm_by_len"] = log_pterm_by_len
+                metrics["pterm_by_len"] = {
+                    length: float(np.exp(val)) for length, val in log_pterm_by_len.items()
+                }
+
+                exp_name = None
+                hparams = getattr(self, "hparams", None)
+                if hparams is not None:
+                    if isinstance(hparams, dict):
+                        exp_name = hparams.get("exp_name")
+                    else:
+                        exp_name = getattr(hparams, "exp_name", None)
+                if not exp_name:
+                    exp = getattr(getattr(self, "logger", None), "experiment", None)
+                    exp_name = getattr(exp, "name", None)
+                if not exp_name:
+                    exp_name = "exp"
+                exp_name = str(exp_name).replace(" ", "_")
+                metrics["exp_name"] = exp_name
+
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+                _root_dir = os.path.join(repo_root, "evaluation")
+                os.makedirs(_root_dir, exist_ok=True)
+                out_path = os.path.join(
+                    _root_dir,
+                    f"test_metrics_{exp_name}_epoch_{epoch}_step_{global_step}.json",
+                )
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(metrics, f, indent=2, sort_keys=True)
 
     def on_train_start(self):
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
@@ -1305,29 +1890,6 @@ class ChemGFNModule(LightningModule):
             return df, log_rs_out, log_pfss_out
         return df
 
-    def sample_probes_baselines(self, probes, n_samples=4):
-        assert isinstance(probes, list) and probes[0].ndim == 1
-        samples = []
-        for probe in probes:
-            probe_str = self.tokenizer.decode(probe)
-            probe_samples = self.sample_baselines(probe.to(self.device), n_samples=n_samples)
-            for idx in range(n_samples):
-                sample = {"Prompt": probe_str}
-                for baseline in probe_samples:
-                    sample[f"Sampled sentence ({baseline})"] = probe_samples[baseline]["sample"][
-                        idx
-                    ]
-                    sample[f"logP(s) ({baseline})"] = probe_samples[baseline]["logP(s)"][
-                        idx
-                    ].item()
-                    sample[f"logP(s) unpenalized ({baseline})"] = probe_samples[baseline][
-                        "logP(s) unpenalized"
-                    ][idx].item()
-                samples.append(sample)
-
-        df = pd.DataFrame(samples)
-        return df.sort_values(by=["Prompt"], ascending=False)
-
     def sample_baselines(self, prompt, n_samples=4):
         assert prompt.ndim == 2
 
@@ -1459,14 +2021,6 @@ class ChemGFNModule(LightningModule):
     # Helpers
     # --------------------------------------------------------------------- #
 
-    @staticmethod
-    def _normalize_scalar(value: Any) -> float:
-        if value is None:
-            return 0.0
-        if hasattr(value, "item"):
-            return float(value.item())
-        return float(value)
-
     def _load_token_masks(self):
         tokens_path = getattr(self.constraint_config, "legal_tokens", None)
         if tokens_path and os.path.exists(tokens_path):
@@ -1532,6 +2086,238 @@ class ChemGFNModule(LightningModule):
     def _strip_special_token_ids(self, token_ids: list[int]) -> list[int]:
         special_ids = set(self.tokenizer.all_special_ids)
         return [tok for tok in token_ids if tok not in special_ids]
+
+    def _strip_eos_token_ids(self, token_ids: list[int]) -> list[int]:
+        eos_id = int(self.end_of_sentence_token_id)
+        try:
+            eos_pos = token_ids.index(eos_id)
+        except ValueError:
+            return token_ids
+        return token_ids[:eos_pos]
+
+    def _strip_eos_from_batch(self, token_batch: torch.Tensor) -> list[list[int]]:
+        if token_batch is None:
+            return []
+        rows = token_batch.detach().cpu().tolist()
+        return [self._strip_eos_token_ids([int(t) for t in row]) for row in rows]
+
+    def _filter_valid_sequences(
+        self, sequences: list[list[int]], valid_flags: list[bool] | torch.Tensor | None
+    ) -> list[list[int]]:
+        if not sequences or valid_flags is None:
+            return []
+        if isinstance(valid_flags, torch.Tensor):
+            valid_flags = valid_flags.detach().cpu().tolist()
+        if not valid_flags:
+            return []
+        n = min(len(sequences), len(valid_flags))
+        return [sequences[i] for i in range(n) if bool(valid_flags[i])]
+
+    def _calculate_diversity_ragged(self, sequences: list[list[int]]) -> float:
+        if not sequences or len(sequences) <= 1:
+            return 0.0
+        max_len = max((len(seq) for seq in sequences), default=0)
+        if max_len <= 0:
+            return 0.0
+        total_entropy = 0.0
+        used = 0
+        for pos in range(max_len):
+            toks = [seq[pos] for seq in sequences if len(seq) > pos]
+            n = len(toks)
+            if n <= 1:
+                continue
+            _, counts = np.unique(np.array(toks, dtype=np.int64), return_counts=True)
+            probs = counts.astype(np.float64) / float(n)
+            total_entropy += float(-np.sum(probs * np.log(probs + 1e-10)))
+            used += 1
+        return total_entropy / float(used) if used > 0 else 0.0
+
+    def _compute_global_fp_diversity(
+        self,
+        token_ids_list: list[list[int]],
+    ) -> dict[str, float]:
+        validator = getattr(self.reward, "sentence_validator", None)
+        if validator is None:
+            return {}
+        if not hasattr(validator, "_morgan_fp") or not hasattr(
+            validator, "_mean_pairwise_tanimoto"
+        ):
+            return {}
+        if not token_ids_list:
+            return {}
+
+        eos_id = int(self.end_of_sentence_token_id)
+        seq_tensors = []
+        for seq in token_ids_list:
+            cleaned = self._strip_special_token_ids(seq)
+            cleaned = self._strip_eos_token_ids(cleaned)
+            if not cleaned:
+                cleaned = [eos_id]
+            seq_tensors.append(torch.tensor(cleaned, dtype=torch.long))
+
+        if not seq_tensors:
+            return {}
+
+        tokens = torch.nn.utils.rnn.pad_sequence(
+            seq_tensors,
+            batch_first=True,
+            padding_value=eos_id,
+        )
+
+        try:
+            metrics = validator.smiles_accuracy(tokens, self.tokenizer, return_hist=False)
+        except Exception:
+            try:
+                metrics = validator.accuracy(tokens, self.tokenizer)
+            except Exception:
+                return {}
+
+        return {
+            "fp_div_internal_valid": float(metrics.get("fp_div_internal_valid", 0.0)),
+            "fp_div_topk_valid": float(metrics.get("fp_div_topk_valid", 0.0)),
+        }
+
+    def _lengths_from_tokens(self, tokens: torch.Tensor) -> list[int]:
+        if tokens is None or tokens.numel() == 0:
+            return []
+        eos_id = int(self.end_of_sentence_token_id)
+        tok_cpu = tokens.detach().cpu()
+        eos_mask = tok_cpu.eq(eos_id)
+        has_eos = eos_mask.any(dim=1)
+        first_eos = eos_mask.float().argmax(dim=1)
+        full_len = tok_cpu.shape[1]
+        lengths = torch.where(has_eos, first_eos, torch.full_like(first_eos, full_len)).tolist()
+        return [int(x) for x in lengths]
+
+    @staticmethod
+    def _accumulate_length_stats(
+        lengths: list[int],
+        scores: list[float] | torch.Tensor | None,
+        counts: dict[int, int],
+        score_sums: dict[int, float],
+        score_counts: dict[int, int],
+        valid_flags: list[bool] | None = None,
+    ) -> None:
+        if not lengths:
+            return
+        if isinstance(scores, torch.Tensor):
+            scores_list = scores.detach().cpu().tolist()
+        elif isinstance(scores, list):
+            scores_list = scores
+        else:
+            scores_list = None
+
+        n = len(lengths)
+        if scores_list is not None:
+            n = min(n, len(scores_list))
+        if valid_flags is not None:
+            n = min(n, len(valid_flags))
+
+        for idx in range(n):
+            if valid_flags is not None and not valid_flags[idx]:
+                continue
+            length_int = int(lengths[idx])
+            counts[length_int] = counts.get(length_int, 0) + 1
+            if scores_list is not None:
+                score_sums[length_int] = score_sums.get(length_int, 0.0) + float(scores_list[idx])
+                score_counts[length_int] = score_counts.get(length_int, 0) + 1
+
+    def _accumulate_log_pterm_by_length(
+        self,
+        tokens: torch.Tensor,
+        log_pterm: torch.Tensor,
+        sums: dict[int, float],
+        counts: dict[int, int],
+    ) -> None:
+        if log_pterm is None or tokens is None:
+            return
+        lengths = self._lengths_from_tokens(tokens)
+        if not lengths:
+            return
+        log_pterm_cpu = log_pterm.detach().cpu()
+        t_len = int(log_pterm_cpu.shape[1])
+        if t_len <= 0:
+            return
+        n = min(len(lengths), log_pterm_cpu.shape[0])
+        for idx in range(n):
+            length = int(lengths[idx])
+            t_idx = length if length < t_len else t_len - 1
+            val = float(log_pterm_cpu[idx, t_idx].item())
+            sums[length] = sums.get(length, 0.0) + val
+            counts[length] = counts.get(length, 0) + 1
+
+    def _log_validator_core_metrics(
+        self,
+        prefix: str,
+        validator_metric_dict: dict[str, Any] | None,
+        *,
+        sync_dist: bool,
+        on_step: bool | None = None,
+        on_epoch: bool | None = None,
+    ) -> None:
+        if not validator_metric_dict:
+            return
+        scorer_name = None
+        if (
+            self.reward is not None
+            and getattr(self.reward, "sentence_validator", None) is not None
+        ):
+            scorer_name = getattr(self.reward.sentence_validator, "scorer_name", None)
+
+        metrics = {}
+        for key in ("acc", "fp_div_internal_valid", "fp_div_topk_valid"):
+            if key in validator_metric_dict:
+                metrics[f"{prefix}/{key}"] = validator_metric_dict[key]
+        if scorer_name:
+            if scorer_name in validator_metric_dict:
+                metrics[f"{prefix}/{scorer_name}"] = validator_metric_dict[scorer_name]
+            filter_key = f"{scorer_name}_filter"
+            if filter_key in validator_metric_dict:
+                metrics[f"{prefix}/{filter_key}"] = validator_metric_dict[filter_key]
+
+        if metrics:
+            self._log_metrics(
+                metrics,
+                sync_dist=sync_dist,
+                on_step=on_step,
+                on_epoch=on_epoch,
+            )
+
+    def _log_validator_full_metrics(
+        self,
+        prefix: str,
+        validator_metric_dict: dict[str, Any] | None,
+        *,
+        sync_dist: bool,
+        on_step: bool | None = None,
+        on_epoch: bool | None = None,
+    ) -> None:
+        if not validator_metric_dict:
+            return
+        metrics = {}
+        skip_keys = {
+            "len_tok_hist",
+            "len_tok_valid_hist",
+            "len_char_hist",
+            "len_char_valid_hist",
+            "score_hist",
+        }
+        for key, value in validator_metric_dict.items():
+            if key in skip_keys:
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0:
+                    metrics[f"{prefix}/{key}"] = value
+                continue
+            if isinstance(value, (float, int, bool)):
+                metrics[f"{prefix}/{key}"] = value
+        if metrics:
+            self._log_metrics(
+                metrics,
+                sync_dist=sync_dist,
+                on_step=on_step,
+                on_epoch=on_epoch,
+            )
 
     def _log_wandb_prefix_tables(
         self,
@@ -1842,11 +2628,11 @@ class ChemGFNModule(LightningModule):
         # -------------------------
         # Scalars (all + correct)
         # -------------------------
-        if getattr(pos, "top1_auc", None) is not None:
-            payload[f"{tag}/top1_auc"] = float(pos.top1_auc)
+        # if getattr(pos, "top1_auc", None) is not None:
+        #     payload[f"{tag}/top1_auc"] = float(pos.top1_auc)
 
-        if getattr(pos, "top1_auc_correct", None) is not None:
-            payload[f"{tag}/top1_auc_correct"] = float(pos.top1_auc_correct)
+        # if getattr(pos, "top1_auc_correct", None) is not None:
+        #     payload[f"{tag}/top1_auc_correct"] = float(pos.top1_auc_correct)
 
         # drop Nones
         payload = {k: v for k, v in payload.items() if v is not None}
@@ -1854,6 +2640,213 @@ class ChemGFNModule(LightningModule):
             return
 
         # IMPORTANT: do NOT set step manually
+        for run in runs:
+            try:
+                run.log(payload)
+            except Exception:
+                pass
+
+    def _log_wandb_length_metrics(
+        self,
+        tag: str,
+        length_counts: dict[int, int],
+        score_sums: dict[int, float],
+        score_counts: dict[int, int],
+        diversity_by_len: dict[int, float],
+        log_pterm_sums: dict[int, float],
+        log_pterm_counts: dict[int, int],
+    ) -> None:
+        if self.logger is None:
+            return
+        if hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
+            return
+        try:
+            import wandb
+        except Exception:
+            return
+
+        loggers = self.loggers if getattr(self, "loggers", None) else [self.logger]
+        runs = []
+        for lg in loggers:
+            exp = getattr(lg, "experiment", None)
+            if exp is not None and hasattr(exp, "log") and hasattr(exp, "define_metric"):
+                runs.append(exp)
+        if not runs:
+            return
+
+        epoch = int(getattr(self.trainer, "current_epoch", 0))
+        flag_name = f"_wandb_length_defined_{tag.replace('/', '_')}"
+        if not getattr(self, flag_name, False):
+            for run in runs:
+                try:
+                    run.define_metric(f"{tag}/*", step_metric="epoch")
+                except Exception:
+                    pass
+            setattr(self, flag_name, True)
+
+        scorer_name = "score"
+        if (
+            self.reward is not None
+            and getattr(self.reward, "sentence_validator", None) is not None
+        ):
+            scorer_name = getattr(self.reward.sentence_validator, "scorer_name", scorer_name)
+
+        payload = {"epoch": epoch}
+
+        ranges = getattr(self, "_wandb_length_axis_ranges", None)
+        if ranges is None:
+            ranges = {}
+            setattr(self, "_wandb_length_axis_ranges", ranges)
+        tag_ranges = ranges.setdefault(tag, {})
+
+        def _update_range(key: str, values: list[float]) -> tuple[float, float] | None:
+            if not values:
+                return None
+            vmin = float(min(values))
+            vmax = float(max(values))
+            cur = tag_ranges.get(key)
+            if cur is None:
+                tag_ranges[key] = [vmin, vmax]
+            else:
+                cur[0] = min(cur[0], vmin)
+                cur[1] = max(cur[1], vmax)
+            return float(tag_ranges[key][0]), float(tag_ranges[key][1])
+
+        def _update_x_range(
+            key_min: str, key_max: str, xs: list[int]
+        ) -> tuple[float, float] | None:
+            if not xs:
+                return None
+            vmin = float(min(xs))
+            vmax = float(max(xs))
+            cur_min = float(tag_ranges.get(key_min, vmin))
+            cur_max = float(tag_ranges.get(key_max, vmax))
+            tag_ranges[key_min] = min(cur_min, vmin)
+            tag_ranges[key_max] = max(cur_max, vmax)
+            return float(tag_ranges[key_min]), float(tag_ranges[key_max])
+
+        def _apply_ylim(ax, rng: tuple[float, float] | None) -> None:
+            if rng is None:
+                return
+            ymin, ymax = rng
+            if ymin == ymax:
+                pad = 1e-6 if ymin == 0.0 else abs(ymin) * 0.05
+                ymin -= pad
+                ymax += pad
+            ax.set_ylim(ymin, ymax)
+
+        def _plot_line(
+            xs: list[int],
+            ys: list[float],
+            xlabel: str,
+            ylabel: str,
+            title: str,
+            *,
+            key_prefix: str,
+        ):
+            if not xs:
+                return None
+            try:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.plot(xs, ys)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.set_title(title)
+                _apply_ylim(ax, _update_range(f"{key_prefix}_y", ys))
+                x_rng = _update_x_range(f"{key_prefix}_x_min", f"{key_prefix}_x_max", xs)
+                if x_rng is not None:
+                    ax.set_xlim(x_rng[0], x_rng[1])
+                fig.tight_layout()
+                return fig
+            except Exception:
+                return None
+
+        if length_counts:
+            lengths = sorted(length_counts.keys())
+            total = float(sum(length_counts.values()))
+            if total > 0:
+                counts = [float(length_counts[length]) / total * 100.0 for length in lengths]
+            else:
+                counts = [0.0 for _ in lengths]
+            fig = _plot_line(
+                lengths,
+                counts,
+                "length",
+                "percent",
+                f"{tag} count by length (total={int(total)}) (epoch={epoch})",
+                key_prefix="count_by_len",
+            )
+            if fig is not None:
+                payload[f"{tag}/count_by_len"] = wandb.Image(fig)
+                plt.close(fig)
+
+            if score_counts:
+                avg_scores = [
+                    float(score_sums.get(length, 0.0) / max(1, score_counts.get(length, 0)))
+                    for length in lengths
+                ]
+                fig = _plot_line(
+                    lengths,
+                    avg_scores,
+                    "length",
+                    f"{scorer_name}",
+                    f"{tag} {scorer_name} by length (epoch={epoch})",
+                    key_prefix="score_by_len",
+                )
+                if fig is not None:
+                    payload[f"{tag}/{scorer_name}_by_len"] = wandb.Image(fig)
+                    plt.close(fig)
+
+        if diversity_by_len:
+            lengths = sorted(diversity_by_len.keys())
+            divs = [float(diversity_by_len[length]) for length in lengths]
+            fig = _plot_line(
+                lengths,
+                divs,
+                "length",
+                "diversity",
+                f"{tag} diversity by length (epoch={epoch})",
+                key_prefix="diversity_by_len",
+            )
+            if fig is not None:
+                payload[f"{tag}/diversity_by_len"] = wandb.Image(fig)
+                plt.close(fig)
+
+        if log_pterm_sums and log_pterm_counts:
+            lengths = sorted(log_pterm_sums.keys())
+            log_vals = [
+                float(log_pterm_sums.get(length, 0.0) / log_pterm_counts.get(length, 1))
+                if log_pterm_counts.get(length, 0) > 0
+                else 0.0
+                for length in lengths
+            ]
+            fig = _plot_line(
+                lengths,
+                log_vals,
+                "length",
+                "log_pterm",
+                f"{tag} log_pterm by length (epoch={epoch})",
+                key_prefix="log_pterm_by_len",
+            )
+            if fig is not None:
+                payload[f"{tag}/log_pterm_by_len"] = wandb.Image(fig)
+                plt.close(fig)
+            pterm_vals = [float(np.exp(v)) for v in log_vals]
+            fig = _plot_line(
+                lengths,
+                pterm_vals,
+                "length",
+                "pterm",
+                f"{tag} pterm by length (epoch={epoch})",
+                key_prefix="pterm_by_len",
+            )
+            if fig is not None:
+                payload[f"{tag}/pterm_by_len"] = wandb.Image(fig)
+                plt.close(fig)
+
+        payload = {k: v for k, v in payload.items() if v is not None}
+        if len(payload) <= 1:
+            return
         for run in runs:
             try:
                 run.log(payload)
@@ -2021,11 +3014,32 @@ class ChemGFNModule(LightningModule):
         if completed_epochs >= self._ema_start_epoch:
             self._update_ema_state()
             ema_updated = True
+            self._maybe_store_ema_snapshot(completed_epochs)
             if self._should_update_reference(completed_epochs):
-                reference_delta = self._apply_ema_to_reference()
-                self._ema_reference_update_count += 1
-                reference_updated = True
+                ema_state_to_apply = self._get_delayed_ema_state(completed_epochs)
+                if ema_state_to_apply is not None:
+                    reference_delta = self._apply_ema_to_reference(ema_state_to_apply)
+                    self._ema_reference_update_count += 1
+                    reference_updated = True
         self._log_ema_metrics(ema_updated, reference_updated, reference_delta)
+
+    def _maybe_store_ema_snapshot(self, completed_epochs: int) -> None:
+        if self._ema_state_history is None:
+            return
+        self._ema_state_history.append((completed_epochs, self._capture_ema_state()))
+
+    def _get_delayed_ema_state(self, completed_epochs: int) -> dict[str, torch.Tensor] | None:
+        if self._ema_reference_delay_epochs <= 0:
+            return self._ema_state
+        if self._ema_state_history is None:
+            return None
+        if len(self._ema_state_history) < self._ema_reference_delay_epochs + 1:
+            return None
+        target_epoch = completed_epochs - self._ema_reference_delay_epochs
+        for epoch, state in self._ema_state_history:
+            if epoch == target_epoch:
+                return state
+        return None
 
     def _update_ema_state(self) -> None:
         with torch.no_grad():
@@ -2049,18 +3063,20 @@ class ChemGFNModule(LightningModule):
             (completed_epochs - self._ema_reference_start_epoch) % self._ema_reference_interval
         ) == 0
 
-    def _apply_ema_to_reference(self) -> tuple[float, float] | None:
-        if not self._ema_state:
+    def _apply_ema_to_reference(
+        self, ema_state: dict[str, torch.Tensor]
+    ) -> tuple[float, float] | None:
+        if not ema_state:
             return None
         target_model = self._net_frozen_raw
         reference_delta = None
         if self._ema_log_reference_delta:
             if self.disable_peft:
-                reference_delta = self._compute_reference_delta_vs_model(target_model)
+                reference_delta = self._compute_reference_delta_vs_model(target_model, ema_state)
             else:
-                reference_delta = self._compute_reference_delta_vs_prev()
+                reference_delta = self._compute_reference_delta_vs_prev(ema_state)
         if self.disable_peft:
-            target_model.load_state_dict(self._ema_state, strict=False)
+            target_model.load_state_dict(ema_state, strict=False)
         else:
             if hasattr(target_model, "merge_and_unload"):
                 ema_peft = target_model
@@ -2071,7 +3087,7 @@ class ChemGFNModule(LightningModule):
                     except Exception:
                         pass
                 ema_peft = get_peft_model(target_model, self.lora_config)
-            ema_peft.load_state_dict(self._ema_state, strict=False)
+            ema_peft.load_state_dict(ema_state, strict=False)
             if hasattr(ema_peft, "merge_and_unload"):
                 merged_model = ema_peft.merge_and_unload()
                 if merged_model is not target_model:
@@ -2082,7 +3098,7 @@ class ChemGFNModule(LightningModule):
         target_model.eval()
         target_model.requires_grad_(False)
         if self._ema_log_reference_delta and not self.disable_peft:
-            self._ema_reference_prev_state = self._capture_ema_state()
+            self._ema_reference_prev_state = self._capture_ema_state(ema_state)
         return reference_delta
 
     def _log_ema_metrics(
@@ -2135,13 +3151,15 @@ class ChemGFNModule(LightningModule):
             var = 0.0
         return mean, var
 
-    def _compute_reference_delta_vs_prev(self) -> tuple[float, float] | None:
+    def _compute_reference_delta_vs_prev(
+        self, ema_state: dict[str, torch.Tensor]
+    ) -> tuple[float, float] | None:
         if not self._ema_reference_prev_state:
             return None
         total = 0.0
         total_sq = 0.0
         count = 0
-        for name, ema_tensor in self._ema_state.items():
+        for name, ema_tensor in ema_state.items():
             if not self._should_track_ema_name(name):
                 continue
             prev_tensor = self._ema_reference_prev_state.get(name)
@@ -2159,12 +3177,14 @@ class ChemGFNModule(LightningModule):
             var = 0.0
         return mean, var
 
-    def _compute_reference_delta_vs_model(self, model) -> tuple[float, float] | None:
+    def _compute_reference_delta_vs_model(
+        self, model, ema_state: dict[str, torch.Tensor]
+    ) -> tuple[float, float] | None:
         total = 0.0
         total_sq = 0.0
         count = 0
         param_map = dict(model.named_parameters())
-        for name, ema_tensor in self._ema_state.items():
+        for name, ema_tensor in ema_state.items():
             if not self._should_track_ema_name(name):
                 continue
             param = param_map.get(name)
@@ -2183,9 +3203,12 @@ class ChemGFNModule(LightningModule):
             var = 0.0
         return mean, var
 
-    def _capture_ema_state(self) -> dict[str, torch.Tensor]:
+    def _capture_ema_state(
+        self, ema_state: dict[str, torch.Tensor] | None = None
+    ) -> dict[str, torch.Tensor]:
+        ema_state = self._ema_state if ema_state is None else ema_state
         snapshot: dict[str, torch.Tensor] = {}
-        for name, ema_tensor in self._ema_state.items():
+        for name, ema_tensor in ema_state.items():
             if self._should_track_ema_name(name):
                 snapshot[name] = ema_tensor.clone()
         return snapshot

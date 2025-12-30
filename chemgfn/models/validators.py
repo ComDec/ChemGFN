@@ -4,7 +4,7 @@ import math
 import re
 from collections import Counter
 from fractions import Fraction
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 import partialsmiles as ps
 import torch
@@ -215,7 +215,7 @@ class RDKitValidator(SentenceValidator):
     def __init__(
         self,
         scorer: str = "sa",
-        backend: Literal["rdkit", "pa"] = "rdkit",
+        backend: Literal["rdkit", "pa"] = "pa",
         fp_radius: int = 2,
         fp_nbits: int = 2048,
         topk_diversity: int = 20,
@@ -225,7 +225,6 @@ class RDKitValidator(SentenceValidator):
         self.backend = backend
         self.scorer_name = scorer
 
-        # FP diversity config
         self.fp_radius = int(fp_radius)
         self.fp_nbits = int(fp_nbits)
         self.topk_diversity = int(topk_diversity)
@@ -263,6 +262,78 @@ class RDKitValidator(SentenceValidator):
         return AllChem.GetMorganFingerprintAsBitVect(mol, self.fp_radius, nBits=self.fp_nbits)
 
     @staticmethod
+    def _first_eos_pos(tokens: Tensor, eos_id: int) -> tuple[Tensor, Tensor]:
+        """
+        tokens: [B, T]
+        returns:
+          first_eos: [B]  (0..T)   T means "no EOS"
+          has_eos:   [B]  bool
+        """
+        B, T = tokens.shape
+        device = tokens.device
+        pos = torch.arange(T, device=device).view(1, T).expand(B, T)  # [B,T]
+        is_eos = tokens.eq(eos_id)
+        has_eos = is_eos.any(dim=1)
+        eos_pos = torch.where(is_eos, pos, torch.full_like(pos, T))
+        first_eos = eos_pos.min(dim=1).values  # [B], T if none
+        return first_eos, has_eos
+
+    @staticmethod
+    def _stats_1d(vals: list[int]) -> dict[str, float]:
+        """
+        vals: non-empty list of ints
+        returns mean/std/min/max/p50/p90/p95/p99
+        """
+        if len(vals) == 0:
+            return {
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+                "p50": 0.0,
+                "p90": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+            }
+        x = torch.tensor(vals, dtype=torch.float32)
+        x_sorted, _ = torch.sort(x)
+        n = x_sorted.numel()
+
+        def q(p: float) -> float:
+            # nearest-rank-ish; stable and simple
+            idx = int(round((n - 1) * p))
+            idx = max(0, min(n - 1, idx))
+            return float(x_sorted[idx].item())
+
+        mean = float(x.mean().item())
+        std = float(x.std(unbiased=False).item()) if n > 1 else 0.0
+        return {
+            "mean": mean,
+            "std": std,
+            "min": float(x_sorted[0].item()),
+            "max": float(x_sorted[-1].item()),
+            "p50": q(0.50),
+            "p90": q(0.90),
+            "p95": q(0.95),
+            "p99": q(0.99),
+        }
+
+    @staticmethod
+    def _len_bins(vals: list[int], bins: list[tuple[int, int]]) -> dict[str, float]:
+        """
+        bins: list of (lo, hi) inclusive, e.g. [(0,2),(3,5),(6,8),(9,10),(11,10**9)]
+        returns fraction per bin
+        """
+        n = len(vals)
+        if n == 0:
+            return {f"bin_{lo}_{hi}": 0.0 for (lo, hi) in bins}
+        out: dict[str, float] = {}
+        for lo, hi in bins:
+            cnt = sum(1 for v in vals if lo <= v <= hi)
+            out[f"bin_{lo}_{hi}"] = float(cnt / n)
+        return out
+
+    @staticmethod
     def _mean_pairwise_tanimoto(
         fps: list[DataStructs.cDataStructs.ExplicitBitVect],
     ) -> float:
@@ -286,27 +357,71 @@ class RDKitValidator(SentenceValidator):
         generated_tokens: Tensor,
         tokenizer: PreTrainedTokenizer,
         scaffold: str | None = None,
-    ) -> dict[str, float]:
-        decoded = self._decode_batch(generated_tokens, tokenizer)
-
+        *,
+        return_hist: bool = False,  # <-- 新增：需要 wandb 直方图时开
+    ) -> dict[str, Any]:
+        """
+        Returns:
+          - scalars for easy logging
+          - optional raw arrays for wandb.Histogram if return_hist=True
+        """
         num_samples = int(generated_tokens.shape[0])
         if num_samples == 0:
-            return {
+            out: dict[str, Any] = {
                 "acc": 0.0,
                 f"{self.scorer_name}": 0.0,
                 f"{self.scorer_name}_filter": 0.0,
                 "fp_div_internal_valid": 0.0,
                 "fp_div_topk_valid": 0.0,
+                # length scalars
+                "len_tok_mean": 0.0,
+                "len_tok_std": 0.0,
+                "len_tok_min": 0.0,
+                "len_tok_max": 0.0,
+                "len_tok_p50": 0.0,
+                "len_tok_p90": 0.0,
+                "len_tok_p95": 0.0,
+                "len_tok_p99": 0.0,
+                "len_tok_eos_rate": 0.0,
+                "len_tok_valid_mean": 0.0,
+                "len_tok_valid_std": 0.0,
+                "len_tok_valid_min": 0.0,
+                "len_tok_valid_max": 0.0,
+                "len_tok_valid_p50": 0.0,
+                "len_tok_valid_p90": 0.0,
+                "len_tok_valid_p95": 0.0,
+                "len_tok_valid_p99": 0.0,
+                "len_char_mean": 0.0,
+                "len_char_valid_mean": 0.0,
             }
+            if return_hist:
+                out["len_tok_hist"] = []
+                out["len_tok_valid_hist"] = []
+            return out
 
-        # one pass: build mols, validity, scores
+        # -------- token lengths (before EOS) --------
+        eos_id = int(tokenizer.eos_token_id)
+        first_eos, has_eos = self._first_eos_pos(generated_tokens, eos_id)  # [B], [B]
+        # length excluding EOS: if eos at pos p => length = p; if no eos => length = T
+        tok_lens = first_eos.to(torch.int64).tolist()
+        eos_rate = float(has_eos.float().mean().item())
+
+        # decode
+        decoded = self._decode_batch(generated_tokens, tokenizer)
+
+        # one pass: build mols, validity, scores, and char lengths
         valid_flags: list[bool] = [False] * num_samples
         scores: list[float] = [0.0] * num_samples
         valid_mols: list[Chem.Mol] = []
         valid_scores: list[float] = []
 
+        char_lens: list[int] = [0] * num_samples
+        valid_tok_lens: list[int] = []
+        valid_char_lens: list[int] = []
+
         for i, s in enumerate(decoded):
             candidate = _merge_target(scaffold, s)
+            char_lens[i] = int(len(candidate))
 
             mol = None
             if self._is_valid_smiles(candidate):
@@ -320,11 +435,12 @@ class RDKitValidator(SentenceValidator):
                 scores[i] = sc
                 valid_mols.append(mol)
                 valid_scores.append(sc)
+                valid_tok_lens.append(int(tok_lens[i]))
+                valid_char_lens.append(int(char_lens[i]))
             else:
                 scores[i] = 0.0
 
         total_valid = int(sum(valid_flags))
-
         avg_score = float(sum(scores) / num_samples)
         filtered_score = float(sum(valid_scores) / total_valid) if total_valid else 0.0
 
@@ -334,13 +450,12 @@ class RDKitValidator(SentenceValidator):
             mean_sim = self._mean_pairwise_tanimoto(fps)
             fp_div_internal_valid = 1.0 - float(mean_sim)
 
-            # top-k diversity (by score) within valid set
             k = min(self.topk_diversity, total_valid)
             if k >= 2:
                 top_idx = sorted(range(total_valid), key=lambda j: valid_scores[j], reverse=True)[
                     :k
                 ]
-                top_fps = [fps[j] for j in top_idx]  # reuse computed fps
+                top_fps = [fps[j] for j in top_idx]
                 top_mean_sim = self._mean_pairwise_tanimoto(top_fps)
                 fp_div_topk_valid = 1.0 - float(top_mean_sim)
             else:
@@ -349,21 +464,81 @@ class RDKitValidator(SentenceValidator):
             fp_div_internal_valid = 0.0
             fp_div_topk_valid = 0.0
 
-        return {
+        # ---- length scalars (token + char) ----
+        tok_stats = self._stats_1d(tok_lens)
+        vt_stats = self._stats_1d(valid_tok_lens)
+        char_stats = self._stats_1d(char_lens)
+        vchar_stats = self._stats_1d(valid_char_lens)
+
+        # optional: simple bins for quick dashboard bar-plots
+        bins = [(0, 2), (3, 5), (6, 8), (9, 10), (11, -1)]
+        tok_bins = self._len_bins(tok_lens, bins)
+        vt_bins = self._len_bins(valid_tok_lens, bins)
+
+        out: dict[str, Any] = {
             "acc": float(total_valid / num_samples),
             f"{self.scorer_name}": float(avg_score),
             f"{self.scorer_name}_filter": float(filtered_score),
             "fp_div_internal_valid": float(fp_div_internal_valid),
             "fp_div_topk_valid": float(fp_div_topk_valid),
+            # token length (all)
+            "len_tok_mean": tok_stats["mean"],
+            "len_tok_std": tok_stats["std"],
+            "len_tok_min": tok_stats["min"],
+            "len_tok_max": tok_stats["max"],
+            "len_tok_p50": tok_stats["p50"],
+            "len_tok_p90": tok_stats["p90"],
+            "len_tok_p95": tok_stats["p95"],
+            "len_tok_p99": tok_stats["p99"],
+            "len_tok_eos_rate": float(eos_rate),
+            # token length (valid-only)
+            "len_tok_valid_mean": vt_stats["mean"],
+            "len_tok_valid_std": vt_stats["std"],
+            "len_tok_valid_min": vt_stats["min"],
+            "len_tok_valid_max": vt_stats["max"],
+            "len_tok_valid_p50": vt_stats["p50"],
+            "len_tok_valid_p90": vt_stats["p90"],
+            "len_tok_valid_p95": vt_stats["p95"],
+            "len_tok_valid_p99": vt_stats["p99"],
+            # char length (SMILES string length after scaffold merge)
+            "len_char_mean": char_stats["mean"],
+            "len_char_valid_mean": vchar_stats["mean"],
         }
+
+        # add bin fractions (all + valid-only)
+        def _bin_suffix(bin_key: Any) -> str:
+            if isinstance(bin_key, tuple) and len(bin_key) == 2:
+                return f"{bin_key[0]}_{bin_key[1]}"
+            if isinstance(bin_key, str) and bin_key.startswith("bin_"):
+                return bin_key[4:]
+            return str(bin_key)
+
+        for bin_key, frac in tok_bins.items():
+            suffix = _bin_suffix(bin_key)
+            out[f"len_tok_{suffix}_frac"] = float(frac)
+        for bin_key, frac in vt_bins.items():
+            suffix = _bin_suffix(bin_key)
+            out[f"len_tok_valid_{suffix}_frac"] = float(frac)
+
+        # optional raw lists for wandb histograms
+        if return_hist:
+            out["len_tok_hist"] = tok_lens
+            out["len_tok_valid_hist"] = valid_tok_lens
+            out["len_char_hist"] = char_lens
+            out["len_char_valid_hist"] = valid_char_lens
+            out["score_hist"] = scores
+
+        return out
 
     def accuracy(
         self,
         sentences: Tensor,
         tokenizer: PreTrainedTokenizer,
         scaffold: str | None = None,
+        *,
+        return_hist: bool = False,
     ) -> dict[str, float]:
-        return self.smiles_accuracy(sentences, tokenizer, scaffold)
+        return self.smiles_accuracy(sentences, tokenizer, scaffold, return_hist=return_hist)
 
     def __call__(
         self,

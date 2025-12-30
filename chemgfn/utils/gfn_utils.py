@@ -116,6 +116,40 @@ def calculate_diversity(token_id_list):
     return total_entropy / seq_len
 
 
+def calculate_diversity_by_length(token_id_list, eos_id: int) -> dict[int, float]:
+    """Calculate diversity grouped by length (before EOS).
+
+    Args:
+        token_id_list: Tensor or list of token ID sequences.
+        eos_id: Token ID that marks termination.
+
+    Returns:
+        Dict mapping length -> diversity for that length bucket.
+    """
+    if isinstance(token_id_list, torch.Tensor):
+        seqs = token_id_list.tolist()
+    else:
+        seqs = [list(seq) for seq in token_id_list]
+
+    groups: dict[int, list[list[int]]] = {}
+    for seq in seqs:
+        try:
+            eos_pos = seq.index(eos_id)
+        except ValueError:
+            eos_pos = len(seq)
+        length = int(eos_pos)
+        groups.setdefault(length, []).append(seq[:length])
+
+    out: dict[int, float] = {}
+    for length, group in groups.items():
+        if length <= 0 or len(group) <= 1:
+            out[length] = 0.0
+            continue
+        tensor = torch.tensor(group, dtype=torch.long)
+        out[length] = float(calculate_diversity(tensor))
+    return out
+
+
 def _stack_if_not_empty(entries):
     tensors = [entry for entry in entries if entry is not None]
     if not tensors:

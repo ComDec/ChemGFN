@@ -4,7 +4,7 @@ import hydra
 import rootutils
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
@@ -88,10 +88,14 @@ def main(cfg: DictConfig) -> None:
 
     :param cfg: DictConfig configuration composed by Hydra.
     """
+    # allow mutating the hydra config to append an eval suffix
+    with open_dict(cfg):
+        cfg.exp_name = f"{cfg.exp_name}_eval"
+        cfg.logger.wandb.project = "ChemGFN_eval"
+
     # apply extra utilities
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
-
     evaluate(cfg)
 
 
