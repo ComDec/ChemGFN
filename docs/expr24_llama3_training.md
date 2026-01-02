@@ -377,7 +377,7 @@ class Target_Score_Positive:
         ref_log_pf = reference_results["ref_log_pf"]
         ref_log_pterm = reference_results["ref_log_pterm"]
         validator_dict = self.sentence_validator(input_batch[:, prompt_length:], tokenizer, target_molecule) if self.sentence_validator else None
-        reward_penalized = validator_dict["valid_score"] if validator_dict is not None else reward_unpenalized
+        reward_penalized = validator_dict["local_score"] if validator_dict is not None else reward_unpenalized
         return {
             "reward": reward_penalized,
             "reward_unpenalized": reward_unpenalized,

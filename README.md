@@ -246,7 +246,7 @@ class CustomValidator(SentenceValidator):
         # Your validation logic
         return {
             "invalid": invalid_mask,
-            "valid_score": scores,
+            "local_score": scores,
         }
 
 # Use in configuration

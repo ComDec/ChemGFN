@@ -30,7 +30,6 @@ from transformers_cfg.recognizer import StringRecognizer
 
 from chemgfn.models.losses import GFNLoss
 from chemgfn.utils.gfn_utils import (
-    ReplayBuffer,
     base_to_lora,
     calculate_diversity_by_length,
     generate_and_return_termination_logprob,
@@ -43,6 +42,7 @@ from chemgfn.utils.prefix_metrics import (
     prefix_collapse_by_k,
     prefix_collapse_by_position,
 )
+from chemgfn.utils.replay_buffer import ReplayBuffer
 from chemgfn.utils.schedulers import Scheduler
 
 # Re-export Scheduler for backward compatibility with config files
@@ -117,7 +117,7 @@ class ChemGFNModule(LightningModule):
         self.get_dataset_buffer_at_step = self.factor_schedulers["dataset_buffer"]
         self.get_pf_temp_low_at_step = getattr(self.factor_schedulers, "pf_temp_low", None)
         self.get_pf_temp_high_at_step = getattr(self.factor_schedulers, "pf_temp_high", None)
-        self.get_prefix_len_at_step = getattr(self.factor_schedulers, "prefix_len", None)
+        self.get_prefix_len_at_step = getattr(self.factor_schedulers, "k_max", None)
         self.get_k_min_at_step = getattr(self.factor_schedulers, "k_min", None)
 
         self.buffer_mixture_ratio = training_mixed_config["buffer_mixture_ratio"]
@@ -2481,11 +2481,12 @@ class ChemGFNModule(LightningModule):
                 title_extra = "" if suffix == "" else " (correct-only)"
                 fig.suptitle(f"{tag} / prefix-by-position{title_extra} (epoch={epoch})")
                 fig.tight_layout()
+                fig.set_dpi(300)
 
                 key = f"{tag}/pos{suffix}_curves_img" if suffix else f"{tag}/pos_curves_img"
                 if suffix:
                     key = f"{tag}/pos_correct_curves_img"
-                payload[key] = wandb.Image(fig)
+                payload[key] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
             except Exception:
                 pass
@@ -2586,9 +2587,10 @@ class ChemGFNModule(LightningModule):
                 title_extra = "" if suffix == "" else " (correct-only)"
                 fig.suptitle(f"{tag} / prefix-by-k{title_extra} (epoch={epoch})")
                 fig.tight_layout()
+                fig.set_dpi(300)
 
                 key = f"{tag}/k_curves_img" if suffix == "" else f"{tag}/k_correct_curves_img"
-                payload[key] = wandb.Image(fig)
+                payload[key] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
             except Exception:
                 pass
@@ -2757,6 +2759,8 @@ class ChemGFNModule(LightningModule):
                 if x_rng is not None:
                     ax.set_xlim(x_rng[0], x_rng[1])
                 fig.tight_layout()
+                # set dpi to 300
+                fig.set_dpi(300)
                 return fig
             except Exception:
                 return None
@@ -2777,7 +2781,7 @@ class ChemGFNModule(LightningModule):
                 key_prefix="count_by_len",
             )
             if fig is not None:
-                payload[f"{tag}/count_by_len"] = wandb.Image(fig)
+                payload[f"{tag}/count_by_len"] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
 
             if score_counts:
@@ -2794,7 +2798,7 @@ class ChemGFNModule(LightningModule):
                     key_prefix="score_by_len",
                 )
                 if fig is not None:
-                    payload[f"{tag}/{scorer_name}_by_len"] = wandb.Image(fig)
+                    payload[f"{tag}/{scorer_name}_by_len"] = wandb.Image(fig, file_type="jpg")
                     plt.close(fig)
 
         if diversity_by_len:
@@ -2809,7 +2813,7 @@ class ChemGFNModule(LightningModule):
                 key_prefix="diversity_by_len",
             )
             if fig is not None:
-                payload[f"{tag}/diversity_by_len"] = wandb.Image(fig)
+                payload[f"{tag}/diversity_by_len"] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
 
         if log_pterm_sums and log_pterm_counts:
@@ -2829,7 +2833,7 @@ class ChemGFNModule(LightningModule):
                 key_prefix="log_pterm_by_len",
             )
             if fig is not None:
-                payload[f"{tag}/log_pterm_by_len"] = wandb.Image(fig)
+                payload[f"{tag}/log_pterm_by_len"] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
             pterm_vals = [float(np.exp(v)) for v in log_vals]
             fig = _plot_line(
@@ -2841,7 +2845,7 @@ class ChemGFNModule(LightningModule):
                 key_prefix="pterm_by_len",
             )
             if fig is not None:
-                payload[f"{tag}/pterm_by_len"] = wandb.Image(fig)
+                payload[f"{tag}/pterm_by_len"] = wandb.Image(fig, file_type="jpg")
                 plt.close(fig)
 
         payload = {k: v for k, v in payload.items() if v is not None}

@@ -125,7 +125,7 @@ class Expr24Validator(SentenceValidator):
             return {
                 "invalid": torch.zeros(1, 1),
                 "global_score": torch.zeros(1),
-                "valid_score": torch.zeros(1, 1),
+                "local_score": torch.zeros(1, 1),
                 "full_tokens": [],
             }
 
@@ -134,7 +134,7 @@ class Expr24Validator(SentenceValidator):
         device = sentences.device
 
         invalid = torch.ones(batch_size, seq_len + 1, device=device)
-        valid_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
         global_score = torch.zeros(batch_size, device=device)
         full_tokens_list: list[str] = []
 
@@ -151,19 +151,19 @@ class Expr24Validator(SentenceValidator):
                 continue
             score = self._eval_full_expr_to_01(final_expr)
 
-            valid_score[i, -1] = float(score)
+            local_score[i, -1] = float(score)
             global_score[i] = float(score)
             full_tokens_list.append(final_expr)
 
         if self.amortize_valid_state:
             # Vectorized: create mask for entries where global_score > 0
             mask = global_score > 0
-            valid_score[mask, 1:] = 1.0
+            local_score[mask, 1:] = 1.0
 
         return {
             "invalid": None,
             "global_score": global_score,  # 0 or 1
-            "valid_score": valid_score,  # placeholder for future shaping
+            "local_score": local_score,  # placeholder for future shaping
             "full_tokens": full_tokens_list,
         }
 
@@ -551,8 +551,8 @@ class RDKitValidator(SentenceValidator):
         device = sentences.device
 
         invalid = torch.ones(batch_size, seq_len + 1, device=device)
-        valid_score = torch.full((batch_size, seq_len + 1), 0.0, device=device)
-        valid_score[:, 0] = 0.0
+        local_score = torch.full((batch_size, seq_len + 1), 0.0, device=device)
+        local_score[:, 0] = 0.0
         global_score = torch.zeros(batch_size, device=device)
         full_tokens_list: list[str] = []
 
@@ -578,7 +578,7 @@ class RDKitValidator(SentenceValidator):
                 if self._is_valid_smiles(candidate):
                     mol = Chem.MolFromSmiles(candidate)
                     if mol:
-                        valid_score[b, pos + 1] = float(self.score_function(mol))
+                        local_score[b, pos + 1] = float(self.score_function(mol))
                         invalid[b, pos + 1] = 0.0
                     else:
                         invalid[b, pos + 1] = 1.0
@@ -598,7 +598,7 @@ class RDKitValidator(SentenceValidator):
         return {
             "invalid": invalid,
             "global_score": global_score,
-            "valid_score": valid_score,
+            "local_score": local_score,
             "full_tokens": full_tokens_list,
         }
 

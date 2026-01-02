@@ -163,8 +163,8 @@ configs/local/default.yaml
 *.slout
 *.slerr
 
-# Config template backups
+# temporary files
 configs/experiment/templates/*.backup.*
 notebooks/zinc15_250k.txt
 notebooks/ppo_expr24_eval.csv
-chemgfn/models/gfn.py
+evaluation/*.json

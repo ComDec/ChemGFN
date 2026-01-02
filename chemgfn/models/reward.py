@@ -335,11 +335,11 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"]
+            local_score = validator_dict["local_score"]
             reward_mixed = (
                 reference_logP
-                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
-                + scaling_factor * valid_score
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * local_score
+                + scaling_factor * local_score
             )
 
             reward_penalized = reward_mixed
@@ -624,16 +624,16 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping:
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"].to(
+            local_score = validator_dict["local_score"].to(
                 reference_logP.dtype
             )  # (B,T), 000..1 or 000..0
 
-            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
+            y = local_score[:, -1].clamp(0.0, 1.0)  # (B,)
 
             reward_mixed = (
                 reference_logP
-                + (-1) * (reference_logP[..., -1]).unsqueeze(-1) * valid_score
-                + scaling_factor * valid_score
+                + (-1) * (reference_logP[..., -1]).unsqueeze(-1) * local_score
+                + scaling_factor * local_score
             )
 
             gen_tokens = input_batch[:, prompt_length:]
@@ -736,20 +736,20 @@ class Reference_Target_Score_Positive_Mixed_Prefix_Potential_Differential_Shapin
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
+            local_score = validator_dict["local_score"].to(reference_logP.dtype)
 
-            if valid_score.shape[1] == reference_logP.shape[1] - 1:
-                valid_score = torch.cat(
-                    [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
+            if local_score.shape[1] == reference_logP.shape[1] - 1:
+                local_score = torch.cat(
+                    [local_score.new_zeros(local_score.shape[0], 1), local_score], dim=1
                 )
-            assert valid_score.shape == reference_logP.shape
+            assert local_score.shape == reference_logP.shape
 
-            y = valid_score[:, -1].clamp(0.0, 1.0)
+            y = local_score[:, -1].clamp(0.0, 1.0)
 
             reward_mixed = (
                 reference_logP
-                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
-                + float(scaling_factor) * valid_score
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * local_score
+                + float(scaling_factor) * local_score
             )
 
             B, L_state = reward_mixed.shape
@@ -931,22 +931,22 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
+            local_score = validator_dict["local_score"].to(reference_logP.dtype)
 
-            if valid_score.shape[1] == reference_logP.shape[1] - 1:
-                valid_score = torch.cat(
-                    [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
+            if local_score.shape[1] == reference_logP.shape[1] - 1:
+                local_score = torch.cat(
+                    [local_score.new_zeros(local_score.shape[0], 1), local_score], dim=1
                 )
             assert (
-                valid_score.shape == reference_logP.shape
-            ), f"valid_score shape {valid_score.shape} vs reference_logP {reference_logP.shape}"
+                local_score.shape == reference_logP.shape
+            ), f"local_score shape {local_score.shape} vs reference_logP {reference_logP.shape}"
 
-            y = valid_score[:, -1].clamp(0.0, 1.0)  # (B,)
+            y = local_score[:, -1].clamp(0.0, 1.0)  # (B,)
 
             reward_mixed = (
                 reference_logP
-                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
-                + float(scaling_factor) * valid_score
+                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * local_score
+                + float(scaling_factor) * local_score
             )
 
             B, L_state = reward_mixed.shape
@@ -1186,19 +1186,19 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         self,
         *,
         reference_logP: Tensor,  # (B, L_state)
-        valid_score: Tensor,  # (B, L_state)
+        local_score: Tensor,  # (B, L_state)
         scaling_factor: float,
         **kwargs,
     ) -> tuple[Tensor, Tensor]:
         """
-        reward = reference_logP + |reference_logP_last| * valid_score + scaling_factor * valid_score
+        reward = reference_logP + |reference_logP_last| * local_score + scaling_factor * local_score
         """
-        y = valid_score[:, -1].clamp(0.0, 1.0)
+        y = local_score[:, -1].clamp(0.0, 1.0)
 
         reward_mixed = (
             reference_logP
-            + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * valid_score
-            + float(scaling_factor) * valid_score
+            + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * local_score
+            + float(scaling_factor) * local_score
         )
         return reward_mixed, y
 
@@ -1206,7 +1206,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         self,
         *,
         reference_logP: Tensor,  # (B, L_state)
-        valid_score: Tensor,  # (B, L_state) prefix score, invalid -> -1 (or any sentinel)
+        local_score: Tensor,  # (B, L_state) prefix score, invalid -> -1 (or any sentinel)
         scaling_factor: float,  # beta
         gen_tokens: Tensor,  # (B, T_tok) prompt后 tokens（用于 eos 判定）
         eos: int,  # eos token id
@@ -1227,10 +1227,10 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
             B,
             T_tok,
         ), f"active_before {active_before.shape} vs (B,T)={(B,T_tok)}"
-        assert valid_score.shape == (
+        assert local_score.shape == (
             B,
             T_tok + 1,
-        ), f"valid_score {valid_score.shape} vs (B,L)={(B, T_tok+1)}"
+        ), f"local_score {local_score.shape} vs (B,L)={(B, T_tok+1)}"
 
         # -------------------------
         # 1) L_term: #non-eos tokens before termination (first EOS semantics)
@@ -1240,7 +1240,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         L_term = len_mask.sum(dim=1).to(torch.long)  # (B,) in [0, T_tok]
 
         # y: score at termination-length state (NO clip)
-        y = valid_score.gather(1, L_term.view(B, 1)).squeeze(1).to(dtype)  # (B,)
+        y = local_score.gather(1, L_term.view(B, 1)).squeeze(1).to(dtype)  # (B,)
 
         # -------------------------
         # 2) active_state: reachable state mask (B, L_state)
@@ -1261,7 +1261,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
         # -------------------------
         # 4) score_state: per-state score, absorbing after tau_state
         # -------------------------
-        score_state = valid_score.to(dtype)  # (B, L_state)
+        score_state = local_score.to(dtype)  # (B, L_state)
 
         pos = torch.arange(L_state, device=device).view(1, L_state)  # (1, L_state)
         fill_after_tau = pos >= tau_state.view(B, 1)  # (B, L_state)
@@ -1336,16 +1336,16 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"].to(reference_logP.dtype)
+            local_score = validator_dict["local_score"].to(reference_logP.dtype)
 
             # align to (B, L_state)
-            if valid_score.shape[1] == reference_logP.shape[1] - 1:
-                valid_score = torch.cat(
-                    [valid_score.new_zeros(valid_score.shape[0], 1), valid_score], dim=1
+            if local_score.shape[1] == reference_logP.shape[1] - 1:
+                local_score = torch.cat(
+                    [local_score.new_zeros(local_score.shape[0], 1), local_score], dim=1
                 )
             assert (
-                valid_score.shape == reference_logP.shape
-            ), f"valid_score {valid_score.shape} vs reference_logP {reference_logP.shape}"
+                local_score.shape == reference_logP.shape
+            ), f"local_score {local_score.shape} vs reference_logP {reference_logP.shape}"
 
             # tokens / masks
             B, L_state = reference_logP.shape
@@ -1357,7 +1357,7 @@ class Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff:
             mixer = self._reward_mixers[self.reward_strategy]
             reward_mixed, y = mixer(
                 reference_logP=reference_logP,
-                valid_score=valid_score,
+                local_score=local_score,
                 scaling_factor=float(scaling_factor),
                 active_before=active_before,
                 validator_dict=validator_dict,
@@ -1547,13 +1547,13 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping_TestInval
             validator_dict = self.sentence_validator(
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
-            valid_score = validator_dict["valid_score"].to(
+            local_score = validator_dict["local_score"].to(
                 reference_logP.dtype
             )  # (B,T), 000..1 or 000..0
 
-            y = valid_score[:, -1]  # (B,)
+            y = local_score[:, -1]  # (B,)
 
-            reward_mixed = reference_logP + (-50) * (1 - valid_score)
+            reward_mixed = reference_logP + (-50) * (1 - local_score)
 
             # sentences = input_batch[:, prompt_length:]
             # non_term_mask = (input_batch != tokenizer.eos_token_id)[:, prompt_length:]

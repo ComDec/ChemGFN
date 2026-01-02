@@ -10,5 +10,5 @@ python eval.py experiment="SMILES_cfg_RapTB_v2" +trainer.limit_test_batches=100 
 python eval.py experiment="SMILES_cfg_RapTB_v2_weight_50" +trainer.limit_test_batches=100 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/smiles_RapTB_v2_weight_50/train/runs/2025-12-29_14-59-19/checkpoints/last.ckpt"
 
 # baseline
-python eval.py experiment="SMILES_cfg_TB" +trainer.limit_test_batches=100 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/smiles_CFG_TB/train/runs/2025-12-26_11-55-56/checkpoints/last.ckpt"
+python eval.py experiment="SMILES_cfg_TB" +trainer.limit_test_batches=100 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/smiles_CFG_TB/train/runs/2025-12-31_05-22-27/checkpoints/epoch_009.ckpt"
 python eval.py experiment="SMILES_cfg_no_TB" +trainer.limit_test_batches=100 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/smiles_CFG_TB_no_CFG/train/runs/2025-12-27_22-42-15/checkpoints/last.ckpt"

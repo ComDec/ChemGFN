@@ -475,7 +475,7 @@ class TestReferenceTargetScorePositiveMixedInvalidMask:
         mock_validator = Mock()
         mock_validator.return_value = {
             "invalid": torch.zeros(4, 7, dtype=torch.bool),
-            "valid_score": torch.ones(4, 7),
+            "local_score": torch.ones(4, 7),
         }
 
         reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
@@ -505,7 +505,7 @@ class TestReferenceTargetScorePositiveMixedInvalidMask:
         mock_validator = Mock()
         mock_validator.return_value = {
             "invalid": torch.zeros(4, 7, dtype=torch.bool),
-            "valid_score": torch.ones(4, 7),
+            "local_score": torch.ones(4, 7),
         }
 
         reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(

@@ -403,7 +403,7 @@ class TestReplayBuffer:
         # Mock result_dict
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -428,7 +428,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -456,7 +456,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -485,7 +485,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
