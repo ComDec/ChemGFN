@@ -1,0 +1,176 @@
+# @package _global_
+
+# Debug experiment for 24-points task
+# Run with: python chemgfn/train.py experiment=debug_expr24
+
+defaults:
+  - override /data: expr24
+  - override /model: llama3_expr24
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["ChemGFN", "expr24", "CFG", "TB"]
+
+# add CFG, add valid score to reward, we always need a reward to guide the generation
+exp_name: "Expr24_CFG_RapTB_kmin_3_subM"
+seed: 42
+
+# ============================================================================
+# Trainer Configuration
+# ============================================================================
+trainer:
+  max_steps: 5000
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 4
+  default_root_dir: ${paths.output_dir}
+  precision: bf16-true
+  devices: 1
+  num_sanity_val_steps: 0
+  limit_train_batches: 30
+  limit_val_batches: 5
+
+# ============================================================================
+# Model Overrides (only parameters that differ from base config)
+# ============================================================================
+model:
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0001
+
+  reward:
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
+    invalid_start_ratio: 0.2
+    invalid_end_ratio: 1.2
+    disable_peft: ${model.disable_peft}
+    illegal_vocab_penalty: 0
+    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+    phi_weight: 0
+    score_function: "score_fast"
+    sentence_validator:
+      _target_: chemgfn.models.validators.Expr24Validator
+      amortize_valid_state: false
+
+  loss_fn:
+    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    subtb_lambda: 1.0
+    aux_weight: 0.25
+    gamma: 0.99
+    detach_pterm_in_aux: true
+    eps: 1e-8
+    extra_absorb_eps: 1e-6
+    target_mode: "future_max"
+    k_min: 3
+    # mix mode params
+    mix_weight: 0.5
+    soft_beta: 5.0
+    soft_rho: 0.1
+
+  reward_buffer:
+    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    buffer_size: 200
+    weight_div: 1.0
+    weight_val: 1.0
+    weight_rew: 1.0
+    default_strategy: "standard"
+    validator_key: "local_score"
+    validator_type: "last"
+
+    stochastic_epsilon: 0.1
+    ltlg_epsilon: 0.1
+
+    set_function_obj:
+      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
+    similarity_backend:
+      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+
+    # length-collapse mitigation knobs
+    length_bin_size: 10
+    length_alpha_power: 1.0
+    weight_len: 0
+
+  constraint_config:
+    min_sentence_len: 7
+    max_sentence_len: 7
+    grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
+    disable_grammar: false
+    processor_type: "prefix"
+    legal_tokens: ${paths.assets_dir}/token_list/24_points/general
+    illegal_vocab_penalty: -50
+    parse_mode: "limited"
+
+  training_mixed_config:
+    subtb_lambda: 1.0
+    pf_temp_high: 1.0
+    pf_temp_low: 1.0
+    pf_temp_prob: 0.666
+    n_samples: 32
+    buffer_mixture_ratio: 0.7
+    skip_baseline_sampling: true
+    opt_task: false
+    grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
+
+  factor_schedulers:
+    reward_temp:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1
+      end: 1
+      horizon: 5000
+    replay_buffer:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.50
+      end: 0.25
+      horizon: 5000
+    dataset_buffer:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.75
+      end: 0.25
+      horizon: 2500
+    reference_logits_scale:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1
+      end: 1.0
+      horizon: 5000
+    pf_temp_low:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0.8
+      end: 1.0
+      horizon: 5000
+    pf_temp_high:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 1.5
+      end: 1.0
+      horizon: 5000
+    scaling_factor:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 50
+      end: 50
+      horizon: 1000
+    k_min:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 3
+      end: 3
+      horizon: 500
+
+  disable_peft: false
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  num_workers: 0
+# ============================================================================
+# Logger Configuration
+# ============================================================================
+logger:
+  wandb:
+    project: "ChemGFN"
+    offline: false
