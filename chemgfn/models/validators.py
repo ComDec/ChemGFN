@@ -64,15 +64,23 @@ class SentenceValidator(ValidatorBase):
 
 class Expr24Validator(SentenceValidator):
     """
-    24-points validator (CFG-guaranteed valid prefixes).
-    Format: d op d op d op d, where d in {0..9}, op in {+,-,*,/}, no parentheses.
-    Evaluation: standard precedence (*/ before +-). Equals 24 -> 1, else 0.
+    24-points validator.
+    Supports variable-length expressions without parentheses, with digits and +-*/,
+    evaluated using standard precedence. Scoring modes:
+      - hit24        : 1.0 if expression == 24 else 0.0
+      - near_24      : 1.0 at 24, linearly decays with distance from 24 to 0.0
+      - hit24_dense  : hit24 but local_score filled for every valid prefix
+      - near_24_dense: near_24 but local_score filled for every valid prefix
     """
 
-    TOKEN_RE = re.compile(r"[0-9]|[+\-*/]")
+    TOKEN_RE = re.compile(r"\d+|[+\-*/]")
 
     def __init__(self, scorer: str = "hit24", amortize_valid_state: bool = False) -> None:
+        if scorer not in {"hit24", "near_24", "hit24_dense", "near_24_dense"}:
+            raise ValueError(f"Unsupported scorer for Expr24Validator: {scorer}")
+
         super().__init__(scorer)
+        self.scorer = scorer
 
         # Whether to amortize the valid state of the expression to the entire batch
         self.amortize_valid_state = amortize_valid_state
@@ -96,13 +104,14 @@ class Expr24Validator(SentenceValidator):
         if total == 0:
             return {"acc": 0.0}
 
-        hits = 0
+        score_sum = 0.0
         for sample in generated_tokens:
             expr = self._decode_expr(sample, tokenizer)
             if expr is None:
                 continue
-            hits += self._eval_full_expr_to_01(expr)
-        return {"acc": hits / total}
+            _, score = self._score_expression(expr)
+            score_sum += score
+        return {"acc": score_sum / total}
 
     def accuracy(
         self,
@@ -140,73 +149,128 @@ class Expr24Validator(SentenceValidator):
 
         invalid[:, 0] = 1.0  # empty prefix
 
+        dense_mode = self.scorer in {"hit24_dense", "near_24_dense"}
+
         for i in range(batch_size):
+            # determine actual length up to EOS (excluded)
+            stop_pos = seq_len
             for pos in range(seq_len):
                 if sentences[i, pos] == termination_token_id:
+                    stop_pos = pos
                     break
+
+            # prefix evaluation for invalid/local scores
+            for pos in range(stop_pos):
+                prefix_expr = _decode_tokens_to_string(sentences[i, : pos + 1], tokenizer)
+                is_valid_prefix, prefix_score = self._score_expression(prefix_expr)
+                invalid[i, pos + 1] = 0.0 if is_valid_prefix else 1.0
+                if dense_mode:
+                    local_score[i, pos + 1] = float(prefix_score)
 
             final_expr = self._decode_expr(sentences[i], tokenizer)
             if final_expr is None:
                 full_tokens_list.append("")
                 continue
-            score = self._eval_full_expr_to_01(final_expr)
+            is_valid, score = self._score_expression(final_expr)
 
-            local_score[i, -1] = float(score)
+            # populate final position (last observed prefix or full length)
+            last_pos = stop_pos if stop_pos < seq_len else seq_len
+            if last_pos >= 1:
+                local_score[i, last_pos] = float(score)
+                invalid[i, last_pos] = 0.0 if is_valid else 1.0
+
             global_score[i] = float(score)
+            invalid[i, -1] = 0.0 if is_valid else 1.0
             full_tokens_list.append(final_expr)
 
         if self.amortize_valid_state:
             # Vectorized: create mask for entries where global_score > 0
             mask = global_score > 0
-            local_score[mask, 1:] = 1.0
+            local_score[mask, 1:] = global_score[mask].unsqueeze(1)
+            invalid[mask, 1:] = 0.0
 
         return {
-            "invalid": None,
-            "global_score": global_score,  # 0 or 1
+            "invalid": invalid,
+            "global_score": global_score,
             "local_score": local_score,  # placeholder for future shaping
             "full_tokens": full_tokens_list,
         }
 
-    def _eval_full_expr_to_01(self, s: str) -> int:
-        s = s.replace("\u00d7", "*").replace("\u00f7", "/")
-        s = "".join(s.split())
-        toks = self.TOKEN_RE.findall(s)
-        if "".join(toks) != s or len(toks) != 7:
-            return 0
-        for k, tk in enumerate(toks):
-            if k % 2 == 0:
-                if not (len(tk) == 1 and tk.isdigit()):
-                    return 0
+    def _tokenize_expr(self, expr: str) -> list[str] | None:
+        normalized = expr.replace("\u00d7", "*").replace("\u00f7", "/").replace(" ", "")
+        if not normalized:
+            return None
+        tokens = self.TOKEN_RE.findall(normalized)
+        if "".join(tokens) != normalized:
+            return None
+        return tokens
+
+    def _parse_and_eval(self, tokens: list[str]) -> Fraction | None:
+        if len(tokens) == 0 or len(tokens) % 2 == 0:
+            return None
+
+        # Validate token alternation: number, (op, number)*
+        for idx, tk in enumerate(tokens):
+            if idx % 2 == 0:
+                if not tk.isdigit():
+                    return None
             else:
                 if tk not in "+-*/":
-                    return 0
-
-        nums = [Fraction(int(toks[i])) for i in (0, 2, 4, 6)]
-        ops = [toks[i] for i in (1, 3, 5)]
+                    return None
 
         try:
-            v = nums[:]
-            o = ops[:]
-            i = 0
-            while i < len(o):
-                if o[i] in "*/":
-                    a, b = v[i], v[i + 1]
-                    if o[i] == "*":
-                        res = a * b
-                    else:
-                        if b == 0:
-                            return 0
-                        res = a / b
-                    v[i : i + 2] = [res]
-                    o.pop(i)
-                else:
-                    i += 1
-            acc = v[0]
-            for op, b in zip(o, v[1:]):
-                acc = acc + b if op == "+" else acc - b
-            return 1 if acc == 24 else 0
+            values: list[Fraction] = [Fraction(int(tokens[0]))]
         except Exception:
-            return 0
+            return None
+
+        pending_ops: list[str] = []
+        try:
+            for idx in range(1, len(tokens), 2):
+                op = tokens[idx]
+                nxt = Fraction(int(tokens[idx + 1]))
+
+                if op in "*/":
+                    prev = values.pop()
+                    if op == "*":
+                        values.append(prev * nxt)
+                    else:
+                        if nxt == 0:
+                            return None
+                        values.append(prev / nxt)
+                else:
+                    values.append(nxt)
+                    pending_ops.append(op)
+        except Exception:
+            return None
+
+        try:
+            result = values[0]
+            for op, val in zip(pending_ops, values[1:]):
+                result = result + val if op == "+" else result - val
+            return result
+        except Exception:
+            return None
+
+    def _score_value(self, value: Fraction) -> float:
+        base_scorer = self.scorer.replace("_dense", "")
+        if base_scorer == "hit24":
+            return 1.0 if value == 24 else 0.0
+        if base_scorer == "near_24":
+            diff = abs(value - 24)
+            score = 1.0 - float(diff) / 24.0
+            return float(max(0.0, score))
+        raise ValueError(f"Unsupported scorer for Expr24Validator: {self.scorer}")
+
+    def _score_expression(self, expr: str) -> tuple[bool, float]:
+        tokens = self._tokenize_expr(expr)
+        if tokens is None:
+            return False, 0.0
+
+        value = self._parse_and_eval(tokens)
+        if value is None:
+            return False, 0.0
+
+        return True, self._score_value(value)
 
 
 class RDKitValidator(SentenceValidator):
