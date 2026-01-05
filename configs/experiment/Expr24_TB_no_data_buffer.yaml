@@ -9,17 +9,17 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "expr24"]
+tags: ["ChemGFN", "expr24", "CFG", "TB", "no_data_buffer"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "debug_expr24_SubTB_diff_mem_phi_1"
+exp_name: "Expr24_CFG_TB_no_data_buffer"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 60000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -28,7 +28,6 @@ trainer:
   num_sanity_val_steps: 0
   limit_train_batches: 30
   limit_val_batches: 5
-  log_every_n_steps: 1
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -40,45 +39,20 @@ model:
     lr: 0.0001
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShapingWithMemory
-
-    # config params
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
+    invalid_start_ratio: 0.2
+    invalid_end_ratio: 1.2
+    disable_peft: ${model.disable_peft}
     illegal_vocab_penalty: 0
-    grammar_disagree_penalty: -80 # for any baseline, we MUST set this to 0
-
-    # phi params
-    phi_weight: 1.0
-    phi_warmup: 20
-    phi_ramp_steps: 200
-    phi_decay_start: 1000
-    phi_decay_gamma: 0.999
-    dphi_clip: 2.0
-
-    # entropy gate
-    use_entropy_gate: true
-    ent_lo: 0.10
-    ent_hi: 0.55
-
-    # phi build params
-    phi_eta: 1.0
-    phi_clamp: 2.0
-    pv_memory_kwargs:
-      kmax: 4
-      alpha: 1.0
-      gamma: 0.999
-      min_count: 50.0
-      max_keys: 500000
-      prune_every: 2000
-      prune_threshold: 1.0
-      tau_conf: 20.0
-
+    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+    phi_weight: 0
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.ModifiedSubTBLoss
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
@@ -116,43 +90,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 5000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 50000
+      horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.75
-      end: 0.25
-      horizon: 25000
+      start: 0
+      end: 0
+      horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 10000
+      horizon: 1000
 
   disable_peft: false
 

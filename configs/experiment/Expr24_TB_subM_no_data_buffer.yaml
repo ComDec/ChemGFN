@@ -9,17 +9,17 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "expr24"]
+tags: ["ChemGFN", "expr24", "CFG", "TB", "subM", "no_data_buffer"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "debug_expr24_unified_space_TB"
+exp_name: "Expr24_CFG_TB_subM_replay_no_data_buffer"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 60000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -44,8 +44,8 @@ model:
     invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
     illegal_vocab_penalty: 0
-    grammar_disagree_penalty: -80 # for any baseline, we MUST set this to 0
-    phi_weight: 1.0
+    grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+    phi_weight: 0
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
@@ -57,11 +57,27 @@ model:
     eps: 1e-8
 
   reward_buffer:
-    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
     buffer_size: 200
-    sim_tolerance: 0.25
-    strict_mode: false
-    buffer_aug_value: 0
+    weight_div: 1.0
+    weight_val: 1.0
+    weight_rew: 1.0
+    default_strategy: "standard"
+    validator_key: "local_score"
+    validator_type: "last"
+
+    stochastic_epsilon: 0.1
+    ltlg_epsilon: 0.1
+
+    set_function_obj:
+      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
+    similarity_backend:
+      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+
+    # length-collapse mitigation knobs
+    length_bin_size: 10
+    length_alpha_power: 1.0
+    weight_len: 0
 
   constraint_config:
     min_sentence_len: 7
@@ -90,43 +106,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 5000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 50000
+      horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.75
-      end: 0.25
-      horizon: 25000
+      start: 0
+      end: 0
+      horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 10000
+      horizon: 100
 
   disable_peft: false
 
