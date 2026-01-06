@@ -64,23 +64,29 @@ class SentenceValidator(ValidatorBase):
 
 class Expr24Validator(SentenceValidator):
     """
-    24-points validator.
+    Target-sum validator (default target=24).
     Supports variable-length expressions without parentheses, with digits and +-*/,
     evaluated using standard precedence. Scoring modes:
-      - hit24        : 1.0 if expression == 24 else 0.0
-      - near_24      : 1.0 at 24, linearly decays with distance from 24 to 0.0
+      - hit24        : 1.0 if expression == target else 0.0
+      - near_24      : 1.0 at target, linearly decays with distance to 0.0
       - hit24_dense  : hit24 but local_score filled for every valid prefix
       - near_24_dense: near_24 but local_score filled for every valid prefix
     """
 
     TOKEN_RE = re.compile(r"\d+|[+\-*/]")
 
-    def __init__(self, scorer: str = "hit24", amortize_valid_state: bool = False) -> None:
+    def __init__(
+        self,
+        scorer: str = "hit24",
+        amortize_valid_state: bool = False,
+        target_value: int | float = 24,
+    ) -> None:
         if scorer not in {"hit24", "near_24", "hit24_dense", "near_24_dense"}:
             raise ValueError(f"Unsupported scorer for Expr24Validator: {scorer}")
 
         super().__init__(scorer)
         self.scorer = scorer
+        self.target_value = Fraction(target_value)
 
         # Whether to amortize the valid state of the expression to the entire batch
         self.amortize_valid_state = amortize_valid_state
@@ -109,7 +115,7 @@ class Expr24Validator(SentenceValidator):
             expr = self._decode_expr(sample, tokenizer)
             if expr is None:
                 continue
-            _, score = self._score_expression(expr)
+            _, score, _ = self._score_expression(expr)
             score_sum += score
         return {"acc": score_sum / total}
 
@@ -162,8 +168,9 @@ class Expr24Validator(SentenceValidator):
             # prefix evaluation for invalid/local scores
             for pos in range(stop_pos):
                 prefix_expr = _decode_tokens_to_string(sentences[i, : pos + 1], tokenizer)
-                is_valid_prefix, prefix_score = self._score_expression(prefix_expr)
-                invalid[i, pos + 1] = 0.0 if is_valid_prefix else 1.0
+                is_valid_prefix, prefix_score, prefix_value = self._score_expression(prefix_expr)
+                is_hit_target_prefix = is_valid_prefix and prefix_value == self.target_value
+                invalid[i, pos + 1] = 0.0 if is_hit_target_prefix else 1.0
                 if dense_mode:
                     local_score[i, pos + 1] = float(prefix_score)
 
@@ -171,16 +178,16 @@ class Expr24Validator(SentenceValidator):
             if final_expr is None:
                 full_tokens_list.append("")
                 continue
-            is_valid, score = self._score_expression(final_expr)
+            is_valid, score, value = self._score_expression(final_expr)
 
             # populate final position (last observed prefix or full length)
             last_pos = stop_pos if stop_pos < seq_len else seq_len
             if last_pos >= 1:
                 local_score[i, last_pos] = float(score)
-                invalid[i, last_pos] = 0.0 if is_valid else 1.0
+                invalid[i, last_pos] = 0.0 if (is_valid and value == self.target_value) else 1.0
 
             global_score[i] = float(score)
-            invalid[i, -1] = 0.0 if is_valid else 1.0
+            invalid[i, -1] = 0.0 if (is_valid and value == self.target_value) else 1.0
             full_tokens_list.append(final_expr)
 
         if self.amortize_valid_state:
@@ -253,24 +260,26 @@ class Expr24Validator(SentenceValidator):
 
     def _score_value(self, value: Fraction) -> float:
         base_scorer = self.scorer.replace("_dense", "")
+        target = self.target_value
         if base_scorer == "hit24":
-            return 1.0 if value == 24 else 0.0
+            return 1.0 if value == target else 0.0
         if base_scorer == "near_24":
-            diff = abs(value - 24)
-            score = 1.0 - float(diff) / 24.0
+            diff = abs(value - target)
+            denom = float(max(abs(target), 1))
+            score = 1.0 - float(diff) / denom
             return float(max(0.0, score))
         raise ValueError(f"Unsupported scorer for Expr24Validator: {self.scorer}")
 
-    def _score_expression(self, expr: str) -> tuple[bool, float]:
+    def _score_expression(self, expr: str) -> tuple[bool, float, Fraction | None]:
         tokens = self._tokenize_expr(expr)
         if tokens is None:
-            return False, 0.0
+            return False, 0.0, None
 
         value = self._parse_and_eval(tokens)
         if value is None:
-            return False, 0.0
+            return False, 0.0, None
 
-        return True, self._score_value(value)
+        return True, self._score_value(value), value
 
 
 class RDKitValidator(SentenceValidator):
