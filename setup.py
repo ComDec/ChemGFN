@@ -11,5 +11,9 @@ setup(
     url="https://github.com/user/project",
     install_requires=["lightning", "hydra-core"],
     packages=find_packages(),
-    # use this to customize global commands available in the terminal after installing the package
+    entry_points={
+        "console_scripts": [
+            "chemgfn-merge-logs=chemgfn.cli.merge_csv_groups:main",
+        ],
+    },
 )
