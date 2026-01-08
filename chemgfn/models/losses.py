@@ -1124,6 +1124,7 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
         soft_rho: float = 0.0,
         init_logZ: float = 0.0,
         k_min: int = 2,
+        k_window: int = 4,  # NEW: window size for AUX/absorb (fix kmin attractor)
         normalize_mix: bool = True,  # default ON (gradient-level normalization)
         absorb_requires_tau_ge_K: bool = True,  # default ON (hard gate to mitigate prefix collapse)
     ):
@@ -1141,6 +1142,7 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
         self.soft_rho = float(soft_rho)
 
         self.k_min = int(k_min)
+        self.k_window = int(k_window)
         self.normalize_mix = bool(normalize_mix)
         self.absorb_requires_tau_ge_K = bool(absorb_requires_tau_ge_K)
 
@@ -1212,8 +1214,7 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
     @staticmethod
     def _suffix_future_max(u: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         dtype = u.dtype
-        neg_inf = torch.finfo(dtype).min
-        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
+        u_mask = torch.where(valid, u, torch.full_like(u, 0))
         rev = torch.flip(u_mask, dims=[1])
         rev_max = torch.cummax(rev, dim=1).values
         return torch.flip(rev_max, dims=[1])
@@ -1224,23 +1225,46 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
     ) -> torch.Tensor:
         """
         Backward softmax over suffix with step penalty rho (distance discount).
-        Returns u_soft[t] = (1/beta) log sum_{j>=t} exp(beta*u[j] - beta*rho*(j-t))
+        Stable implementation under AMP/bf16:
+        u_soft[t] = (1/beta) log sum_{j>=t} exp(beta*u[j] - beta*rho*(j-t))
+
+        We compute in u-space recurrence:
+        W_t = (1/b) logaddexp(b*u_t, b*(W_{t+1}-rho))
+        where W_t == u_soft[t].
         """
+        if beta <= 0:
+            raise ValueError(f"beta must be > 0, got {beta}")
+
         B, L = u.shape
-        dtype = u.dtype
-        neg_inf = torch.finfo(dtype).min
-        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
-        out = torch.empty_like(u_mask)
+        device = u.device
+        out_dtype = u.dtype
 
-        b = float(beta)
-        step_pen = b * float(rho)
+        # IMPORTANT: do the recurrence in fp32 and disable autocast,
+        # otherwise (Z ~ beta*u ~ O(200)) makes rho step_pen vanish in bf16.
+        with torch.autocast(device_type="cuda", enabled=False):
+            u32 = u.float()
+            valid32 = valid  # bool
 
-        Z = b * u_mask[:, -1]  # [B]
-        out[:, -1] = Z / b
-        for t in range(L - 2, -1, -1):
-            Z = torch.logaddexp(b * u_mask[:, t], Z - step_pen)
-            out[:, t] = Z / b
-        return out
+            neg_inf = torch.finfo(torch.float32).min
+            u_mask = torch.where(valid32, u32, torch.full_like(u32, neg_inf))  # [B, L]
+            out = torch.empty_like(u_mask)  # fp32
+
+            b = float(beta)
+            r = float(rho)
+
+            # W is u_soft in u-space
+            W = u_mask[:, -1]  # [B]
+            out[:, -1] = W
+
+            for t in range(L - 2, -1, -1):
+                # W = (1/b) log( exp(b*u_t) + exp(b*(W_next - rho)) )
+                W = torch.logaddexp(b * u_mask[:, t], b * (W - r)) / b
+                out[:, t] = W
+
+            # optional: make invalid positions harmless (since some callers forget to mask)
+            out = torch.where(valid32, out, torch.zeros_like(out))
+
+        return out.to(out_dtype)
 
     # ----------------- forward -----------------
 
@@ -1337,15 +1361,37 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
             # base eligibility: before EOS and within horizon
             m_base_bool = within_tau & within_h & valid_end  # [B, L-1] bool
 
-            # v2: skip k<kmin entirely
+            # ---- original: m_base_bool is [B, L-1] bool; k_idx is [1, L-1] with values 1..L-1 ----
             after_kmin = k_idx >= kmin  # [1, L-1] bool
-            m_bool = m_base_bool & after_kmin  # [B, L-1] bool
+
+            # ---- NEW: windowed AUX to avoid "k=2 attractor" when kmin gets small ----
+            W = max(
+                1, int(getattr(self, "k_window", 4))
+            )  # set self.k_window=4 in __init__ (or keep getattr)
+
+            if W > 1:
+                # per-sample window start k0 ∈ [kmin, max_start], ensuring room for W steps
+                max_start = (h - (W - 1)).clamp(min=kmin)  # [B]
+                # sample k0 per sample (breaks fixed constraint at k=kmin)
+                # NOTE: randomness is per batch; good enough for now
+                k1 = h  # [B]
+                k0 = kmin + torch.floor(
+                    torch.rand((B,), device=device, dtype=dtype)
+                    * (h - kmin + 1).clamp(min=1).to(dtype)
+                ).to(torch.long)
+                in_window = (k_idx >= k0.view(B, 1)) & (k_idx <= k1.view(B, 1))
+            else:
+                k0 = torch.full((B,), int(kmin), device=device, dtype=torch.long)  # [B]
+                k1 = h  # [B]
+                in_window = after_kmin.expand(B, -1)
+
+            # final AUX mask
+            m_bool = m_base_bool & in_window  # [B, L-1] bool
             m = m_bool.to(dtype)  # [B, L-1] float
 
-            # subTB weights
-            w = (self.subtb_lambda ** torch.arange(0, L - 1, device=device, dtype=dtype)).view(
-                1, -1
-            )
+            # delta weights: w_k = lambda^(k - k0)
+            w_exp = (k_idx - k0.view(B, 1)).clamp_min(0).to(dtype)  # [B, L-1]
+            w = (self.subtb_lambda**w_exp).to(dtype)  # [B, L-1]
 
             # u = log_r - ref_scale * ref_logP (or log_r)
             if (ref_log_pf is not None) and (ref_log_pterm is not None):
@@ -1395,14 +1441,16 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
             else:
                 raise ValueError(f"Unknown target_mode: {self.target_mode}")
 
-            u_tk = u_target[:, 1:]  # [B, L-1]
+            # mask out invalid future positions to avoid inf * 0 -> nan when apply_absorb==0
+            u_target = torch.where(valid_future, u_target, torch.zeros_like(u_target))
 
+            u_tk = u_target[:, 1:]  # [B, L-1]
             # alpha_k = gamma^(h-k)
             exp = (h.view(B, 1) - k_idx).clamp_min(0).to(dtype)
             alpha = (self.gamma**exp) * within_h.to(dtype)  # [B, L-1]
 
             apply_absorb = (
-                m_base_bool & after_kmin & before_absorb_horizon & can_absorb_seq & no_reward_at_k
+                m_base_bool & in_window & before_absorb_horizon & can_absorb_seq & no_reward_at_k
             )  # [B, L-1] bool
 
             alpha_eff = alpha * apply_absorb.to(dtype)
@@ -1423,14 +1471,12 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
             # eta_i: if no aux => 0
             eta = float(self.aux_weight)
             eta_i = eta * active_i.to(dtype)
-
             # ================== TB + eta*AUX, normalized (gradient-level) ==================
             if self.normalize_mix:
                 denom = (1.0 + eta_i).clamp_min(self.eps).detach()
                 loss_i = (loss_tb_i + eta_i * loss_aux_i) / denom
             else:
                 loss_i = loss_tb_i + eta_i * loss_aux_i
-
             loss = loss_i.mean()
         else:
             loss = loss_tb
