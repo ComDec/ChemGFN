@@ -1,4 +1,4 @@
 root  ::= expr4
-expr4 ::= num | num op num | num op num op num | num op num op num op num
+expr4 ::= num | num op num | num op num op num | num op num op num op num | num op num op num op num op num | num op num op num op num op num op num
 op    ::= "+" | "-" | "*" | "/"
 num   ::= [0-9]
