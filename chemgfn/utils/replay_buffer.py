@@ -518,13 +518,34 @@ class FacilityLengthSetFunction(SetFunction):
     """
 
     def _item_length(self, buf, cand) -> int:
-        # Prefer token_ids length if user later adds it into BufferItem (optional, backward compatible).
+        """
+        CRITICAL FIX:
+        Prefer "generated token length" if available (cand.gen_len),
+        then fallback to seq_len, then token_ids length, then smiles char length.
+
+        This avoids the classic bug: using len(smiles) as a proxy for model token length.
+        """
+        gen_len = getattr(cand, "gen_len", None)
+        if gen_len is not None:
+            try:
+                return int(gen_len)
+            except Exception:
+                pass
+
+        seq_len = getattr(cand, "seq_len", None)
+        if seq_len is not None:
+            try:
+                return int(seq_len)
+            except Exception:
+                pass
+
         tok = getattr(cand, "token_ids", None)
         if tok is not None:
             try:
                 return int(tok.numel()) if hasattr(tok, "numel") else int(len(tok))
             except Exception:
                 pass
+
         s = getattr(cand, "canonical_smiles", None) or getattr(cand, "smiles", "") or ""
         return int(len(s))
 
@@ -536,10 +557,10 @@ class FacilityLengthSetFunction(SetFunction):
         for c in candidates:
             c.max_sim = 0.0
 
-        # length bins
+        # length bins (bin_size is *size*, not number of bins)
         bin_size = max(1, int(getattr(buf, "length_bin_size", 10)))
         lengths = [self._item_length(buf, c) for c in candidates]
-        bin_idx = [min(10**9, (L // bin_size)) for L in lengths]
+        bin_idx = [min(10**9, (int(L) // bin_size)) for L in lengths]
         nbins = (max(bin_idx) + 1) if bin_idx else 1
 
         # alpha increases with bin (favor longer to fight short oversampling)
@@ -584,7 +605,6 @@ class FacilityLengthSetFunction(SetFunction):
         return float(g)
 
     def upper_bound(self, buf, cand, idx: int, state: dict) -> float:
-        # current gain is a valid upper bound (monotone submodular diminishing returns)
         return float(self.gain(buf, cand, idx, state))
 
     def on_select(
@@ -643,13 +663,6 @@ class ReplayBufferSubmodular:
     A replay buffer that maintains a subset of items maximizing a weighted submodular objective.
     Supports diversity (similarity coverage), validity, reward, and (NEW) length-collapse mitigation
     via a submodular length-bin coverage term.
-
-    Multiple greedy strategies:
-      - standard
-      - lazy
-      - stochastic (Mirzasoleiman et al. style per-iteration subset)
-      - lazier_than_lazy (kept as stochastic flavor here)
-      - random baseline
     """
 
     class BufferItem:
@@ -665,6 +678,9 @@ class ReplayBufferSubmodular:
             "max_sim",
             "last_eval",
             "selected",
+            # ---- LENGTH (CRITICAL FIX) ----
+            "seq_len",  # tokens before EOS (as stored)
+            "gen_len",  # generation length proxy (preferred for length SF)
         )
 
         def __init__(self, smiles: str, reward: float, weight_val: float, weight_rew: float):
@@ -694,6 +710,10 @@ class ReplayBufferSubmodular:
             self.max_sim = 0.0
             self.last_eval = 0
             self.selected = False
+
+            # default lengths (will be overwritten in add_batch)
+            self.seq_len = 0
+            self.gen_len = 0
 
         def __repr__(self):
             return f"BufferItem(smiles={self.canonical_smiles}, reward={self.reward:.4f}, valid={self.valid})"
@@ -729,7 +749,7 @@ class ReplayBufferSubmodular:
 
         # weight_len: strength of length-bin submodular coverage term
         self.weight_len = float(kwargs.get("weight_len", 0.0))
-        # length_bin_size: bin granularity (in char-len or token-len if you later add token_ids)
+        # length_bin_size: bin granularity (in token length; NOT number of bins)
         self.length_bin_size = int(kwargs.get("length_bin_size", 10))
         # length_alpha_power: >1 biases more toward longer bins
         self.length_alpha_power = float(kwargs.get("length_alpha_power", 1.0))
@@ -738,7 +758,7 @@ class ReplayBufferSubmodular:
         self._set_function_obj = set_function_obj
 
         if per_prompt:
-            self.buffer = {}
+            self.buffer: Dict[str, Dict[str, Any]] = {}
         else:
             self.buffer = {"items": [], "data": {}}
 
@@ -779,9 +799,7 @@ class ReplayBufferSubmodular:
         if isinstance(b, SimilarityBackend):
             return b
         if b is None:
-            # default: RDKit tanimoto
             return RDKITBulkTanimotoBackend()
-        # allow passing a callable factory
         if callable(b):
             out = b()
             if not isinstance(out, SimilarityBackend):
@@ -821,7 +839,10 @@ class ReplayBufferSubmodular:
             return self.buffer[prompt_key]
         return self.buffer
 
+    # =========================
     # main API
+    # =========================
+
     def add_batch(
         self,
         prompt,
@@ -846,7 +867,7 @@ class ReplayBufferSubmodular:
         sentences[(sentences == eos).cumsum(dim=-1) >= 1] = eos
 
         token_sentences = tokenizer.batch_decode(sentences, skip_special_tokens=True)
-        prompt_len = prompt.shape[1]
+        prompt_len = int(prompt.shape[1])
 
         valid_mask = None
         validator_scores = None
@@ -877,16 +898,34 @@ class ReplayBufferSubmodular:
             BufferItem = type(self).BufferItem
             bi = BufferItem(str_sentence, r_raw, self.weight_val, self.weight_rew)
 
+            # ---- CRITICAL FIX: compute token lengths once, store in BufferItem + sample_data ----
+            ts = sentences[i].detach().cpu()  # 1D
+            eos_pos = (ts == eos).nonzero(as_tuple=True)[0]
+            seq_len = int(eos_pos[0].item()) if eos_pos.numel() > 0 else int(ts.numel())
+
+            # robust gen_len: if prompt isn't actually included, fallback to seq_len
+            gen_len = seq_len - prompt_len
+            if gen_len <= 0:
+                gen_len = seq_len
+
+            bi.seq_len = int(seq_len)
+            bi.gen_len = int(gen_len)
+
             sample_data = {
                 "str_prompt": str_prompt,
                 "str_sentence": str_sentence,
-                "tensor_sentence": sentences[i].detach().cpu(),
-                "tensor_answer": sentences[i].detach().cpu(),
+                "tensor_sentence": ts,
+                "tensor_answer": ts,
                 "full_logrewards": logrewards[i].detach().cpu()
                 if hasattr(logrewards, "detach")
                 else logrewards[i],
                 "is_valid": is_valid,
                 "reward": r_raw,
+                # lengths for stat/debug
+                "prompt_len": int(prompt_len),
+                "seq_len": int(seq_len),
+                "gen_len": int(gen_len),
+                "smiles_len": int(len(getattr(bi, "canonical_smiles", "") or str_sentence)),
             }
             new_items.append((bi, sample_data))
 
@@ -920,6 +959,10 @@ class ReplayBufferSubmodular:
         )
         y = torch.nn.utils.rnn.pad_sequence(ans, batch_first=True, padding_value=0)
         return x, y
+
+    # =========================
+    # Update buffer logic (unchanged)
+    # =========================
 
     def _update_buffer_single(self, st: dict, new_items_list, strategy: str, epoch_end: bool):
         new_items = []
@@ -959,6 +1002,10 @@ class ReplayBufferSubmodular:
                     existing_item.static_score = (self.weight_rew * bi.reward) + (
                         self.weight_val if bi.valid else 0.0
                     )
+                    # also carry lengths
+                    existing_item.seq_len = getattr(bi, "seq_len", existing_item.seq_len)
+                    existing_item.gen_len = getattr(bi, "gen_len", existing_item.gen_len)
+
                     data_map[id(existing_item)] = new_data.get(
                         id(bi), data_map.get(id(existing_item), {})
                     )
@@ -985,6 +1032,7 @@ class ReplayBufferSubmodular:
         import time
 
         start_time = time.time()
+
         if strategy == "standard":
             selected_items = self._select_standard(candidates, self.buffer_size)
         elif strategy == "lazy":
@@ -1001,8 +1049,10 @@ class ReplayBufferSubmodular:
             selected_items = self._select_random(candidates, self.buffer_size)
         else:
             raise ValueError(
-                f"Unknown strategy: {strategy}. Choose from 'standard', 'lazy', 'stochastic', 'lazier_than_lazy', 'random'."
+                f"Unknown strategy: {strategy}. Choose from 'standard', 'lazy', 'stochastic', "
+                f"'lazier_than_lazy', 'random'."
             )
+
         end_time = time.time()
         print(f"Selection of {strategy} time: {end_time - start_time} seconds")
 
@@ -1010,6 +1060,7 @@ class ReplayBufferSubmodular:
         st["data"] = {id(it): data_map.get(id(it), {}) for it in selected_items}
 
     def _update_buffer_for_prompt(self, st: dict, new_items_list, strategy: str, epoch_end: bool):
+        # identical to single, just on st
         new_items = []
         new_data = {}
         for item in new_items_list:
@@ -1047,6 +1098,9 @@ class ReplayBufferSubmodular:
                     existing_item.static_score = (self.weight_rew * bi.reward) + (
                         self.weight_val if bi.valid else 0.0
                     )
+                    existing_item.seq_len = getattr(bi, "seq_len", existing_item.seq_len)
+                    existing_item.gen_len = getattr(bi, "gen_len", existing_item.gen_len)
+
                     data_map[id(existing_item)] = new_data.get(
                         id(bi), data_map.get(id(existing_item), {})
                     )
@@ -1086,14 +1140,15 @@ class ReplayBufferSubmodular:
             selected_items = self._select_random(candidates, self.buffer_size)
         else:
             raise ValueError(
-                f"Unknown strategy: {strategy}. Choose from 'standard', 'lazy', 'stochastic', 'lazier_than_lazy', 'random'."
+                f"Unknown strategy: {strategy}. Choose from 'standard', 'lazy', 'stochastic', "
+                f"'lazier_than_lazy', 'random'."
             )
 
         st["items"] = selected_items
         st["data"] = {id(it): data_map.get(id(it), {}) for it in selected_items}
 
     # =========================
-    # Selection Strategies (now fully generic)
+    # Selection Strategies (unchanged)
     # =========================
 
     def _select_standard(self, candidates: list, K: int, chunk_size: int = 4096) -> list:
@@ -1106,7 +1161,6 @@ class ReplayBufferSubmodular:
         sf = self._get_set_function()
         state = sf.begin(self, candidates)
 
-        # pool with O(1) removal
         pool = list(range(n))
         pos = list(range(n))
         selected = []
@@ -1239,7 +1293,6 @@ class ReplayBufferSubmodular:
     def _select_lazier_than_lazy(
         self, candidates: list, K: int, epsilon: float = 0.1, chunk_size: int = 4096
     ) -> list:
-        # Keep your semantics: per-iteration subset sampling + exact incremental update
         return self._select_stochastic(candidates, K, epsilon=epsilon, chunk_size=chunk_size)
 
     def _select_random(self, candidates: list, K: int) -> list:
@@ -1248,27 +1301,85 @@ class ReplayBufferSubmodular:
         return random.sample(candidates, min(K, len(candidates)))
 
     # =========================
-    # Stats / Print / CSV
+    # Stats / Print / CSV  (stat FIXED + length stats)
     # =========================
 
-    def stat(self):
+    def stat(self) -> dict:
+        """
+        Minimal, safe, O(buffer_size) stats.
+        Includes token length stats (gen_len/seq_len) for debugging length SF.
+        """
+
+        def _summ(items: list, data_map: dict) -> dict:
+            total = len(items)
+            if total == 0:
+                return {
+                    "total": 0,
+                    "valid_frac": 0.0,
+                    "gen_len_mean": 0.0,
+                    "seq_len_mean": 0.0,
+                }
+            valid = sum(1 for it in items if getattr(it, "valid", False))
+            gen_lens = []
+            seq_lens = []
+            for it in items:
+                d = data_map.get(id(it), {}) or {}
+                gl = d.get("gen_len", getattr(it, "gen_len", 0))
+                sl = d.get("seq_len", getattr(it, "seq_len", 0))
+                try:
+                    gen_lens.append(int(gl))
+                    seq_lens.append(int(sl))
+                except Exception:
+                    pass
+            gen_mean = float(sum(gen_lens) / len(gen_lens)) if gen_lens else 0.0
+            seq_mean = float(sum(seq_lens) / len(seq_lens)) if seq_lens else 0.0
+            return {
+                "total": total,
+                "valid_frac": float(valid) / float(total),
+                "gen_len_mean": gen_mean,
+                "seq_len_mean": seq_mean,
+            }
+
         if self.per_prompt:
             stats = {}
+            # per prompt
             for idx, (k, st) in enumerate(self.buffer.items()):
-                total = len(st["items"])
-                valid = sum(1 for it in st["items"] if it.valid)
+                items = list(st.get("items", []) or [])
+                data_map = st.get("data", {}) or {}
+                s = _summ(items, data_map)
                 stats.update(
                     {
-                        f"prompt_{idx}_total_buffer": total,
-                        f"prompt_{idx}_valid_frac": valid / total if total > 0 else 0.0,
+                        f"prompt_{idx}_total_buffer": s["total"],
+                        f"prompt_{idx}_valid_frac": s["valid_frac"],
+                        f"prompt_{idx}_gen_len_mean": s["gen_len_mean"],
+                        f"prompt_{idx}_seq_len_mean": s["seq_len_mean"],
                     }
                 )
+            # global aggregate
+            all_items = []
+            all_data = {}
+            for _, st in self.buffer.items():
+                all_items.extend(list(st.get("items", []) or []))
+                all_data.update(st.get("data", {}) or {})
+            s = _summ(all_items, all_data)
+            stats.update(
+                {
+                    "buffer_total": s["total"],
+                    "buffer_valid_frac": s["valid_frac"],
+                    "buffer_gen_len_mean": s["gen_len_mean"],
+                    "buffer_seq_len_mean": s["seq_len_mean"],
+                }
+            )
             return stats
-        total = len(self.buffer["items"])
-        valid = sum(1 for it in self.buffer["items"] if it.valid)
+
+        items = list(self.buffer.get("items", []) or [])
+        data_map = self.buffer.get("data", {}) or {}
+        s = _summ(items, data_map)
         return {
-            "buffer_total": total,
-            "buffer_valid_frac": valid / total if total > 0 else 0.0,
+            "buffer_total": s["total"],
+            "buffer_valid_frac": s["valid_frac"],
+            "buffer_gen_len_mean": s["gen_len_mean"],
+            "buffer_seq_len_mean": s["seq_len_mean"],
         }
 
     def print(self):
@@ -1313,6 +1424,8 @@ class ReplayBufferSubmodular:
             "max_sim",
             "smiles_len",
             "token_ids_len",
+            "seq_len",
+            "gen_len",
             "weight_rew",
             "weight_val",
             "weight_div",
@@ -1338,8 +1451,16 @@ class ReplayBufferSubmodular:
                         or ""
                     )
                     token_ids = getattr(it, "token_ids", None) or data.get("tensor_sentence")
-                    # remove eos
-                    token_ids = [x for x in token_ids if x != self.termination_token_id]
+                    if token_ids is None:
+                        token_ids = []
+                    # remove eos (safe for list/tensor)
+                    try:
+                        token_ids = [
+                            x for x in token_ids if int(x) != int(self.termination_token_id)
+                        ]
+                    except Exception:
+                        pass
+
                     smiles = getattr(it, "canonical_smiles", "") or ""
 
                     w.writerow(
@@ -1353,6 +1474,8 @@ class ReplayBufferSubmodular:
                             getattr(it, "max_sim", ""),
                             len(smiles),
                             _ids_len(token_ids),
+                            int(data.get("seq_len", getattr(it, "seq_len", 0))),
+                            int(data.get("gen_len", getattr(it, "gen_len", 0))),
                             float(getattr(self, "weight_rew", 0.0)),
                             float(getattr(self, "weight_val", 0.0)),
                             float(getattr(self, "weight_div", 0.0)),
