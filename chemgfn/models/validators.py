@@ -115,8 +115,10 @@ class Expr24Validator(SentenceValidator):
             expr = self._decode_expr(sample, tokenizer)
             if expr is None:
                 continue
-            _, score, _ = self._score_expression(expr)
-            score_sum += score
+            is_valid, _, value = self._score_expression(expr)
+            # Accuracy is a strict hit: expression must evaluate exactly to target.
+            if is_valid and value == self.target_value:
+                score_sum += 1.0
         return {"acc": score_sum / total}
 
     def accuracy(
