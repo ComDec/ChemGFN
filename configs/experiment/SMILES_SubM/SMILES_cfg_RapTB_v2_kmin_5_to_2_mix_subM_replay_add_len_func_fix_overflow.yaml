@@ -12,14 +12,14 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func_fix_overflow"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 10000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -159,43 +159,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 5000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 50000
+      horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.75
       end: 0.25
-      horizon: 25000
+      horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 50
-      end: 50
-      horizon: 10000
+      start: 5
+      end: 5
+      horizon: 1000
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"

@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "RapTB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_len_func_only"
 seed: 42
 
 # ============================================================================
@@ -110,9 +110,9 @@ model:
   reward_buffer:
     _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
     buffer_size: 200
-    weight_div: 1.0
-    weight_val: 1.0
-    weight_rew: 1.0
+    weight_div: 0.0
+    weight_val: 0.0
+    weight_rew: 0.0
     default_strategy: "standard"
     validator_key: "local_score"
     validator_type: "max"

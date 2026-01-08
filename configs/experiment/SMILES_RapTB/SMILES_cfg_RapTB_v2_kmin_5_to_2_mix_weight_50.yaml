@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_weight_50"
 seed: 42
 
 # ============================================================================
@@ -95,7 +95,7 @@ model:
   loss_fn:
     _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
-    aux_weight: 0.25
+    aux_weight: 0.50
     gamma: 0.99
     detach_pterm_in_aux: true
     eps: 1e-8
@@ -108,28 +108,11 @@ model:
     soft_rho: 0.1
 
   reward_buffer:
-    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
-    weight_div: 1.0
-    weight_val: 1.0
-    weight_rew: 1.0
-    default_strategy: "standard"
-    validator_key: "local_score"
-    validator_type: "max"
-
-    stochastic_epsilon: 0.1
-    ltlg_epsilon: 0.1
-
-    set_function_obj:
-      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
-    similarity_backend:
-      _target_: chemgfn.utils.replay_buffer.RDKITBulkTanimotoBackend
-
-    # length-collapse mitigation knobs
-    length_bin_size: 1
-    length_alpha_power: 1.0
-    length_alpha_mode: "uniform"
-    weight_len: 1.0
+    sim_tolerance: 0.25
+    strict_mode: false
+    buffer_aug_value: 0
 
   constraint_config:
     min_sentence_len: 1

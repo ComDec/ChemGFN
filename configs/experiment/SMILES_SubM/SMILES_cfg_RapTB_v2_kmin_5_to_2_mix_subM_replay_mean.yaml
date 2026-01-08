@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_scoreby_mean"
 seed: 42
 
 # ============================================================================
@@ -115,7 +115,7 @@ model:
     weight_rew: 1.0
     default_strategy: "standard"
     validator_key: "local_score"
-    validator_type: "max"
+    validator_type: "mean"
 
     stochastic_epsilon: 0.1
     ltlg_epsilon: 0.1
@@ -126,10 +126,9 @@ model:
       _target_: chemgfn.utils.replay_buffer.RDKITBulkTanimotoBackend
 
     # length-collapse mitigation knobs
-    length_bin_size: 1
+    length_bin_size: 10
     length_alpha_power: 1.0
-    length_alpha_mode: "uniform"
-    weight_len: 1.0
+    weight_len: 0
 
   constraint_config:
     min_sentence_len: 1

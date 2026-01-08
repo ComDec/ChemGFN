@@ -12,14 +12,14 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_RapTB_v3_kmin_5_to_2_window_4_mix_subM_add_len"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps: 10000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -93,7 +93,7 @@ model:
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv3
     subtb_lambda: 1.0
     aux_weight: 0.25
     gamma: 0.99
@@ -102,6 +102,7 @@ model:
     extra_absorb_eps: 1e-6
     target_mode: "mix"
     k_min: 2
+    k_window: 4
     # mix mode params
     mix_weight: 0.5
     soft_beta: 5.0
@@ -126,7 +127,7 @@ model:
       _target_: chemgfn.utils.replay_buffer.RDKITBulkTanimotoBackend
 
     # length-collapse mitigation knobs
-    length_bin_size: 1
+    length_bin_size: 2
     length_alpha_power: 1.0
     length_alpha_mode: "uniform"
     weight_len: 1.0
@@ -159,43 +160,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 5000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 50000
+      horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.75
       end: 0.25
-      horizon: 25000
+      horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 50000
+      horizon: 5000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 10000
+      horizon: 1000
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"

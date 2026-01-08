@@ -4,8 +4,10 @@ data_path: ${paths.data_dir}/24_points/prompts.txt
 train_size: 0.95
 num_workers: 0
 pin_memory: True
-total_size: 10000
+total_size: 1000
 prompt_size: 1
 n_samples: ${model.training_mixed_config.n_samples}
 allowed_vocab_path: ${model.constraint_config.legal_tokens}
 buffer_sample_path: ${paths.data_dir}/24_points/buffer_24_non_zero.pt
+add_prompt: False
+buffer_tokenization: False

@@ -109,8 +109,9 @@ model:
       _target_: chemgfn.utils.replay_buffer.RDKITBulkTanimotoBackend
 
     # length-collapse mitigation knobs
-    length_bin_size: 10
+    length_bin_size: 1
     length_alpha_power: 1.0
+    length_alpha_mode: "uniform"
     weight_len: 1.0
 
   constraint_config:

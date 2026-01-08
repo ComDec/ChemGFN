@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "smiles_opt", "CFG", "qed", "RapTB", "subM_replay"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_subM_replay_add_len_func"
+exp_name: "smiles_CFG_TB_subM_replay_len_func_only"
 seed: 42
 
 # ============================================================================
@@ -38,13 +38,6 @@ model:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 0.0001
-
-  ema_config:
-    enabled: false
-    decay: 0.999
-    ema_start_epoch: 10
-    reference_start_epoch: 20
-    reference_update_interval: 10
 
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
@@ -93,26 +86,16 @@ model:
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "mix"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
 
   reward_buffer:
     _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
     buffer_size: 200
-    weight_div: 1.0
-    weight_val: 1.0
-    weight_rew: 1.0
+    weight_div: 0.0
+    weight_val: 0.0
+    weight_rew: 0.0
     default_strategy: "standard"
     validator_key: "local_score"
     validator_type: "max"
@@ -196,12 +179,6 @@ model:
       start: 50
       end: 50
       horizon: 10000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 5
-      end: 2
-      horizon: 5000
 
   disable_peft: false
 
@@ -219,4 +196,4 @@ data:
 logger:
   wandb:
     project: "ChemGFN"
-    offline: False
+    offline: 0
