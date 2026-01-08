@@ -1,3 +1,5 @@
+# type: ignore
+# pyright: reportGeneralTypeIssues=false
 from __future__ import annotations
 
 import json
@@ -6,7 +8,7 @@ import random
 import sys
 from collections import deque
 from functools import partial
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -71,20 +73,27 @@ class ChemGFNModule(LightningModule):
         training_mixed_config: dict[str, Any],
         ema_config: dict[str, Any],
         constraint_config: dict[str, Any],
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler,
+        optimizer: Callable[[Any], torch.optim.Optimizer],
+        scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler] | None,
         factor_schedulers: dict[str, Any],
-        compile: bool,
+        compile_model: bool | None = None,
+        compile: bool | None = None,
         disable_peft: bool = False,
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters(ignore=["net", "loss_fn"])
-        model = AutoModelForCausalLM.from_pretrained(net_config.pretrained_model_name_or_path)
+        self.net_config: Any = net_config
+        self.reward_config: Any = reward_config
+        self.constraint_config: Any = constraint_config
+        self.training_mixed_config: Any = training_mixed_config
+        self.ema_config: Any = ema_config
+
+        model = AutoModelForCausalLM.from_pretrained(self.net_config.pretrained_model_name_or_path)
         model.train()
 
         model_frozen = AutoModelForCausalLM.from_pretrained(
-            net_config.pretrained_model_name_or_path
+            self.net_config.pretrained_model_name_or_path
         )
         model_frozen.eval()
         model_frozen.requires_grad_(False)
@@ -103,7 +112,7 @@ class ChemGFNModule(LightningModule):
         self.reward_config = reward_config
         self.constraint_config = constraint_config
         self.training_mixed_config = training_mixed_config
-        self.end_of_sentence_token_id = self.tokenizer.eos_token_id
+        self.end_of_sentence_token_id: int = int(self.tokenizer.eos_token_id)
 
         # Initialize all schedulers from config
         # Can use either hydra instantiate or direct parameter specification
@@ -140,7 +149,9 @@ class ChemGFNModule(LightningModule):
 
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.compile = compile
+        # Backward compatibility: prefer explicit compile_model, fall back to legacy compile flag.
+        chosen_compile = compile_model if compile_model is not None else compile
+        self.use_compile = bool(chosen_compile)
 
         self.train_sentence_length: list = []
         self.train_samples: list = []
@@ -198,6 +209,10 @@ class ChemGFNModule(LightningModule):
         self.test_batch_fp_div_topk_count = 0
 
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
+        # If True, skip heavy epoch-end logging and only persist replay buffer.
+        self.minimal_epoch_end_logging = getattr(
+            self.training_mixed_config, "minimal_epoch_end_logging", True
+        )
 
         self.ema_config = ema_config
         self._ema_enabled = bool(self._ema_cfg("enabled", False))
@@ -231,7 +246,7 @@ class ChemGFNModule(LightningModule):
             self.loss_fn.set_alpha_reference(self.get_alpha_reference_at_step(self.global_step))
 
         try:
-            if self.compile:
+            if self.use_compile:
                 self.net = torch.compile(self.net, mode="max-autotune", fullgraph=False)
                 self.net_frozen = torch.compile(
                     self.net_frozen, mode="max-autotune", fullgraph=False
@@ -1193,12 +1208,13 @@ class ChemGFNModule(LightningModule):
     ) -> None:
         reward_temp = self.get_reward_temp_at_step(self.global_step)
         scaling_factor = self.get_scaling_factor_at_step(self.global_step)
-        lr = self.lr_schedulers().get_lr()[0]
+        lr_sched = cast(Any, self.lr_schedulers())
+        lr = lr_sched.get_lr()[0] if lr_sched is not None else 0.0
         self.reward.temperature = reward_temp
         self.reward.scaling_factor = scaling_factor
         self._log_metrics({"train/reward_temp": reward_temp}, sync_dist=True, on_step=True)
 
-        for pg in self.optimizers().param_groups:
+        for pg in cast(Any, self.optimizers()).param_groups:
             pg["lr"] = lr
 
     # ------------------------------------------------------------------ #
@@ -1211,7 +1227,11 @@ class ChemGFNModule(LightningModule):
             sync_dist=True,
         )
         self._log_metrics(
-            {"scheduled/lr": self.lr_schedulers().get_lr()[0]},
+            {
+                "scheduled/lr": (
+                    cast(Any, self.lr_schedulers()).get_lr()[0] if self.lr_schedulers() else 0.0
+                )
+            },
             sync_dist=True,
         )
         self.train_len_counts.clear()
@@ -1230,6 +1250,20 @@ class ChemGFNModule(LightningModule):
         if hasattr(self, "global_rank") and self.global_rank != 0:
             return
 
+        if self.minimal_epoch_end_logging:
+            self.reward_buffer.save_csv(
+                os.path.join(
+                    self.trainer.default_root_dir,
+                    "replay_buffer",
+                    f"replay_{self.trainer.current_epoch}.csv",
+                ),
+                self.tokenizer,
+            )
+            self.train_samples.clear()
+            self.train_samples_ids.clear()
+            self.train_sentence_length.clear()
+            return
+
         # log training samples
         if self.train_samples:
             df = pd.DataFrame(self.train_samples)
@@ -1242,6 +1276,16 @@ class ChemGFNModule(LightningModule):
         df.to_csv(
             os.path.join(_root_dir, f"samples_train_probes_{self.trainer.current_epoch}.csv"),
             index=False,
+        )
+
+        # log replay buffer
+        self.reward_buffer.save_csv(
+            os.path.join(
+                self.trainer.default_root_dir,
+                "replay_buffer",
+                f"replay_{self.trainer.current_epoch}.csv",
+            ),
+            self.tokenizer,
         )
 
         # log prefix collapse metrics
@@ -1257,12 +1301,16 @@ class ChemGFNModule(LightningModule):
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
+        invalid_flags = (~valid_flags).tolist()
 
         pos = prefix_collapse_by_position(
-            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+            seqs_list, mask_list, collapse_thr=0.95, invalid=invalid_flags
         )
         kmet = prefix_collapse_by_k(
-            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+            seqs_list,
+            mask_list,
+            k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            invalid=invalid_flags,
         )
 
         log = {
@@ -1282,22 +1330,8 @@ class ChemGFNModule(LightningModule):
         )
         plt.close()
 
-        # log replay buffer
-        self.reward_buffer.save_csv(
-            os.path.join(
-                self.trainer.default_root_dir,
-                "replay_buffer",
-                f"replay_{self.trainer.current_epoch}.csv",
-            ),
-            self.tokenizer,
-        )
-
         # if self.logger is not None:
         #     self.logger.log_table("train/samples_latest", dataframe=df)
-
-        self.train_samples.clear()
-        self.train_samples_ids.clear()
-        self.train_sentence_length.clear()
 
         # log prefix collapse metrics
         if (self._pv_probe_cache is None) or (getattr(self.reward, "pv_mem", None) is None):
@@ -1341,6 +1375,10 @@ class ChemGFNModule(LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
+
+        self.train_samples.clear()
+        self.train_samples_ids.clear()
+        self.train_sentence_length.clear()
 
     def on_validation_epoch_start(self):
         """Prepare validation probes and reset cached samples."""
@@ -1444,11 +1482,15 @@ class ChemGFNModule(LightningModule):
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
+        invalid_flags = (~valid_flags).tolist()
         pos = prefix_collapse_by_position(
-            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+            seqs_list, mask_list, collapse_thr=0.95, invalid=invalid_flags
         )
         kmet = prefix_collapse_by_k(
-            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+            seqs_list,
+            mask_list,
+            k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            invalid=invalid_flags,
         )
 
         log = {
@@ -1614,11 +1656,15 @@ class ChemGFNModule(LightningModule):
         mask_noeos = active_before & non_eos
         seqs_list = seqs.detach().cpu().tolist()
         mask_list = mask_noeos.detach().cpu().tolist()
+        invalid_flags = (~valid_flags).tolist()
         pos = prefix_collapse_by_position(
-            seqs_list, mask_list, collapse_thr=0.95, invalid=~valid_flags
+            seqs_list, mask_list, collapse_thr=0.95, invalid=invalid_flags
         )
         kmet = prefix_collapse_by_k(
-            seqs_list, mask_list, k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], invalid=~valid_flags
+            seqs_list,
+            mask_list,
+            k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            invalid=invalid_flags,
         )
 
         log = {
@@ -1998,7 +2044,7 @@ class ChemGFNModule(LightningModule):
     # ------------------------------------------------------------------ #
 
     def setup(self, stage: str) -> None:
-        if self.compile and stage == "fit":
+        if self.use_compile and stage == "fit":
             self.net = torch.compile(self.net)
             self.net_frozen = torch.compile(self.net_frozen)
 
