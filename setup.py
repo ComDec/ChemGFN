@@ -15,6 +15,7 @@ setup(
         "console_scripts": [
             "chemgfn-merge-logs=chemgfn.cli.merge_csv_groups:main",
             "chemgfn-extract-step=chemgfn.cli.extract_csv_step:main",
+            "chemgfn-unmerge-logs=chemgfn.cli.unmerge_logs:main",
         ],
     },
 )
