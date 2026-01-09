@@ -9,17 +9,17 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "SubTB", "no_data_buffer", "near_24_dense"]
+tags: ["ChemGFN", "expr24", "CFG", "TB", "no_data_buffer"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "Expr24_CFG_SubTB_no_data_buffer_hit24_subM"
+exp_name: "Expr24_CFG_TB_no_data_buffer_hit24"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps:  500
+  max_steps:   5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -53,32 +53,16 @@ model:
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.ModifiedSubTBBalanceLoss
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
   reward_buffer:
-    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
-    weight_div: 1.0
-    weight_val: 1.0
-    weight_rew: 1.0
-    default_strategy: "standard"
-    validator_key: "local_score"
-    validator_type: "max"
-
-    stochastic_epsilon: 0.1
-    ltlg_epsilon: 0.1
-
-    set_function_obj:
-      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
-    similarity_backend:
-      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
-
-    # length-collapse mitigation knobs
-    length_bin_size: 10
-    length_alpha_power: 1.0
-    weight_len: 0
+    sim_tolerance: 0.25
+    strict_mode: false
+    buffer_aug_value: 0
 
   constraint_config:
     min_sentence_len: 7
@@ -152,7 +136,6 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  buffer_sample_path: null
 # ============================================================================
 # Logger Configuration
 # ============================================================================

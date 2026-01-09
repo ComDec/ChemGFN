@@ -9,17 +9,17 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "VarExpr24", "CFG", "TB", "RapTB", "kmin_2"]
+tags: ["ChemGFN", "expr24", "CFG", "SubTB", "no_data_buffer", "near_24_dense"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_2"
+exp_name: "Expr24_CFG_SubTB_no_data_buffer_hit24"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps:  500
+  max_steps:   5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -53,19 +53,9 @@ model:
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.ModifiedSubTBBalanceLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "future_max"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -75,9 +65,9 @@ model:
     buffer_aug_value: 0
 
   constraint_config:
-    min_sentence_len: 1
+    min_sentence_len: 7
     max_sentence_len: 7
-    grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
+    grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
     disable_grammar: false
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
@@ -138,12 +128,6 @@ model:
       start: 50
       end: 50
       horizon: 1000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 2
-      end: 2
-      horizon: 500
 
   disable_peft: false
 
@@ -152,6 +136,7 @@ model:
 # ============================================================================
 data:
   num_workers: 0
+  buffer_sample_path: null
 # ============================================================================
 # Logger Configuration
 # ============================================================================

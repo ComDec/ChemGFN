@@ -9,17 +9,17 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "TB"]
+tags: ["ChemGFN", "expr24", "CFG", "TB", "no_data_buffer", "near_24_dense"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_4_to_1_mix_wo_dbuff_hit24"
+exp_name: "Expr24_CFG_TB_no_data_buffer_hit24_subM"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps:  500
+  max_steps:   5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -53,31 +53,37 @@ model:
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "mix"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
 
   reward_buffer:
-    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
     buffer_size: 200
-    sim_tolerance: 0.25
-    strict_mode: false
-    buffer_aug_value: 0
+    weight_div: 1.0
+    weight_val: 1.0
+    weight_rew: 1.0
+    default_strategy: "standard"
+    validator_key: "local_score"
+    validator_type: "max"
+
+    stochastic_epsilon: 0.1
+    ltlg_epsilon: 0.1
+
+    set_function_obj:
+      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
+    similarity_backend:
+      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+
+    # length-collapse mitigation knobs
+    length_bin_size: 10
+    length_alpha_power: 1.0
+    weight_len: 0
 
   constraint_config:
-    min_sentence_len: 3
-    max_sentence_len: 11
-    grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
+    min_sentence_len: 7
+    max_sentence_len: 7
+    grammar_path: ${paths.assets_dir}/24_grammars/general.ebnf
     disable_grammar: false
     processor_type: "prefix"
     legal_tokens: ${paths.assets_dir}/token_list/24_points/general
@@ -111,8 +117,8 @@ model:
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
+      start: 0
+      end: 0
       horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -138,12 +144,6 @@ model:
       start: 50
       end: 50
       horizon: 1000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 6
-      end: 1
-      horizon: 5000
 
   disable_peft: false
 
@@ -153,6 +153,7 @@ model:
 data:
   num_workers: 0
   buffer_sample_path: null
+
 # ============================================================================
 # Logger Configuration
 # ============================================================================
