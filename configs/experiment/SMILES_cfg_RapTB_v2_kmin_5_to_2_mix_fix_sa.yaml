@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "SA", "RapTB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_10_to_2_mix_fix_len15"
+exp_name: "smiles_RapTB_v2_kmin_5_to_2_mix_fix_softmax_SA"
 seed: 42
 
 # ============================================================================
@@ -26,7 +26,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  200
+  limit_train_batches:  250
   limit_val_batches:  50
 
 
@@ -89,7 +89,7 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.RDKitValidator
-      scorer: "qed"
+      scorer: "sa_norm"
       backend: "pa"
 
   loss_fn:
@@ -116,7 +116,7 @@ model:
 
   constraint_config:
     min_sentence_len: 1
-    max_sentence_len: 15
+    max_sentence_len: 10
     grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     disable_grammar: false
     processor_type: "prefix"
@@ -182,7 +182,7 @@ model:
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 10
+      start: 5
       end: 2
       horizon: 5000
 
@@ -193,7 +193,7 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_sa.json
   buffer_sample_path: null
 
 # ============================================================================

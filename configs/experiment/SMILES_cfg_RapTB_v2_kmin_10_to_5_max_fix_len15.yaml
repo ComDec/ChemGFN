@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_10_to_2_mix_fix_len15"
+exp_name: "smiles_RapTB_v2_kmin_10_to_5_max_fix_len15"
 seed: 42
 
 # ============================================================================
@@ -26,7 +26,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  200
+  limit_train_batches:  250
   limit_val_batches:  50
 
 
@@ -100,7 +100,7 @@ model:
     detach_pterm_in_aux: true
     eps: 1e-8
     extra_absorb_eps: 1e-6
-    target_mode: "mix"
+    target_mode: "future_max"
     k_min: 2
     # mix mode params
     mix_weight: 0.5
@@ -183,7 +183,7 @@ model:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 10
-      end: 2
+      end: 5
       horizon: 5000
 
   disable_peft: false

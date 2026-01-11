@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_10_to_2_mix_fix_len15"
+exp_name: "smiles_RapTB_v2_kmin_10_to_5_mix_fix_len15"
 seed: 42
 
 # ============================================================================
@@ -183,7 +183,7 @@ model:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 10
-      end: 2
+      end: 5
       horizon: 5000
 
   disable_peft: false

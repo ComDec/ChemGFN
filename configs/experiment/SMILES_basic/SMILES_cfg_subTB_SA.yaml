@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "smiles_opt", "CFG", "SA", "subTB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_RapTB_v2_kmin_10_to_2_mix_fix_len15"
+exp_name: "smiles_CFG_subTB_SA"
 seed: 42
 
 # ============================================================================
@@ -26,7 +26,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  200
+  limit_train_batches:  250
   limit_val_batches:  50
 
 
@@ -38,13 +38,6 @@ model:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 0.0001
-
-  ema_config:
-    enabled: false
-    decay: 0.999
-    ema_start_epoch: 10
-    reference_start_epoch: 20
-    reference_update_interval: 10
 
   reward:
     _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
@@ -89,23 +82,13 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.RDKitValidator
-      scorer: "qed"
+      scorer: "sa_norm"
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.ModifiedSubTBLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "mix"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -116,7 +99,7 @@ model:
 
   constraint_config:
     min_sentence_len: 1
-    max_sentence_len: 15
+    max_sentence_len: 10
     grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     disable_grammar: false
     processor_type: "prefix"
@@ -142,49 +125,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 5000
+      horizon: 50000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 5000
+      horizon: 50000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.75
       end: 0.25
-      horizon: 2500
+      horizon: 25000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 5000
+      horizon: 50000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 5000
+      horizon: 50000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 5000
+      horizon: 50000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 1000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 10
-      end: 2
-      horizon: 5000
+      horizon: 10000
 
   disable_peft: false
 
@@ -193,7 +170,7 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_sa.json
   buffer_sample_path: null
 
 # ============================================================================
