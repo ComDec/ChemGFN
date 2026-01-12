@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "TB"]
+tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_4_to_1_mix_wo_dbuff_hit24"
+exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_oracle"
 seed: 42
 
 # ============================================================================
@@ -26,7 +26,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  500
+  limit_train_batches:  250
   limit_val_batches:  50
 
 # ============================================================================
@@ -49,13 +49,13 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
-      scorer: "hit24"
+      scorer: "hit24_dense"
       amortize_valid_state: false
 
   loss_fn:
     _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
-    aux_weight: 0.25
+    aux_weight: 0.1
     gamma: 0.99
     detach_pterm_in_aux: true
     eps: 1e-8
@@ -64,8 +64,8 @@ model:
     k_min: 2
     # mix mode params
     mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
+    soft_beta: 3.0
+    soft_rho: 0.3
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
@@ -76,7 +76,7 @@ model:
 
   constraint_config:
     min_sentence_len: 3
-    max_sentence_len: 11
+    max_sentence_len: 9
     grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
     disable_grammar: false
     processor_type: "prefix"
@@ -111,8 +111,8 @@ model:
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
+      start: 0.75
+      end: 0.25
       horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -141,8 +141,8 @@ model:
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 6
-      end: 1
+      start: 7
+      end: 3
       horizon: 5000
 
   disable_peft: false

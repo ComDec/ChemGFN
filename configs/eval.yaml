@@ -32,3 +32,6 @@ tags: ["dev"]
 
 # passing checkpoint path is necessary for evaluation
 ckpt_path: ???
+
+# number of repeated test runs (sampling) in a single invocation
+test_repeats: 1

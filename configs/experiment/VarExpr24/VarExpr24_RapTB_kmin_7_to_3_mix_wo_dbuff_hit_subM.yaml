@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "TB"]
+tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense", "subM"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_4_to_1_mix_wo_dbuff_hit24_subM"
+exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_subM"
 seed: 42
 
 # ============================================================================
@@ -26,7 +26,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  500
+  limit_train_batches:  250
   limit_val_batches:  50
 
 # ============================================================================
@@ -49,7 +49,7 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
-      scorer: "hit24"
+      scorer: "hit24_dense"
       amortize_valid_state: false
 
   loss_fn:
@@ -92,7 +92,7 @@ model:
 
   constraint_config:
     min_sentence_len: 3
-    max_sentence_len: 11
+    max_sentence_len: 9
     grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
     disable_grammar: false
     processor_type: "prefix"
