@@ -349,6 +349,28 @@ def sa_scorer(mol) -> float:
         return 0.0
 
 
+def sa_scorer_normalized(mol) -> float:
+    """
+    Normalized and inverted synthetic accessibility score.
+
+    RDKit's contrib `sascorer` implements the Ertl & Schuffenhauer (2009)
+    SA metric that returns ~1 (easy) to ~10 (hard). We rescale to [0, 1],
+    clamp, and invert so values closer to 1 indicate easier synthesis.
+    """
+    if mol is None:
+        return 0.0
+    try:
+        import sascorer
+
+        raw = float(sascorer.calculateScore(mol))
+        min_score, max_score = 1.0, 10.0
+        norm = (raw - min_score) / max(1e-8, (max_score - min_score))
+        norm = min(1.0, max(0.0, norm))
+        return 1.0 - norm
+    except Exception:
+        return 0.0
+
+
 def logP(mol) -> float:
     if mol is None:
         return -1.0
@@ -377,12 +399,69 @@ def logP_relative(mol) -> float:
         return -1.0
 
 
+def bertz_ct(mol) -> float:
+    """Topological complexity (Bertz CT)."""
+    if mol is None:
+        return 0.0
+    try:
+        return _safe_float(Descriptors.BertzCT(mol), 0.0)  # type: ignore[attr-defined]
+    except Exception:
+        return 0.0
+
+
+def bertz_window_score(mol, lo: float = 200.0, hi: float = 900.0) -> float:
+    """
+    Soft window score in [0,1] for BertzCT being in [lo, hi].
+    Too simple or too complex are down-weighted.
+    """
+    if mol is None:
+        return 0.0
+    try:
+        x = float(Descriptors.BertzCT(mol))  # type: ignore[attr-defined]
+        m_lo = lo * 0.5
+        m_hi = hi * 1.5
+        if x <= m_lo or x >= m_hi:
+            return 0.0
+        if x < lo:
+            return float((x - m_lo) / max(1e-8, (lo - m_lo)))
+        if x > hi:
+            return float((m_hi - x) / max(1e-8, (m_hi - hi)))
+        return 1.0
+    except Exception:
+        return 0.0
+
+
+def stereo_complexity_reward(
+    mol,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    gamma: float = 1.0,
+    bertz_lo: float = 200.0,
+    bertz_hi: float = 900.0,
+) -> float:
+    """
+    Composite reward R = QED^alpha * Fsp3^beta * d_complexity^gamma.
+    d_complexity is the BertzCT soft window; higher favors balanced complexity.
+    """
+    if mol is None:
+        return 0.0
+    try:
+        q = max(0.0, min(1.0, qed(mol)))
+        f = max(0.0, min(1.0, fraction_csp3(mol)))
+        d = max(0.0, min(1.0, bertz_window_score(mol, lo=bertz_lo, hi=bertz_hi)))
+        return float((q**alpha) * (f**beta) * (d**gamma))
+    except Exception:
+        return 0.0
+
+
 FUNCTION_MAPPING: dict[str, Callable] = {
     # original
     "sa": sa_scorer,
+    "sa_norm": sa_scorer_normalized,
     "logP": logP,
     "logP_drug": logP_drug,
     "logP_relative": logP_relative,
+    "bertz_ct": bertz_ct,
     # recommended fast objectives
     "qed": qed,
     "tpsa": tpsa,
@@ -401,7 +480,10 @@ FUNCTION_MAPPING: dict[str, Callable] = {
     # soft window scores (0..1)
     "mw_window": size_window_score,
     "logp_window": logp_window_score,
+    "bertz_window": bertz_window_score,
     # optional filters
     "pains_alerts": pains_alert_count,
     "pains_pass": pains_pass,
+    # composites
+    "stereo_complexity_reward": stereo_complexity_reward,
 }
