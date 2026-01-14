@@ -746,6 +746,8 @@ class ReplayBufferSubmodular:
         buffer_size: int,
         per_prompt: bool = False,
         weight_div: float = 1.0,
+        diversity_valid_only: bool = False,
+        diversity_valid_ratio: float = 1.0,
         weight_val: float = 1.0,
         weight_rew: float = 1.0,
         default_strategy: str = "standard",
@@ -761,6 +763,14 @@ class ReplayBufferSubmodular:
         self.per_prompt = per_prompt
 
         self.weight_div = weight_div
+        # Diversity gating: 0 => ignore validity; 1 => only valid; (0,1) => mix.
+        self.diversity_valid_only = bool(diversity_valid_only)
+        # ratio takes precedence; clamp to [0,1]
+        r = float(diversity_valid_ratio)
+        r = 0.0 if r < 0 else 1.0 if r > 1 else r
+        if self.diversity_valid_only:
+            r = 1.0
+        self.diversity_valid_ratio = r
         self.weight_val = weight_val
         self.weight_rew = weight_rew
 
@@ -816,6 +826,48 @@ class ReplayBufferSubmodular:
 
     def set_set_function(self, sf: SetFunction):
         self._set_function_obj = sf
+
+    def _filter_for_diversity(self, candidates: list, data_map: dict):
+        """
+        Optional gate: restrict facility/diversity selection to a valid-heavy subset.
+        diversity_valid_ratio in [0,1]:
+          - 0: keep all samples (no gating).
+          - 1: keep only valid.
+          - (0,1): keep all valid, plus up to N invalid so that
+            valid share >= ratio. If no valid exist, fall back to all.
+        """
+        ratio = self.diversity_valid_ratio
+        if ratio <= 0:
+            return candidates, data_map
+        valid = [it for it in candidates if getattr(it, "valid", False)]
+        if ratio >= 1.0:
+            filtered = valid
+            filtered_data = {id(it): data_map.get(id(it), {}) for it in filtered}
+            return filtered, filtered_data
+
+        # ratio in (0,1)
+        if not valid:
+            return candidates, data_map  # nothing valid to enforce
+
+        invalid = [it for it in candidates if not getattr(it, "valid", False)]
+        # ensure valid proportion >= ratio => max_invalid <= valid_count * (1-r)/r
+        max_invalid = int(math.floor(len(valid) * (1.0 - ratio) / max(ratio, 1e-12)))
+        if max_invalid >= len(invalid):
+            filtered = valid + invalid
+        else:
+            # pick best invalids by static_score (fallback reward)
+            invalid_sorted = sorted(
+                invalid,
+                key=lambda it: (
+                    getattr(it, "static_score", None),
+                    getattr(it, "reward", None),
+                ),
+                reverse=True,
+            )
+            filtered = valid + invalid_sorted[:max_invalid]
+
+        filtered_data = {id(it): data_map.get(id(it), {}) for it in filtered}
+        return filtered, filtered_data
 
     def _get_similarity_backend(self) -> SimilarityBackend:
         b = self._similarity_backend
@@ -1053,6 +1105,8 @@ class ReplayBufferSubmodular:
                     uniq[c] = it
         candidates = list(uniq.values())
 
+        candidates, data_map = self._filter_for_diversity(candidates, data_map)
+
         if len(candidates) <= self.buffer_size:
             st["items"] = candidates[: self.buffer_size]
             st["data"] = {id(it): data_map.get(id(it), {}) for it in st["items"]}
@@ -1147,6 +1201,8 @@ class ReplayBufferSubmodular:
                 if it.reward > uniq[c].reward:
                     uniq[c] = it
         candidates = list(uniq.values())
+
+        candidates, data_map = self._filter_for_diversity(candidates, data_map)
 
         if len(candidates) <= self.buffer_size:
             st["items"] = candidates[: self.buffer_size]
