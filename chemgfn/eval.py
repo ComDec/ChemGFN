@@ -71,13 +71,31 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
 
-    log.info("Starting testing!")
-    trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
+    repeats = int(getattr(cfg, "test_repeats", 1))
+    log.info(f"Starting testing for {repeats} repeat(s)!")
+
+    for rep in range(repeats):
+        # Create a fresh trainer each repeat to isolate default_root_dir outputs.
+        rep_trainer: Trainer = hydra.utils.instantiate(
+            cfg.trainer,
+            logger=logger,
+            default_root_dir=f"{cfg.trainer.default_root_dir}/repeat_{rep}"
+            if repeats > 1
+            else cfg.trainer.default_root_dir,
+        )
+        object_dict["trainer"] = rep_trainer
+
+        # Tag the model with repeat suffix so on_test_epoch_end can suffix files.
+        if hasattr(model, "__setattr__"):
+            model.test_repeat_suffix = f"_run{rep}" if repeats > 1 else ""
+
+        log.info(f"Testing repeat {rep + 1}/{repeats}")
+        rep_trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
 
     # for predictions use trainer.predict(...)
     # predictions = trainer.predict(model=model, dataloaders=dataloaders, ckpt_path=cfg.ckpt_path)
 
-    metric_dict = trainer.callback_metrics
+    metric_dict = rep_trainer.callback_metrics
 
     return metric_dict, object_dict
 
