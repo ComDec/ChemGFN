@@ -424,7 +424,7 @@ class ShingleJaccardBackend(SimilarityBackend):
     Useful for expr24 (expressions) or any string domain.
     """
 
-    def __init__(self, k: int = 3, tokenizer: Optional[callable] = None):
+    def __init__(self, k: int = 2, tokenizer: Optional[callable] = None):
         self.k = int(k)
         self.tokenizer = tokenizer  # optional: str -> list[str]
 
@@ -448,7 +448,14 @@ class ShingleJaccardBackend(SimilarityBackend):
     def prepare(self, candidates: list) -> list:
         reps = []
         for c in candidates:
-            s = getattr(c, "canonical_smiles", None) or getattr(c, "smiles", "") or ""
+            # Prefer generic text representation; fall back to canonical_smiles for SMILES tasks.
+            s = (
+                getattr(c, "canonical_text", None)
+                or getattr(c, "text", None)
+                or getattr(c, "canonical_smiles", None)
+                or getattr(c, "smiles", "")
+                or ""
+            )
             reps.append(self._rep(str(s)))
         return reps
 
@@ -671,6 +678,8 @@ class ReplayBufferSubmodular:
         __slots__ = (
             "smiles",
             "canonical_smiles",
+            "text",
+            "canonical_text",
             "reward",
             "valid",
             "fingerprint",
@@ -683,27 +692,41 @@ class ReplayBufferSubmodular:
             "gen_len",  # generation length proxy (preferred for length SF)
         )
 
-        def __init__(self, smiles: str, reward: float, weight_val: float, weight_rew: float):
-            self.smiles = smiles
+        def __init__(
+            self,
+            text: str,
+            reward: float,
+            weight_val: float,
+            weight_rew: float,
+            is_valid: bool,
+        ):
+            # NOTE: `text` is the generic decoded string (SMILES or expression, etc.)
+            self.text = text
+            self.canonical_text = text
+            # legacy naming to avoid widespread refactors
+            self.smiles = text
+            self.canonical_smiles = text
             try:
                 self.reward = float(reward)
             except Exception:
                 self.reward = float(reward.item()) if hasattr(reward, "item") else float(reward)
 
-            mol = None
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-            except Exception:
-                mol = None
+            # validity is determined upstream by validators; do not override here
+            self.valid = bool(is_valid)
+            self.fingerprint = None
 
-            if mol is None:
-                self.valid = False
-                self.canonical_smiles = smiles
-                self.fingerprint = None
-            else:
-                self.valid = True
-                self.canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
-                self.fingerprint = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+            # Optional canonicalization for SMILES-like strings (kept for SMILES tasks)
+            if self.valid and _HAVE_RDKIT:
+                try:
+                    mol = Chem.MolFromSmiles(text)
+                    if mol is not None:
+                        self.canonical_smiles = Chem.MolToSmiles(mol, canonical=True)
+                        self.canonical_text = self.canonical_smiles
+                        self.fingerprint = AllChem.GetMorganFingerprintAsBitVect(
+                            mol, radius=2, nBits=2048
+                        )
+                except Exception:
+                    pass
 
             self.static_score = (weight_rew * self.reward) + (weight_val if self.valid else 0.0)
 
@@ -896,7 +919,13 @@ class ReplayBufferSubmodular:
                 r_raw = float(logrewards[i, idx].item())
 
             BufferItem = type(self).BufferItem
-            bi = BufferItem(str_sentence, r_raw, self.weight_val, self.weight_rew)
+            bi = BufferItem(
+                str_sentence,
+                r_raw,
+                self.weight_val,
+                self.weight_rew,
+                is_valid=is_valid,
+            )
 
             # ---- CRITICAL FIX: compute token lengths once, store in BufferItem + sample_data ----
             ts = sentences[i].detach().cpu()  # 1D
