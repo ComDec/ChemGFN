@@ -7,11 +7,16 @@ from fractions import Fraction
 from typing import Any, Iterable, Literal
 
 import partialsmiles as ps
+import spacy
 import torch
 from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import AllChem
 from torch import Tensor
-from transformers import PreTrainedTokenizer
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    PreTrainedTokenizer,
+)
 
 from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING
 
@@ -60,6 +65,187 @@ class ValidatorBase:
 
 class SentenceValidator(ValidatorBase):
     pass
+
+
+class RuleSentenceValidator(SentenceValidator):
+    """Rule-based validator adapted from the original ``next_sentence`` task."""
+
+    name = "rule_sentence"
+    requires_target_molecule = False
+
+    def __init__(
+        self,
+        termination_token_id: int = -1,
+        spacy_model: str = "en_core_web_sm",
+    ) -> None:
+        super().__init__(self.name, termination_token_id=termination_token_id)
+        try:
+            self.nlp = spacy.load(spacy_model)
+        except OSError as exc:
+            raise ImportError(
+                f"SpaCy model '{spacy_model}' is not installed. "
+                "Run `python -m spacy download en_core_web_sm`."
+            ) from exc
+
+    def _is_valid_sentence(self, text: str) -> bool:
+        doc = self.nlp(text.strip())
+        tokens = [t for sent in doc.sents for t in sent]
+        if len(tokens) < 2:
+            return False
+
+        # Require the first non-space token to be capitalized
+        first_tok = next((t for t in tokens if not t.is_space), None)
+        if first_tok is None or not first_tok.is_title:
+            return False
+
+        has_noun = any(tok.pos_ in {"NOUN", "PROPN", "PRON"} for tok in tokens)
+        has_verb = any(tok.pos_ in {"VERB", "AUX"} for tok in tokens)
+        return has_noun and has_verb
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor | list[str]]:
+        if sentences is None or sentences.ndim < 1:
+            empty = torch.zeros(
+                1, device=sentences.device if torch.is_tensor(sentences) else "cpu"
+            )
+            return {
+                "invalid": empty.unsqueeze(1),
+                "global_score": empty,
+                "local_score": empty.unsqueeze(1),
+                "full_tokens": [""],
+            }
+
+        termination_token_id = (
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.zeros(batch_size, device=device)
+        full_tokens: list[str] = []
+
+        invalid[:, 0] = 1.0  # empty prefix is considered invalid
+
+        for i in range(batch_size):
+            row = sentences[i]
+            try:
+                stop_pos = (row == termination_token_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = seq_len
+
+            for pos in range(stop_pos):
+                prefix_text = tokenizer.decode(row[: pos + 1], skip_special_tokens=False)
+                is_valid = self._is_valid_sentence(prefix_text)
+                invalid[i, pos + 1] = 0.0 if is_valid else 1.0
+                local_score[i, pos + 1] = 1.0 if is_valid else 0.0
+
+            final_text = tokenizer.decode(row[:stop_pos], skip_special_tokens=False)
+            full_tokens.append(final_text)
+            final_valid = stop_pos > 0 and (invalid[i, stop_pos] == 0)
+            global_score[i] = 1.0 if final_valid else 0.0
+            invalid[i, -1] = 0.0 if final_valid else 1.0
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,
+            "local_score": local_score,
+            "full_tokens": full_tokens,
+        }
+
+
+class CoLASentenceValidator(SentenceValidator):
+    """Model-based grammaticality validator using CoLA acceptability."""
+
+    name = "cola_sentence"
+    requires_target_molecule = False
+
+    def __init__(
+        self,
+        termination_token_id: int = -1,
+        model_name: str = "textattack/roberta-base-CoLA",
+        invalid_threshold: float = 0.2,
+    ) -> None:
+        super().__init__(self.name, termination_token_id=termination_token_id)
+        self.invalid_threshold = float(invalid_threshold)
+        self.model_name = model_name
+        self.model_tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_name, device_map="auto"
+        )
+        self.model.eval()
+
+    @torch.no_grad()
+    def _batch_invalid_prob(self, texts: list[str]) -> torch.Tensor:
+        inputs = self.model_tokenizer(texts, padding=True, return_tensors="pt").to(
+            self.model.device
+        )
+        logits = self.model(**inputs).logits
+        probs = logits.softmax(dim=-1)
+        # label 0 corresponds to "unacceptable" in CoLA
+        return probs[:, 0].detach()
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        target_molecule: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor | list[str]]:
+        termination_token_id = (
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.zeros(batch_size, device=device)
+        full_tokens: list[str] = []
+
+        invalid[:, 0] = 1.0  # empty prefix is invalid
+        done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for pos in range(seq_len):
+            slice_tokens = sentences[:, : pos + 1]
+            done |= slice_tokens[:, -1] == termination_token_id
+            if done.all():
+                break
+
+            texts = tokenizer.batch_decode(slice_tokens)
+            invalid_prob = self._batch_invalid_prob(texts).to(device)
+
+            invalid_mask = invalid_prob > self.invalid_threshold
+            invalid[~done, pos + 1] = invalid_mask[~done].float()
+            local_score[~done, pos + 1] = 1.0 - invalid_prob[~done]
+
+        for i in range(batch_size):
+            row = sentences[i]
+            try:
+                stop_pos = (row == termination_token_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = seq_len
+            final_text = tokenizer.decode(row[:stop_pos], skip_special_tokens=False)
+            full_tokens.append(final_text)
+
+            final_score = local_score[i, min(stop_pos, seq_len)]
+            global_score[i] = final_score
+            invalid[i, -1] = 0.0 if final_score > 0 else 1.0
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,
+            "local_score": local_score,
+            "full_tokens": full_tokens,
+        }
 
 
 class Expr24Validator(SentenceValidator):

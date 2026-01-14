@@ -31,6 +31,13 @@ from transformers_cfg.parser import parse_ebnf
 from transformers_cfg.recognizer import StringRecognizer
 
 from chemgfn.models.losses import GFNLoss
+from chemgfn.utils.cond_var_metrics import (
+    compute_raptb_targets,
+    compute_subtb_targets_delta,
+    compute_tb_targets,
+    grouped_weighted_var,
+)
+from chemgfn.utils.diversity import SequenceDiversity
 from chemgfn.utils.gfn_utils import (
     base_to_lora,
     calculate_diversity_by_length,
@@ -201,12 +208,37 @@ class ChemGFNModule(LightningModule):
         self.val_batch_fp_div_internal_count = 0
         self.val_batch_fp_div_topk_sum = 0.0
         self.val_batch_fp_div_topk_count = 0
+        self.val_text_diversity_sum = 0.0
+        self.val_text_diversity_count = 0
+        self.val_text_diversity_sum = 0.0
+        self.val_text_diversity_count = 0
         self.test_batch_diversity_sum = 0.0
         self.test_batch_diversity_count = 0
         self.test_batch_fp_div_internal_sum = 0.0
         self.test_batch_fp_div_internal_count = 0
         self.test_batch_fp_div_topk_sum = 0.0
         self.test_batch_fp_div_topk_count = 0
+        self.test_text_diversity_sum = 0.0
+        self.test_text_diversity_count = 0
+        self.test_condvar_tokens: list[torch.Tensor] = []
+        self.test_condvar_log_pf_steps: list[torch.Tensor] = []
+        self.test_condvar_log_pterm: list[torch.Tensor] = []
+        self.test_condvar_log_r: list[torch.Tensor] = []
+        self.test_condvar_tau: list[int] = []
+
+        div_metric = getattr(self.reward_config, "diversity_metric", None)
+        div_model_name = getattr(
+            self.reward_config,
+            "diversity_model_name",
+            "sentence-transformers/all-mpnet-base-v2",
+        )
+        self.sequence_diversity = (
+            SequenceDiversity(div_metric, model_name=div_model_name) if div_metric else None
+        )
+        self.test_condvar_ref_log_pf_steps: list[torch.Tensor] = []
+        self.test_condvar_ref_log_pterm: list[torch.Tensor] = []
+        self.test_repeat_suffix: str = ""
+        self.test_repeat_suffix: str = ""
 
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
         # If True, skip heavy epoch-end logging and only persist replay buffer.
@@ -822,6 +854,21 @@ class ChemGFNModule(LightningModule):
         batch_diversity = self._calculate_diversity_ragged(batch_sequences)
         self.val_batch_diversity_sum += float(batch_diversity)
         self.val_batch_diversity_count += 1
+        if self.sequence_diversity is not None:
+            decoded_batch = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+            decoded_batch = [
+                text.replace(self.tokenizer.eos_token, "").strip() for text in decoded_batch
+            ]
+            if len(decoded_batch) > 1:
+                text_div = self.sequence_diversity(decoded_batch)
+                if text_div is not None:
+                    self.val_text_diversity_sum += float(text_div)
+                    self.val_text_diversity_count += 1
+                    self._log_metrics(
+                        {"val/diversity_text": text_div},
+                        on_step=False,
+                        sync_dist=True,
+                    )
 
         if self.reward.sentence_validator is None:
             validator_metric_dict = {}
@@ -1032,6 +1079,22 @@ class ChemGFNModule(LightningModule):
             prompt_len=prompt_len,
         )
         tokens = generated_text[:, prompt_len:]
+        if self.sequence_diversity is not None:
+            decoded_batch = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)
+            decoded_batch = [
+                text.replace(self.tokenizer.eos_token, "").strip() for text in decoded_batch
+            ]
+            if len(decoded_batch) > 1:
+                text_div = self.sequence_diversity(decoded_batch)
+                if text_div is not None:
+                    self.test_text_diversity_sum += float(text_div)
+                    self.test_text_diversity_count += 1
+                    self._log_metrics(
+                        {"test/diversity_text": text_div},
+                        on_step=False,
+                        sync_dist=True,
+                    )
+        tau_tensor = self._compute_tau_from_tokens(tokens)
         self._accumulate_log_pterm_by_length(
             tokens,
             log_pterm,
@@ -1041,6 +1104,22 @@ class ChemGFNModule(LightningModule):
         if log_pfs is not None:
             self.test_log_rs.append(last_log_r.detach().cpu())
             self.test_log_pfss.append(log_pfs.detach().cpu())
+        log_pf_steps = log_pf[:, :-1] if log_pf is not None else None
+        if (
+            log_pf_steps is not None
+            and log_pterm is not None
+            and log_r is not None
+            and tau_tensor is not None
+        ):
+            self._cache_test_conditional_variance_inputs(
+                tokens=tokens,
+                log_pf_steps=log_pf_steps,
+                log_pterm=log_pterm,
+                log_r=log_r,
+                tau=tau_tensor,
+                ref_log_pf_steps=log_pf_ref[:, :-1] if log_pf_ref is not None else None,
+                ref_log_pterm=log_pterm_ref if log_pterm_ref is not None else None,
+            )
 
         validator_dict = result_dict.get("validator_dict")
         valid_flags = self._get_valid_flags(validator_dict, generated_text, prompt_len)
@@ -1426,6 +1505,15 @@ class ChemGFNModule(LightningModule):
                 sync_dist=True,
                 on_epoch=True,
             )
+        if self.sequence_diversity is not None and self.val_text_diversity_count > 0:
+            self._log_metrics(
+                {
+                    "val/diversity_text_batch_mean": self.val_text_diversity_sum
+                    / float(self.val_text_diversity_count)
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
         if self.val_batch_fp_div_internal_count > 0:
             mean_internal = self.val_batch_fp_div_internal_sum / float(
                 self.val_batch_fp_div_internal_count
@@ -1454,6 +1542,19 @@ class ChemGFNModule(LightningModule):
         diversity_by_len_valid = calculate_diversity_by_length(
             valid_val_sequences, self.end_of_sentence_token_id
         )
+        if self.sequence_diversity is not None:
+            decoded_all = [
+                self.tokenizer.decode(seq, skip_special_tokens=True)
+                for seq in self.val_samples_ids
+            ]
+            if len(decoded_all) > 1:
+                text_div_epoch = self.sequence_diversity(decoded_all)
+                if text_div_epoch is not None:
+                    self._log_metrics(
+                        {"val/diversity_text_epoch": text_div_epoch},
+                        sync_dist=True,
+                        on_epoch=True,
+                    )
         fp_div = self._compute_global_fp_diversity(self.val_samples_ids)
         if fp_div:
             self._log_metrics(
@@ -1573,8 +1674,18 @@ class ChemGFNModule(LightningModule):
         self.test_batch_fp_div_internal_count = 0
         self.test_batch_fp_div_topk_sum = 0.0
         self.test_batch_fp_div_topk_count = 0
+        self.test_text_diversity_sum = 0.0
+        self.test_text_diversity_count = 0
+        self.test_condvar_tokens.clear()
+        self.test_condvar_log_pf_steps.clear()
+        self.test_condvar_log_pterm.clear()
+        self.test_condvar_log_r.clear()
+        self.test_condvar_tau.clear()
+        self.test_condvar_ref_log_pf_steps.clear()
+        self.test_condvar_ref_log_pterm.clear()
 
     def on_test_epoch_end(self):
+        cond_var_stats: dict[int, dict[str, float]] = {}
         diversity = self._calculate_diversity_ragged(self.test_samples_ids)
         self._log_metrics({"test/diversity": diversity}, sync_dist=True, on_epoch=True)
         valid_test_sequences = self._filter_valid_sequences(
@@ -1589,6 +1700,15 @@ class ChemGFNModule(LightningModule):
                 {
                     "test/diversity_batch_mean": self.test_batch_diversity_sum
                     / float(self.test_batch_diversity_count)
+                },
+                sync_dist=True,
+                on_epoch=True,
+            )
+        if self.sequence_diversity is not None and self.test_text_diversity_count > 0:
+            self._log_metrics(
+                {
+                    "test/diversity_text_batch_mean": self.test_text_diversity_sum
+                    / float(self.test_text_diversity_count)
                 },
                 sync_dist=True,
                 on_epoch=True,
@@ -1615,6 +1735,19 @@ class ChemGFNModule(LightningModule):
         diversity_by_len_valid = calculate_diversity_by_length(
             valid_test_sequences, self.end_of_sentence_token_id
         )
+        if self.sequence_diversity is not None:
+            decoded_all = [
+                self.tokenizer.decode(seq, skip_special_tokens=True)
+                for seq in self.test_samples_ids
+            ]
+            if len(decoded_all) > 1:
+                text_div_epoch = self.sequence_diversity(decoded_all)
+                if text_div_epoch is not None:
+                    self._log_metrics(
+                        {"test/diversity_text_epoch": text_div_epoch},
+                        sync_dist=True,
+                        on_epoch=True,
+                    )
         fp_div = self._compute_global_fp_diversity(self.test_samples_ids)
         if fp_div:
             self._log_metrics(
@@ -1663,7 +1796,12 @@ class ChemGFNModule(LightningModule):
         kmet = prefix_collapse_by_k(
             seqs_list,
             mask_list,
-            k_list=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            k_list=list(
+                range(
+                    self.constraint_config.min_sentence_len,
+                    self.constraint_config.max_sentence_len + 1,
+                )
+            ),
             invalid=invalid_flags,
         )
 
@@ -1673,6 +1811,10 @@ class ChemGFNModule(LightningModule):
         }
         self._log_metrics(log, on_epoch=True, sync_dist=True)
         self._log_wandb_prefix_tables("prefix_pos_test", pos, kmet)
+
+        cond_var_log, cond_var_json = self._compute_test_conditional_variance_metrics()
+        if cond_var_log:
+            self._log_metrics(cond_var_log, sync_dist=True, on_epoch=True)
 
         if self.test_samples_table:
             samples_table = pd.DataFrame(self.test_samples_table)
@@ -1690,12 +1832,12 @@ class ChemGFNModule(LightningModule):
                     "log_r_unpenalized",
                 ]
             )
-        _root_dir = os.path.join(self.trainer.default_root_dir, "test_samples")
+        _root_dir = self._repeat_dir("test_samples")
         os.makedirs(_root_dir, exist_ok=True)
         samples_table.to_csv(
             os.path.join(
                 _root_dir,
-                f"samples_test_{self.trainer.global_step}.csv",
+                f"samples_test_{self.trainer.global_step}{self._test_repeat_suffix()}.csv",
             ),
             index=False,
         )
@@ -1775,6 +1917,8 @@ class ChemGFNModule(LightningModule):
                 metrics["pterm_by_len"] = {
                     length: float(np.exp(val)) for length, val in log_pterm_by_len.items()
                 }
+                if cond_var_json:
+                    metrics["prefix_conditional_variance"] = cond_var_json
 
                 exp_name = None
                 hparams = getattr(self, "hparams", None)
@@ -1792,11 +1936,11 @@ class ChemGFNModule(LightningModule):
                 metrics["exp_name"] = exp_name
 
                 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-                _root_dir = os.path.join(repo_root, "evaluation")
+                _root_dir = self._repeat_eval_dir()
                 os.makedirs(_root_dir, exist_ok=True)
                 out_path = os.path.join(
                     _root_dir,
-                    f"test_metrics_{exp_name}_epoch_{epoch}_step_{global_step}.json",
+                    f"test_metrics_{exp_name}_epoch_{epoch}_step_{global_step}{self._test_repeat_suffix()}.json",
                 )
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(metrics, f, indent=2, sort_keys=True)
@@ -2292,6 +2436,297 @@ class ChemGFNModule(LightningModule):
             sums[length] = sums.get(length, 0.0) + val
             counts[length] = counts.get(length, 0) + 1
 
+    def _compute_tau_from_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Compute tau as the first EOS position (or last index if none)."""
+        if tokens is None:
+            return torch.tensor([], dtype=torch.long, device=self.device)
+        if tokens.numel() == 0:
+            return torch.zeros(tokens.shape[0], dtype=torch.long, device=tokens.device)
+        max_len = tokens.shape[1]
+        eos_mask = tokens == self.end_of_sentence_token_id
+        idxs = torch.arange(max_len, device=tokens.device).unsqueeze(0).expand_as(tokens)
+        first_eos = torch.where(eos_mask, idxs, torch.full_like(idxs, max_len))
+        tau = first_eos.min(dim=1).values
+        tau = torch.clamp(tau, max=max_len - 1)
+        return tau.to(dtype=torch.long)
+
+    def _cache_test_conditional_variance_inputs(
+        self,
+        *,
+        tokens: torch.Tensor,
+        log_pf_steps: torch.Tensor,
+        log_pterm: torch.Tensor,
+        log_r: torch.Tensor,
+        tau: torch.Tensor,
+        ref_log_pf_steps: torch.Tensor | None = None,
+        ref_log_pterm: torch.Tensor | None = None,
+    ) -> None:
+        """Cache per-sample tensors required for prefix-conditional variance."""
+        if (
+            tokens is None
+            or log_pf_steps is None
+            or log_pterm is None
+            or log_r is None
+            or tau is None
+        ):
+            return
+
+        tokens_cpu = tokens.detach().cpu()
+        log_pf_cpu = log_pf_steps.detach().cpu()
+        log_pterm_cpu = log_pterm.detach().cpu()
+        log_r_cpu = log_r.detach().cpu()
+        tau_cpu = tau.detach().cpu()
+        ref_log_pf_cpu = ref_log_pf_steps.detach().cpu() if ref_log_pf_steps is not None else None
+        ref_log_pterm_cpu = ref_log_pterm.detach().cpu() if ref_log_pterm is not None else None
+
+        n = min(
+            tokens_cpu.shape[0],
+            log_pf_cpu.shape[0],
+            log_pterm_cpu.shape[0],
+            log_r_cpu.shape[0],
+            tau_cpu.shape[0],
+            ref_log_pf_cpu.shape[0] if ref_log_pf_cpu is not None else tokens_cpu.shape[0],
+            ref_log_pterm_cpu.shape[0] if ref_log_pterm_cpu is not None else tokens_cpu.shape[0],
+        )
+        if n <= 0:
+            return
+        tokens_cpu = tokens_cpu[:n]
+        log_pf_cpu = log_pf_cpu[:n]
+        log_pterm_cpu = log_pterm_cpu[:n]
+        log_r_cpu = log_r_cpu[:n]
+        tau_cpu = tau_cpu[:n]
+        if ref_log_pf_cpu is not None:
+            ref_log_pf_cpu = ref_log_pf_cpu[:n]
+        if ref_log_pterm_cpu is not None:
+            ref_log_pterm_cpu = ref_log_pterm_cpu[:n]
+
+        max_len = min(
+            tokens_cpu.shape[1],
+            log_pterm_cpu.shape[1],
+            log_r_cpu.shape[1],
+            log_pf_cpu.shape[1] + 1,
+            ref_log_pterm_cpu.shape[1]
+            if ref_log_pterm_cpu is not None
+            else log_pterm_cpu.shape[1],
+            (ref_log_pf_cpu.shape[1] + 1)
+            if ref_log_pf_cpu is not None
+            else log_pf_cpu.shape[1] + 1,
+        )
+        if max_len <= 1:
+            return
+
+        tokens_cpu = tokens_cpu[:, :max_len]
+        log_pterm_cpu = log_pterm_cpu[:, :max_len]
+        log_r_cpu = log_r_cpu[:, :max_len]
+        log_pf_cpu = log_pf_cpu[:, : max_len - 1]
+        tau_cpu = torch.clamp(tau_cpu, max=max_len - 1)
+        if ref_log_pf_cpu is not None:
+            ref_log_pf_cpu = ref_log_pf_cpu[:, : max_len - 1]
+        if ref_log_pterm_cpu is not None:
+            ref_log_pterm_cpu = ref_log_pterm_cpu[:, :max_len]
+
+        self.test_condvar_tokens.extend([row.clone() for row in tokens_cpu])
+        self.test_condvar_log_pf_steps.extend([row.clone() for row in log_pf_cpu])
+        self.test_condvar_log_pterm.extend([row.clone() for row in log_pterm_cpu])
+        self.test_condvar_log_r.extend([row.clone() for row in log_r_cpu])
+        self.test_condvar_tau.extend([int(x) for x in tau_cpu.tolist()])
+        if ref_log_pf_cpu is not None:
+            self.test_condvar_ref_log_pf_steps.extend([row.clone() for row in ref_log_pf_cpu])
+        if ref_log_pterm_cpu is not None:
+            self.test_condvar_ref_log_pterm.extend([row.clone() for row in ref_log_pterm_cpu])
+
+    def _default_condvar_m_values(self) -> list[int]:
+        """Default prefix cut positions for conditional variance diagnostics."""
+        return [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32]
+
+    def _compute_test_conditional_variance_metrics(self) -> tuple[dict[str, float], dict]:
+        """Compute method-aligned conditional variance metrics based on exp_name."""
+        if not self.test_condvar_tokens:
+            return {}, {}
+        try:
+            tokens = torch.stack(self.test_condvar_tokens, dim=0)
+            log_pf_steps = torch.stack(self.test_condvar_log_pf_steps, dim=0)
+            log_pterm = torch.stack(self.test_condvar_log_pterm, dim=0)
+            log_r = torch.stack(self.test_condvar_log_r, dim=0)
+            tau = torch.tensor(self.test_condvar_tau, dtype=torch.long)
+            ref_log_pf_steps = (
+                torch.stack(self.test_condvar_ref_log_pf_steps, dim=0)
+                if self.test_condvar_ref_log_pf_steps
+                else None
+            )
+            ref_log_pterm = (
+                torch.stack(self.test_condvar_ref_log_pterm, dim=0)
+                if self.test_condvar_ref_log_pterm
+                else None
+            )
+        except Exception:
+            return {}, {}
+
+        max_len = min(
+            tokens.shape[1],
+            log_pterm.shape[1],
+            log_r.shape[1],
+            log_pf_steps.shape[1] + 1,
+            ref_log_pterm.shape[1] if ref_log_pterm is not None else log_pterm.shape[1],
+            (ref_log_pf_steps.shape[1] + 1)
+            if ref_log_pf_steps is not None
+            else log_pf_steps.shape[1] + 1,
+        )
+        if max_len <= 1:
+            return {}, {}
+
+        tokens = tokens[:, :max_len]
+        log_pterm = log_pterm[:, :max_len]
+        log_r = log_r[:, :max_len]
+        log_pf_steps = log_pf_steps[:, : max_len - 1]
+        tau = torch.clamp(tau, max=max_len - 1)
+        if ref_log_pf_steps is not None:
+            ref_log_pf_steps = ref_log_pf_steps[:, : max_len - 1]
+        if ref_log_pterm is not None:
+            ref_log_pterm = ref_log_pterm[:, :max_len]
+
+        m_values = [m for m in self._default_condvar_m_values() if 0 <= m < max_len]
+        if not m_values:
+            return {}, {}
+
+        # method detection
+        exp_name = None
+        hparams = getattr(self, "hparams", None)
+        if hparams is not None:
+            if isinstance(hparams, dict):
+                exp_name = hparams.get("exp_name")
+            else:
+                exp_name = getattr(hparams, "exp_name", None)
+        if exp_name is None:
+            exp = getattr(getattr(self, "logger", None), "experiment", None)
+            exp_name = getattr(exp, "name", "")
+        exp_name = str(exp_name or "").lower()
+        want_raptb = "raptb" in exp_name
+        want_subtb = "subtb" in exp_name
+
+        log_payload: dict[str, float] = {}
+        json_payload: dict = {}
+
+        # TB baseline
+        tb_targets = compute_tb_targets(
+            tokens=tokens,
+            log_pf_steps=log_pf_steps,
+            log_pterm=log_pterm,
+            log_r=log_r,
+            tau=tau,
+            m_values=m_values,
+        )
+        tb_json = {}
+        for m, data in tb_targets.items():
+            stats = grouped_weighted_var(data["keys"], data["targets"])
+            if not stats:
+                continue
+            prefix = f"test/cond_var_Ym_m{m}"
+            log_payload[prefix] = stats["cond_var"]
+            log_payload[f"{prefix}_singleton_mass"] = stats["singleton_mass"]
+            log_payload[f"{prefix}_max_group_mass"] = stats["max_group_mass"]
+            log_payload[f"{prefix}_num_groups"] = stats["num_groups"]
+            log_payload[f"{prefix}_finite_rate"] = stats["finite_rate"]
+            tb_json[m] = stats
+        if tb_json:
+            json_payload["TB"] = tb_json
+
+        # RapTB effective/hybrid
+        if want_raptb:
+            # compute valid_end
+            eos = int(self.end_of_sentence_token_id)
+            eos_or_after = (tokens[:, :-1] == eos).cumsum(dim=1) >= 1
+            valid_end = ~eos_or_after
+            log_pf_full = torch.cat([log_pf_steps, torch.zeros_like(log_pf_steps[:, :1])], dim=1)
+            rap_targets = compute_raptb_targets(
+                tokens=tokens,
+                log_pf=log_pf_full,
+                log_pterm=log_pterm,
+                log_r=log_r,
+                tau=tau,
+                valid_end=valid_end,
+                m_values=m_values,
+                gamma=float(getattr(self.loss_fn, "gamma", 1.0)),
+                k_min=int(getattr(self.loss_fn, "k_min", 1)),
+                extra_absorb_eps=float(getattr(self.loss_fn, "extra_absorb_eps", 0.0)),
+                soft_beta=float(getattr(self.loss_fn, "soft_beta", 1.0)),
+                soft_rho=float(getattr(self.loss_fn, "soft_rho", 0.0)),
+                target_mode=str(getattr(self.loss_fn, "target_mode", "future_max")),
+                mix_weight=float(getattr(self.loss_fn, "mix_weight", 1.0)),
+                ref_log_pf=ref_log_pf_steps,
+                ref_log_pterm=ref_log_pterm,
+                ref_scale=float(getattr(self.loss_fn, "ref_scale", 1.0)),
+                max_prefix_len=int(getattr(self.loss_fn, "k_max", max_len - 1))
+                if getattr(self.loss_fn, "k_max", None) is not None
+                else None,
+            )
+            rap_json = {}
+            for m, data in rap_targets.items():
+                if "targets_eff" in data:
+                    stats_eff = grouped_weighted_var(data["keys_eff"], data["targets_eff"])
+                    if stats_eff:
+                        prefix = f"test/cond_var_Yeff_m{m}"
+                        log_payload[prefix] = stats_eff["cond_var"]
+                        log_payload[f"{prefix}_singleton_mass"] = stats_eff["singleton_mass"]
+                        log_payload[f"{prefix}_max_group_mass"] = stats_eff["max_group_mass"]
+                        log_payload[f"{prefix}_num_groups"] = stats_eff["num_groups"]
+                        log_payload[f"{prefix}_finite_rate"] = stats_eff["finite_rate"]
+                        log_payload[f"{prefix}_apply_absorb_rate"] = data.get("apply_rate", 0.0)
+                        rap_json.setdefault(m, {})["eff"] = stats_eff
+                        rap_json[m]["apply_rate"] = data.get("apply_rate", 0.0)
+                if "targets_hyb" in data:
+                    stats_hyb = grouped_weighted_var(data["keys_hyb"], data["targets_hyb"])
+                    if stats_hyb:
+                        prefix = f"test/cond_var_Yhyb_m{m}"
+                        log_payload[prefix] = stats_hyb["cond_var"]
+                        log_payload[f"{prefix}_singleton_mass"] = stats_hyb["singleton_mass"]
+                        log_payload[f"{prefix}_max_group_mass"] = stats_hyb["max_group_mass"]
+                        log_payload[f"{prefix}_num_groups"] = stats_hyb["num_groups"]
+                        log_payload[f"{prefix}_finite_rate"] = stats_hyb["finite_rate"]
+                        log_payload[f"{prefix}_apply_absorb_rate"] = data.get("apply_rate", 0.0)
+                        rap_json.setdefault(m, {})["hyb"] = stats_hyb
+                        rap_json[m]["apply_rate"] = data.get("apply_rate", 0.0)
+            if rap_json:
+                json_payload["RapTB"] = rap_json
+
+        # SubTB approximate (delta-based)
+        if want_subtb:
+            sub_targets = compute_subtb_targets_delta(
+                tokens=tokens,
+                log_pf=torch.cat([log_pf_steps, torch.zeros_like(log_pf_steps[:, :1])], dim=1),
+                log_pterm=log_pterm,
+                log_r=log_r,
+                m_values=m_values,
+            )
+            sub_json = {}
+            for m, data in sub_targets.items():
+                stats = grouped_weighted_var(data["keys"], data["targets"])
+                if not stats:
+                    continue
+                prefix = f"test/cond_var_subtb_delta_m{m}"
+                log_payload[prefix] = stats["cond_var"]
+                log_payload[f"{prefix}_singleton_mass"] = stats["singleton_mass"]
+                log_payload[f"{prefix}_max_group_mass"] = stats["max_group_mass"]
+                log_payload[f"{prefix}_num_groups"] = stats["num_groups"]
+                log_payload[f"{prefix}_finite_rate"] = stats["finite_rate"]
+                sub_json[m] = stats
+            if sub_json:
+                json_payload["SubTB_delta"] = sub_json
+
+        return log_payload, json_payload
+
+    def _test_repeat_suffix(self) -> str:
+        return getattr(self, "test_repeat_suffix", "") or ""
+
+    def _repeat_dir(self, base_name: str) -> str:
+        suffix = self._test_repeat_suffix()
+        name = f"{base_name}{suffix}" if suffix else base_name
+        return os.path.join(self.trainer.default_root_dir, name)
+
+    def _repeat_eval_dir(self) -> str:
+        """Return repeat-scoped eval directory under trainer.default_root_dir/json."""
+        return os.path.join(self.trainer.default_root_dir, "json")
+
     def _log_validator_core_metrics(
         self,
         prefix: str,
@@ -2403,7 +2838,7 @@ class ChemGFNModule(LightningModule):
 
         payload = {"epoch": epoch}
         local_tag = tag.replace("/", "_")
-        _root_dir = os.path.join(self.trainer.default_root_dir, "prefix_tables")
+        _root_dir = self._repeat_dir("prefix_tables")
         os.makedirs(_root_dir, exist_ok=True)
 
         ranges = getattr(self, "_wandb_prefix_axis_ranges", None)

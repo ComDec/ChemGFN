@@ -275,10 +275,12 @@ def generate_and_return_termination_logprob(
 
             if isinstance(results, dict):
                 modified_logits = results["masked_logits"]
-                agree_entries.append(results["acceptance"])
+                acceptance = results["acceptance"]
             else:
                 modified_logits = results
-                agree_entries.append(torch.ones_like(modified_logits, dtype=torch.bool))
+                acceptance = torch.ones_like(modified_logits, dtype=torch.bool)
+            results = {"masked_logits": modified_logits, "acceptance": acceptance}
+            agree_entries.append(acceptance)
 
             if step < min_len:
                 non_eos_only = torch.where(results["acceptance"].sum(dim=1) != 1)[0]
@@ -326,13 +328,20 @@ def generate_and_return_termination_logprob(
                 scores = logits.clone().detach()
                 scores = default_processor(state, scores)
                 results = logits_processor(state, scores, disable_grammar=disable_grammar)
-                modified_logits = results["masked_logits"]
-                agree_entries.append(results["acceptance"])
+                if isinstance(results, dict):
+                    modified_logits = results["masked_logits"]
+                    acceptance = results["acceptance"]
+                else:
+                    modified_logits = results
+                    acceptance = torch.ones_like(modified_logits, dtype=torch.bool)
+                results = {"masked_logits": modified_logits, "acceptance": acceptance}
+                agree_entries.append(acceptance)
 
         inactive_tokens = token_ids.new_full(token_ids.shape, termination_token_id)
         token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, inactive_tokens)
 
-        logits[~results["acceptance"]] += grammar_disagree_penalty
+        if grammar_disagree_penalty != 0 and results["acceptance"].ndim == 2:
+            logits[~results["acceptance"]] += grammar_disagree_penalty
         logprob = logits.log_softmax(dim=-1)
 
         term_scores = logprob[:, termination_token_id]
