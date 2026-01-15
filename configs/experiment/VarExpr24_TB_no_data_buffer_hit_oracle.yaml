@@ -9,12 +9,21 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_scare", "subM"]
+tags: ["ChemGFN", "expr24", "CFG", "TB", "hit24_dense", "oracle"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_scare_subM"
+exp_name: "VarExpr24_CFG_TB_hit24_dense_oracle"
 seed: 42
 
+model_checkpoint:
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}_diversity_{val/diversity:.4f}"
+  every_n_epochs: 10
+  monitor: "val/diversity_valid"
+  save_last: True
+  auto_insert_metric_name: False
+  mode: "max"
+  save_top_k: 0
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
@@ -26,7 +35,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  250
+  limit_train_batches:  500
   limit_val_batches:  50
 
 # ============================================================================
@@ -49,46 +58,20 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
-      scorer: "hit24"
+      scorer: "hit24_dense"
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "mix"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 3.0
-    soft_rho: 0.2
 
   reward_buffer:
-    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
-    weight_div: 1.0
-    weight_val: 1.0
-    weight_rew: 1.0
-    default_strategy: "standard"
-    validator_key: "local_score"
-    validator_type: "last"
-
-    stochastic_epsilon: 0.1
-    ltlg_epsilon: 0.1
-
-    set_function_obj:
-      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
-    similarity_backend:
-      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
-
-    # length-collapse mitigation knobs
-    length_bin_size: 2
-    length_alpha_power: 1.0
-    weight_len: 1.0
+    sim_tolerance: 0.25
+    strict_mode: false
+    buffer_aug_value: 0
 
   constraint_config:
     min_sentence_len: 3
@@ -121,14 +104,14 @@ model:
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.50
-      end: 0.25
+      start: 0
+      end: 0
       horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
+      start: 0.75
+      end: 0.25
       horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -154,12 +137,6 @@ model:
       start: 50
       end: 50
       horizon: 1000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 6
-      end: 1
-      horizon: 5000
 
   disable_peft: false
 
@@ -168,11 +145,11 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  buffer_sample_path: null
+  buffer_sample_path: ${paths.data_dir}/24_points/buffer_24_len1to9_non_zero.pt
 # ============================================================================
 # Logger Configuration
 # ============================================================================
 logger:
   wandb:
     project: "ChemGFN"
-    offline: 1
+    offline: false

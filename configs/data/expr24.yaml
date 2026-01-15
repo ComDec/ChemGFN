@@ -1,10 +1,10 @@
 _target_: chemgfn.data.gfn_datamodule.BufferDataModule
 tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
 data_path: ${paths.data_dir}/24_points/prompts.txt
-train_size: 0.95
+train_size: 0.5
 num_workers: 0
 pin_memory: True
-total_size: 1000
+total_size: 100000
 prompt_size: 1
 n_samples: ${model.training_mixed_config.n_samples}
 allowed_vocab_path: ${model.constraint_config.legal_tokens}

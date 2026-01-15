@@ -4,15 +4,15 @@
 # Run with: python chemgfn/train.py experiment=debug_expr24
 
 defaults:
-  - override /data: expr24
-  - override /model: llama3_expr24
+  - override /data: smiles_opt
+  - override /model: llama3_smiles_opt
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense"]
+tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_subM"
+exp_name: "smiles_RapTB_v2_kmin_12_to_8_mix_fix_len15_subM"
 seed: 42
 
 # ============================================================================
@@ -29,6 +29,7 @@ trainer:
   limit_train_batches:  250
   limit_val_batches:  50
 
+
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
 # ============================================================================
@@ -38,24 +39,63 @@ model:
     _partial_: true
     lr: 0.0001
 
+  ema_config:
+    enabled: false
+    decay: 0.999
+    ema_start_epoch: 10
+    reference_start_epoch: 20
+    reference_update_interval: 10
+
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
-    invalid_start_ratio: 0.2
-    invalid_end_ratio: 1.2
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
     disable_peft: ${model.disable_peft}
+
+     # config params
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
+
+    # phi params
     phi_weight: 0
+
+    # reward strategy
+    reward_strategy: "smiles_absorbing"
+    smiles_len_weight: 0.0
+    smiles_score_clip: [0.0, 1.0]
+    pv_update_strategy: smiles_global_score
+
+    # entropy gate, UNDER DEVELOPMENT
+    use_entropy_gate: false
+    use_token_entropy_gate: false
+    ent_lo: 0.10
+    ent_hi: 0.55
+
+    # phi build params
+    phi_eta: 1.0
+    phi_clamp: 2.0
+
+    # split logic
+    pv_split: 2
+    pv_split_inclusive: true
+
+    # pv memory params
+    pv_memory_kwargs:
+      alpha: 1.0
+      gamma: 0.999
+      max_keys: 500000
+      prune_every: 200
+      prune_threshold: 1.0
+      tau_conf: 20.0
+
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.validators.Expr24Validator
-      scorer: "hit24_dense"
-      amortize_valid_state: false
+      _target_: chemgfn.models.validators.RDKitValidator
+      scorer: "qed"
+      backend: "pa"
 
   loss_fn:
     _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
-    aux_weight: 0.1
+    aux_weight: 0.25
     gamma: 0.99
     detach_pterm_in_aux: true
     eps: 1e-8
@@ -75,7 +115,7 @@ model:
     weight_rew: 1.0
     default_strategy: "standard"
     validator_key: "local_score"
-    validator_type: "last"
+    validator_type: "max"
 
     stochastic_epsilon: 0.1
     ltlg_epsilon: 0.1
@@ -83,20 +123,21 @@ model:
     set_function_obj:
       _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
     similarity_backend:
-      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+      _target_: chemgfn.utils.replay_buffer.RDKITBulkTanimotoBackend
 
     # length-collapse mitigation knobs
-    length_bin_size: 2
+    length_bin_size: 1
     length_alpha_power: 1.0
+    length_alpha_mode: "uniform"
     weight_len: 1.0
 
   constraint_config:
-    min_sentence_len: 3
-    max_sentence_len: 9
-    grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
+    min_sentence_len: 1
+    max_sentence_len: 15
+    grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
     disable_grammar: false
     processor_type: "prefix"
-    legal_tokens: ${paths.assets_dir}/token_list/24_points/general
+    legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
     illegal_vocab_penalty: -50
     parse_mode: "limited"
 
@@ -109,6 +150,7 @@ model:
     buffer_mixture_ratio: 0.7
     skip_baseline_sampling: true
     opt_task: false
+    # without applying grammar disagree penalty to forward side
     grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
 
   factor_schedulers:
@@ -127,8 +169,8 @@ model:
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
+      start: 0.75
+      end: 0.25
       horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -157,8 +199,8 @@ model:
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 7
-      end: 3
+      start: 10
+      end: 5
       horizon: 5000
 
   disable_peft: false
@@ -168,11 +210,13 @@ model:
 # ============================================================================
 data:
   num_workers: 0
+  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
   buffer_sample_path: null
+
 # ============================================================================
 # Logger Configuration
 # ============================================================================
 logger:
   wandb:
     project: "ChemGFN"
-    offline: false
+    offline: False

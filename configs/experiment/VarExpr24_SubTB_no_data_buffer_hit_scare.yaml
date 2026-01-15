@@ -9,10 +9,10 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "TB", "hit24_dense", "oracle"]
+tags: ["ChemGFN", "expr24", "CFG", "SubTB", "no_data_buffer", "hit24_scare"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_TB_hit24_dense_oracle"
+exp_name: "VarExpr24_CFG_SubTB_hit24_scare"
 seed: 42
 
 model_checkpoint:
@@ -24,6 +24,7 @@ model_checkpoint:
   auto_insert_metric_name: False
   mode: "max"
   save_top_k: 0
+
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
@@ -58,11 +59,11 @@ model:
     score_function: "score_fast"
     sentence_validator:
       _target_: chemgfn.models.validators.Expr24Validator
-      scorer: "hit24_dense"
+      scorer: "hit24"
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
+    _target_: chemgfn.models.losses.ModifiedSubTBBalanceLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
@@ -145,7 +146,7 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  buffer_sample_path: ${paths.data_dir}/24_points/buffer_24_len1to9_non_zero.pt
+  buffer_sample_path: null
 # ============================================================================
 # Logger Configuration
 # ============================================================================

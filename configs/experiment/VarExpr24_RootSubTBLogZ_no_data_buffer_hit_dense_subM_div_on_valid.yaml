@@ -9,11 +9,21 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense"]
+tags: ["ChemGFN", "expr24", "CFG", "RootSubTB", "no_data_buffer", "hit24_dense", "subM"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense"
+exp_name: "VarExpr24_CFG_RootSubTBLogZ_hit24_dense_subM_div_on_valid"
 seed: 42
+
+model_checkpoint:
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}_diversity_{val/diversity:.4f}"
+  every_n_epochs: 10
+  monitor: "val/diversity_valid"
+  save_last: True
+  auto_insert_metric_name: False
+  mode: "max"
+  save_top_k: 0
 
 # ============================================================================
 # Trainer Configuration
@@ -26,7 +36,7 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  250
+  limit_train_batches:  500
   limit_val_batches:  50
 
 # ============================================================================
@@ -53,26 +63,33 @@ model:
       amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
+    _target_: chemgfn.models.losses.RootedSubTBLogZLoss
     subtb_lambda: 1.0
-    aux_weight: 0.1
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "mix"
-    k_min: 2
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 3.0
-    soft_rho: 0.3
 
   reward_buffer:
-    _target_: chemgfn.utils.gfn_utils.ReplayBuffer
+    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    diversity_valid_only: true
     buffer_size: 200
-    sim_tolerance: 0.25
-    strict_mode: false
-    buffer_aug_value: 0
+    weight_div: 1.0
+    weight_val: 1.0
+    weight_rew: 1.0
+    default_strategy: "standard"
+    validator_key: "local_score"
+    validator_type: "last"
+
+    stochastic_epsilon: 0.1
+    ltlg_epsilon: 0.1
+
+    set_function_obj:
+      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
+    similarity_backend:
+      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+
+    # length-collapse mitigation knobs
+    length_bin_size: 2
+    length_alpha_power: 1.0
+    weight_len: 1.0
 
   constraint_config:
     min_sentence_len: 3
@@ -111,8 +128,8 @@ model:
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.0
-      end: 0.0
+      start: 0
+      end: 0
       horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
@@ -138,12 +155,6 @@ model:
       start: 50
       end: 50
       horizon: 1000
-    k_min:
-      _target_: chemgfn.models.gfn.Scheduler
-      schedule_type: "linear"
-      start: 7
-      end: 3
-      horizon: 5000
 
   disable_peft: false
 
