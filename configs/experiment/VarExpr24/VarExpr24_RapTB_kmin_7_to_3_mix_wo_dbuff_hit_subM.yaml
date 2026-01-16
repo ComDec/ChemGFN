@@ -9,7 +9,7 @@ defaults:
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense", "subM"]
+tags: ["ChemGFN", "expr24", "CFG", "RapTB", "hit24_dense"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
 exp_name: "VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_subM"
@@ -157,8 +157,8 @@ model:
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 6
-      end: 1
+      start: 7
+      end: 3
       horizon: 5000
 
   disable_peft: false
