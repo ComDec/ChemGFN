@@ -15,10 +15,6 @@ import torch.nn.functional as F
 __all__ = [
     "GFNLoss",
     "ModifiedSubTBLoss",
-    "ModifiedSubTBLossSplitReward",
-    "ModifiedSubTBBalanceLoss",
-    "SubTBBatchDiversityLoss",
-    "SubTBBatchDiversityPriorLoss",
 ]
 
 
@@ -100,17 +96,11 @@ class ModifiedSubTBLoss(GFNLoss):
     """
     Modified SubTrajectory Balance (SubTB) Loss.
 
-    This loss implements the SubTB objective for GFlowNet training, which balances
-    subtrajectories of different lengths to improve training stability and sample quality.
-
-    Args:
-        subtb_lambda (float): Length decay weight for subtrajectories. Default: 1.0
-        balance (float): Token-level balancing degree in [0,1]. 0 keeps original window-sum;
-                        1 re-weights so each token contributes equally. Default: 0.0
-        eps (float): Numerical stabilizer for division. Default: 1e-8
-
-    References:
-        SubTB: https://arxiv.org/abs/2209.12782
+    New:
+        prefix_only (bool): if True, only use prefix subtrajectories that start at s0
+                            (i.e., windows with start index i=0). This avoids using
+                            arbitrary-start subtrajectories when you don't model
+                            multiple logZ / state flows.
     """
 
     def __init__(
@@ -118,11 +108,13 @@ class ModifiedSubTBLoss(GFNLoss):
         subtb_lambda: float = 1.0,
         balance: float = 0.0,
         eps: float = 1e-8,
+        prefix_only: bool = False,  # <-- NEW SWITCH
     ):
         super().__init__()
         self.subtb_lambda = subtb_lambda
         self.balance = balance
         self.eps = eps
+        self.prefix_only = prefix_only
 
     def forward(
         self,
@@ -133,23 +125,7 @@ class ModifiedSubTBLoss(GFNLoss):
         termination_token_id: int,
         prompt_len: int,
         **kwargs,
-    ) -> torch.Tensor:
-        """
-        Compute SubTB loss.
-
-        Args:
-            log_pf: Log forward policy probabilities at each step, shape [B, L]
-            log_r: Log reward prefix accumulator, shape [B, L+1]
-            log_pterm: Log termination probabilities, shape [B, L+1]
-            generated_text: Token IDs including prompt, shape [B, prompt_len + L+1]
-            termination_token_id: EOS token ID
-            prompt_len: Length of prompt
-            **kwargs: Additional arguments (for compatibility)
-
-        Returns:
-            Scalar loss tensor
-        """
-        # Ensure the dimensions of log probabilities, rewards, and generated text match
+    ):
         assert (
             log_pf.shape[1]
             == log_r.shape[1]
@@ -157,161 +133,82 @@ class ModifiedSubTBLoss(GFNLoss):
             == generated_text.shape[1] - prompt_len
         ), f"Shape mismatch: log_pf={log_pf.shape}, log_r={log_r.shape}, log_pterm={log_pterm.shape}, generated_text={generated_text.shape}, prompt_len={prompt_len}"
 
-        # Ensure there is at least one transition before termination
         assert log_pf.shape[1] > 1, "Need at least one transition before termination (L > 1)"
-        # Calculate the change in expected reward and probability at each step
+
+        # delta: [B, L-1]
         delta = (
             log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
         )
 
-        # Compute cumulative sum of delta for subtrajectory balance calculation
+        # delta_cumsum: [B, L], with delta_cumsum[:, 0] = 0
         delta_cumsum = torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(dim=1)
 
-        # Create a mask for tokens after the termination token
+        # mask: [B, L-1], True at/after first EOS (within generated part, excluding last token)
         mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(dim=-1) >= 1
 
-        batch_loss = 0.0
-        total_lambda = 0.0
-        generated_len = generated_text.shape[1] - prompt_len
+        batch_loss = log_pf.new_zeros(())
+        total_lambda = log_pf.new_zeros(())
+        generated_len = generated_text.shape[1] - prompt_len  # == L
 
         for subtraj_len in range(1, generated_len):
-            # Calculate the subtrajectory balance term
-            subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
-            # Apply mask to ignore invalid parts of the sequence
-            subtb_term[mask[:, subtraj_len - 1 :]] = 0
-            # Accumulate weighted subtrajectory balance term
-            batch_loss += self.subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
-            # Accumulate total weight for normalization
-            total_lambda += (
-                self.subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
-            )
+            w = self.subtb_lambda ** (subtraj_len - 1)
 
-        # Normalize the loss by the total weight
-        batch_loss /= total_lambda
+            if self.prefix_only:
+                # Only prefix window: start i=0, end=subtraj_len
+                # term shape: [B]
+                subtb_term = (delta_cumsum[:, subtraj_len]) ** 2
+
+                # valid iff the (subtraj_len-1)-th generated token is BEFORE EOS
+                valid = ~mask[:, subtraj_len - 1]  # [B], bool
+
+                batch_loss = batch_loss + w * (subtb_term * valid).sum()
+                total_lambda = total_lambda + w * valid.sum()
+
+            else:
+                # Original: all start positions i
+                # term shape: [B, L - subtraj_len]
+                subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len]) ** 2
+
+                # Invalidate windows whose last transition lands at/after EOS
+                subtb_term[mask[:, subtraj_len - 1 :]] = 0
+
+                batch_loss = batch_loss + w * subtb_term.sum()
+                total_lambda = total_lambda + w * (~mask[:, subtraj_len - 1 :]).sum()
+
+        batch_loss = batch_loss / total_lambda.clamp_min(self.eps)
         return {"loss": batch_loss}
 
 
-class RootAbsorbExtraSubTBLoss(GFNLoss):
+class RootedSubTBLogZLoss(GFNLoss):
     """
-    L = (1-eta)*L_TB_terminal + eta*L_aux_rooted_absorb_extra(K)
+    Rooted (prefix-only) SubTB with an explicit learnable scalar logZ.
 
-    Key semantics you requested:
-    - K is an absorption horizon (scheduler-controlled).
-      For prefixes k < K with (approximately) no extra reward signal, we absorb a future target
-      computed from extra rewards in [k..K] (or [k..tau] if K is None).
-    - If a trajectory terminates before K (tau < K), we do NOT absorb (keep original).
-    - Length decay is mandatory: alpha_k = gamma^(horizon - k), gamma < 1.
-    - Target supports: future-max and discounted softmax; default is a mix.
-    - Aux detaches log_pterm to avoid short-length bias.
+    Residual at prefix end k (1..L-1, before EOS):
+        res(k) = logZ + sum_{t<k} log_pf[t] + log_pterm[k] - log_r[k]
+
+    Loss:
+        sum_k lambda^(k-1) * res(k)^2  / sum_k lambda^(k-1)
     """
 
     def __init__(
         self,
-        subtb_lambda: float = 1.0,  # w_k = lambda^(k-1)
-        aux_weight: float = 0.25,  # eta in [0,1] if you use convex combo
-        gamma: float = 0.99,  # MUST be < 1 for length decay
-        detach_pterm_in_aux: bool = True,
+        subtb_lambda: float = 1.0,
         eps: float = 1e-8,
-        # absorption behavior
-        extra_absorb_eps: float = 1e-6,  # treat |extra_k| <= eps as "no reward"
-        target_mode: Literal["future_max", "future_soft", "mix"] = "mix",
-        mix_weight: float = 0.5,  # mix: w*max + (1-w)*soft
-        soft_beta: float = 5.0,  # softmax temperature in logsumexp
-        soft_rho: float = 0.0,  # per-step distance penalty (>=0)
+        init_logZ: float = 0.0,
     ):
         super().__init__()
         self.subtb_lambda = float(subtb_lambda)
-        self.aux_weight = float(aux_weight)
-        self.gamma = float(gamma)
-        self.detach_pterm_in_aux = bool(detach_pterm_in_aux)
         self.eps = float(eps)
-
-        self.extra_absorb_eps = float(extra_absorb_eps)
-        self.target_mode = target_mode
-        self.mix_weight = float(mix_weight)
-        self.soft_beta = float(soft_beta)
-        self.soft_rho = float(soft_rho)
-
-        # enforce "length decay is mandatory"
-        if not (self.gamma < 1.0):
-            raise ValueError(
-                f"gamma must be < 1.0 for mandatory length decay, got gamma={self.gamma}"
-            )
-
-    def _delta_cumsum(self, log_pf, log_r, log_pterm):
-        delta = (
-            log_r[:, :-1] + log_pf[:, :-1] + log_pterm[:, 1:] - log_r[:, 1:] - log_pterm[:, :-1]
-        )  # [B, L-1]
-        return torch.cat([torch.zeros_like(delta[:, :1]), delta], dim=1).cumsum(dim=1)  # [B, L]
-
-    @staticmethod
-    def _reconstruct_ref_logP(ref_log_pf: torch.Tensor, ref_log_pterm: torch.Tensor):
-        B, T = ref_log_pf.shape
-        B2, L = ref_log_pterm.shape
-        assert (
-            B == B2 and L == T + 1
-        ), f"shape mismatch: pf {ref_log_pf.shape}, pterm {ref_log_pterm.shape}"
-        prefix = ref_log_pf.cumsum(dim=-1)  # [B, T]
-        ref_logP = ref_log_pterm.clone()
-        ref_logP[:, 1:] = ref_logP[:, 1:] + prefix
-        return ref_logP
-
-    @staticmethod
-    def _suffix_future_max(u: torch.Tensor, valid: torch.Tensor):
-        """
-        u: [B, L]
-        valid: [B, L] bool, True means position is allowed in the suffix set.
-        returns v: [B, L] where v[b,k] = max_{t>=k, valid[b,t]} u[b,t]
-        """
-        dtype = u.dtype
-        device = u.device
-        neg_inf = torch.finfo(dtype).min
-        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
-        rev = torch.flip(u_mask, dims=[1])
-        rev_max = torch.cummax(rev, dim=1).values
-        return torch.flip(rev_max, dims=[1])
-
-    @staticmethod
-    def _suffix_future_soft(u: torch.Tensor, valid: torch.Tensor, beta: float, rho: float):
-        """
-        v_k = (1/beta) logsumexp_{t>=k, valid[t]} exp(beta*(u_t - rho*(t-k))).
-        Implemented by reverse scan:
-          Z_k = logaddexp(beta*u_k, Z_{k+1} - beta*rho)
-        """
-        B, L = u.shape
-        dtype = u.dtype
-        device = u.device
-        neg_inf = torch.finfo(dtype).min
-
-        u_mask = torch.where(valid, u, torch.full_like(u, neg_inf))
-        out = torch.empty_like(u_mask)
-
-        b = float(beta)
-        r = float(rho)
-
-        Z = b * u_mask[:, -1]  # [B]
-        out[:, -1] = Z / b
-
-        step_pen = b * r
-        for t in range(L - 2, -1, -1):
-            Z = torch.logaddexp(b * u_mask[:, t], Z - step_pen)
-            out[:, t] = Z / b
-        return out
+        self.logZ = torch.nn.Parameter(torch.tensor([float(init_logZ)], dtype=torch.float32))
 
     def forward(
         self,
-        log_pf: torch.Tensor,  # [B, L]
+        log_pf: torch.Tensor,  # [B, L]  (steps are log_pf[:, :-1])
         log_r: torch.Tensor,  # [B, L]
         log_pterm: torch.Tensor,  # [B, L]
         generated_text: torch.Tensor,  # [B, prompt_len + L]
         termination_token_id: int,
         prompt_len: int,
-        ref_log_pf: Optional[torch.Tensor] = None,  # [B, L-1]
-        ref_log_pterm: Optional[torch.Tensor] = None,  # [B, L]
-        ref_scale: float = 1.0,
-        max_prefix_len: Optional[
-            int
-        ] = None,  # <-- K: absorb horizon (scheduler). None => horizon=tau
         **kwargs,
     ):
         B, L = log_pf.shape
@@ -319,132 +216,37 @@ class RootAbsorbExtraSubTBLoss(GFNLoss):
         assert generated_text.shape[1] - prompt_len == L
         assert L > 1
 
-        # ---- tau from EOS mask ----
-        eos_or_after = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(
+        # mask over generated tokens excluding forced last token:
+        # mask[:, t] = True if token t is at/after the first EOS (within generated part)
+        mask = (generated_text[:, prompt_len:-1] == int(termination_token_id)).cumsum(
             dim=-1
         ) >= 1  # [B, L-1]
-        valid_end = ~eos_or_after  # [B, L-1] valid prefix ends (k=1..)
-        tau = valid_end.sum(dim=1).clamp(0, L - 1)  # [B] first EOS state index
 
-        # ---- main TB at terminal (keeps pterm grads) ----
-        C_main = self._delta_cumsum(log_pf, log_r, log_pterm)  # [B, L]
-        C_tau = C_main.gather(1, tau.view(B, 1)).squeeze(1)
-        loss_tb = (C_tau**2).mean()
+        # prefix sum of forward log-probs over steps
+        # steps are log_pf[:, :-1] with length L-1, prefix_logpf[:, k-1] = sum_{t<k} log_pf[t]
+        prefix_logpf = log_pf[:, :-1].cumsum(dim=1)  # [B, L-1]
 
-        # ---- auxiliary rooted absorbed prefixes (extra-only, horizon K) ----
-        loss_aux = torch.zeros((), device=log_pf.device, dtype=log_pf.dtype)
-        if self.aux_weight > 0.0:
-            # horizon K: if None => per-sample horizon = tau (absorb everywhere until terminal)
-            if max_prefix_len is None:
-                K = None
-            else:
-                K = int(max_prefix_len)
-                K = max(1, min(K, L - 1))
+        # weights w_k = lambda^(k-1) for k=1..L-1
+        k = torch.arange(1, L, device=log_pf.device, dtype=log_pf.dtype)  # [L-1]
+        w = (self.subtb_lambda ** (k - 1)).view(1, L - 1)  # [1, L-1]
 
-            lp_aux = log_pterm.detach() if self.detach_pterm_in_aux else log_pterm
-            C_aux = self._delta_cumsum(log_pf, log_r, lp_aux)  # [B, L]
-            Ck = C_aux[:, 1:]  # [B, L-1], k=1..L-1
+        # validity: prefix end k is valid iff (k-1)-th token is BEFORE EOS
+        valid = (~mask).to(log_pf.dtype)  # [B, L-1]
 
-            # prefix indices k=1..L-1
-            k_idx = torch.arange(1, L, device=log_pf.device).view(1, L - 1)  # [1, L-1]
+        # residuals for k=1..L-1
+        logZ = self.logZ.to(device=log_pf.device, dtype=log_pf.dtype).view(1, 1)  # [1,1]
+        res = logZ + prefix_logpf + log_pterm[:, 1:] - log_r[:, 1:]  # [B, L-1]
 
-            # aux is only computed on reachable prefixes and within horizon h:
-            # - if K is None: h = tau
-            # - else: h = min(K, tau)  (so we only use prefixes <= K; if tau<K, we only have <=tau)
-            if K is None:
-                h = tau
-            else:
-                h = torch.minimum(tau, tau.new_full(tau.shape, K))
+        num = (w * valid * (res**2)).sum()
+        den = (w * valid).sum().clamp_min(self.eps)
+        loss = num / den
 
-            within_tau = k_idx <= tau.view(B, 1)  # [B, L-1]
-            within_h = k_idx <= h.view(B, 1)  # [B, L-1]
-            m = (within_tau & within_h & valid_end).to(log_pf.dtype)  # [B, L-1]
+        # helpful diagnostics
+        with torch.no_grad():
+            # average drift of pterm vs ref can be logged elsewhere; here just expose logZ
+            pass
 
-            # weights w_k = lambda^(k-1)
-            w = (
-                self.subtb_lambda
-                ** torch.arange(0, L - 1, device=log_pf.device, dtype=log_pf.dtype)
-            ).view(1, -1)
-
-            # ---------- compute extra u ----------
-            if (ref_log_pf is not None) and (ref_log_pterm is not None):
-                ref_logP = self._reconstruct_ref_logP(ref_log_pf, ref_log_pterm)  # [B, L]
-                u = log_r - float(ref_scale) * ref_logP  # [B, L]
-            else:
-                # fallback: treat log_r itself as "extra" (less principled, but keeps training running)
-                u = log_r
-
-            u_k = u[:, 1:]  # [B, L-1]
-
-            # "no reward" prefixes: only these get absorption correction
-            no_reward = u_k.abs() <= self.extra_absorb_eps  # [B, L-1]
-
-            # If K is given, sequences with tau < K should remain unchanged (no absorption).
-            if K is None:
-                can_absorb_seq = torch.ones((B, 1), device=log_pf.device, dtype=torch.bool)
-            else:
-                can_absorb_seq = tau.view(B, 1) >= K
-
-            # We only absorb for k < K (strictly before horizon) when K is given.
-            # If K is None (absorb to terminal), we absorb for k <= tau; strictness isn't important.
-            if K is None:
-                before_horizon = within_h
-            else:
-                before_horizon = k_idx < K  # [1, L-1], broadcast
-
-            # ---------- build per-position target u_target[k] from future in [k..h] ----------
-            # valid states for future aggregation: state index t is valid iff t <= h (per sample) and t <= tau.
-            pos = torch.arange(L, device=log_pf.device).view(1, L)  # [1, L]
-            valid_future = (pos <= h.view(B, 1)) & (pos <= tau.view(B, 1))  # [B, L]
-
-            # Compute two targets over suffix (k..):
-            u_max = self._suffix_future_max(u.detach(), valid_future)  # [B, L]
-            u_soft = self._suffix_future_soft(
-                u.detach(), valid_future, beta=self.soft_beta, rho=self.soft_rho
-            )  # [B, L]
-
-            if self.target_mode == "future_max":
-                u_target = u_max
-            elif self.target_mode == "future_soft":
-                u_target = u_soft
-            elif self.target_mode == "mix":
-                mw = float(self.mix_weight)
-                u_target = mw * u_max + (1.0 - mw) * u_soft
-            else:
-                raise ValueError(f"Unknown target_mode: {self.target_mode}")
-
-            u_tk = u_target[:, 1:]  # [B, L-1] aligned with k=1..L-1
-
-            # ---------- mandatory length decay alpha_k = gamma^(horizon - k) ----------
-            # horizon for decay: if K is given, use K; else use h (which is tau)
-            if K is None:
-                horizon_for_decay = h
-            else:
-                horizon_for_decay = h  # equals K for sequences with tau>=K; equals tau otherwise (but those won't absorb)
-
-            exp = (horizon_for_decay.view(B, 1) - k_idx).clamp_min(0).to(log_pf.dtype)  # [B, L-1]
-            alpha = (self.gamma**exp) * within_h.to(log_pf.dtype)  # [B, L-1]
-
-            # ---------- apply absorption correction only where you asked ----------
-            # condition:
-            #   (1) prefix is in aux mask (reachable & <=h)
-            #   (2) prefix has no reward signal
-            #   (3) prefix is before horizon (k<K when K given)
-            #   (4) sequence can absorb (tau>=K when K given)
-            apply_absorb = m.bool() & no_reward & before_horizon & can_absorb_seq  # [B, L-1]
-
-            alpha_eff = alpha * apply_absorb.to(log_pf.dtype)
-
-            # correction: replace boundary extra u_k by future target u_tk (stopgrad target)
-            corr = alpha_eff * (u_k - u_tk)  # [B, L-1]
-            Ck_abs = Ck + corr
-
-            num = ((Ck_abs**2) * m * w).sum()
-            den = (m * w).sum().clamp_min(self.eps)
-            loss_aux = num / den
-
-        loss = (1 - self.aux_weight) * loss_tb + self.aux_weight * loss_aux
-        return {"loss": loss, "loss_tb": loss_tb.detach(), "loss_aux": loss_aux.detach()}
+        return {"loss": loss, "logZ": self.logZ.detach()}
 
 
 class RootAbsorbExtraSubTBLossFixTBLogZ(GFNLoss):
@@ -1567,138 +1369,11 @@ class LLMTrajectoryBalanceLoss(nn.Module):
 
         return {
             "loss": loss,
+            "log_z_b": log_z_b.mean().detach(),
             "tb_residual_mean": residual.mean().detach(),
             "tb_residual_std": residual.std(unbiased=False).detach(),
             "logp_traj_mean": logp_traj.mean().detach(),
             "logr_traj_mean": logr_traj.mean().detach(),
-        }
-
-
-class ModifiedSubTBLossSplitReward(GFNLoss):
-    """
-    Modified SubTrajectory Balance (SubTB) Loss with split reward.
-    """
-
-    def __init__(
-        self,
-        subtb_lambda: float = 1.0,
-        alpha_reference: float = 0.5,
-        eps: float = 1e-8,
-    ):
-        super().__init__()
-        self.subtb_lambda = subtb_lambda
-        self.alpha_reference = float(alpha_reference)
-        assert 0.0 <= self.alpha_reference <= 1.0, "alpha_reference must be between 0 and 1"
-        self.eps = eps
-
-    def set_alpha_reference(self, alpha_reference: float):
-        self.alpha_reference = float(alpha_reference)
-        assert 0.0 <= self.alpha_reference <= 1.0, "alpha_reference must be between 0 and 1"
-
-    def forward(
-        self,
-        log_pf: torch.Tensor,  # [B, L]
-        log_r_reference: torch.Tensor,  # [B, L]
-        log_r_target: torch.Tensor,  # [B, L]
-        log_pterm: torch.Tensor,  # [B, L]
-        generated_text: torch.Tensor,  # [B, prompt_len + L]
-        termination_token_id: int,
-        prompt_len: int,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Compute SubTB loss.
-
-        Args:
-            log_pf: Log forward policy probabilities at each step, shape [B, L]
-            log_r: Log reward prefix accumulator, shape [B, L]
-            log_pterm: Log termination probabilities, shape [B, L]
-            generated_text: Token IDs including prompt, shape [B, prompt_len + L]
-            termination_token_id: EOS token ID
-            prompt_len: Length of prompt
-            **kwargs: Additional arguments (for compatibility)
-
-        Returns:
-            Scalar loss tensor
-        """
-        # Ensure the dimensions of log probabilities, rewards, and generated text match
-        assert (
-            log_pf.shape[1]
-            == log_r_reference.shape[1]
-            == log_r_target.shape[1]
-            == log_pterm.shape[1]
-            == generated_text.shape[1] - prompt_len
-        ), f"Shape mismatch: log_pf={log_pf.shape}, log_r_reference={log_r_reference.shape}, log_r_target={log_r_target.shape}, log_pterm={log_pterm.shape}, generated_text={generated_text.shape}, prompt_len={prompt_len}"
-
-        # Ensure there is at least one transition before termination
-        assert log_pf.shape[1] > 1, "Need at least one transition before termination (L > 1)"
-
-        # Calculate the change in expected reward and probability at each step
-        delta_reference = (
-            log_r_reference[:, :-1]
-            + log_pf[:, :-1]
-            + log_pterm[:, 1:]
-            - log_r_reference[:, 1:]
-            - log_pterm[:, :-1]
-        )
-        delta_target = (
-            log_r_target[:, :-1]
-            + log_pf[:, :-1]
-            + log_pterm[:, 1:]
-            - log_r_target[:, 1:]
-            - log_pterm[:, :-1]
-        )
-
-        # Compute cumulative sum of delta for subtrajectory balance calculation
-        delta_cumsum_reference = torch.cat(
-            [torch.zeros_like(delta_reference[:, :1]), delta_reference], dim=1
-        ).cumsum(dim=1)
-        delta_cumsum_target = torch.cat(
-            [torch.zeros_like(delta_target[:, :1]), delta_target], dim=1
-        ).cumsum(dim=1)
-
-        # Create a mask for tokens after the termination token
-        mask = (generated_text[:, prompt_len:-1] == termination_token_id).cumsum(dim=-1) >= 1
-
-        batch_loss_reference = 0.0
-        batch_loss_target = 0.0
-        total_lambda = 0.0
-        generated_len = generated_text.shape[1] - prompt_len
-
-        for subtraj_len in range(1, generated_len):
-            # Calculate the subtrajectory balance term
-            subtb_term_reference = (
-                delta_cumsum_reference[:, subtraj_len:] - delta_cumsum_reference[:, :-subtraj_len]
-            ) ** 2
-            subtb_term_target = (
-                delta_cumsum_target[:, subtraj_len:] - delta_cumsum_target[:, :-subtraj_len]
-            ) ** 2
-            # Apply mask to ignore invalid parts of the sequence
-            subtb_term_reference[mask[:, subtraj_len - 1 :]] = 0
-            subtb_term_target[mask[:, subtraj_len - 1 :]] = 0
-            # Accumulate weighted subtrajectory balance term
-            batch_loss_reference += (
-                self.subtb_lambda ** (subtraj_len - 1) * subtb_term_reference.sum()
-            )
-            batch_loss_target += self.subtb_lambda ** (subtraj_len - 1) * subtb_term_target.sum()
-            # Accumulate total weight for normalization
-            total_lambda += (
-                self.subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1 :]).sum()
-            )
-
-        # Normalize the loss by the total weight
-        batch_loss_reference /= total_lambda
-        batch_loss_target /= total_lambda
-
-        total_loss = (
-            self.alpha_reference * batch_loss_reference
-            + (1.0 - self.alpha_reference) * batch_loss_target
-        )
-
-        return {
-            "loss": total_loss,
-            "loss_reference": batch_loss_reference.detach(),
-            "loss_target": batch_loss_target.detach(),
         }
 
 
@@ -1838,159 +1513,3 @@ class ModifiedSubTBBalanceLoss(GFNLoss):
         # Linear interpolation: balance=0 -> pure original design; balance=1 -> fully balanced to token
         loss = (1.0 - self.balance) * loss_win + self.balance * loss_tok
         return {"loss": loss}
-
-
-def _entropy_from_counts(counts: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    probs = counts / counts.sum().clamp_min(eps)
-    return -(probs * probs.add(eps).log()).sum()
-
-
-class SubTBBatchDiversityLoss(GFNLoss):
-    """
-    SubTB + batch-level diversity loss.
-
-    Args:
-        subtb_lambda: SubTB lambda
-        balance: Balance between SubTB and diversity loss
-        eps: Epsilon
-        seq_diversity_weight: Sequence-level diversity weight
-        pos_diversity_weight: Position-level diversity weight
-        pos_max: Maximum position
-        use_logits: Use logits to compute diversity loss
-    """
-
-    def __init__(
-        self,
-        subtb_lambda: float = 1.0,
-        balance: float = 0.0,
-        eps: float = 1e-8,
-        seq_diversity_weight: float = 0.0,
-        pos_diversity_weight: float = 0.0,
-        pos_max: Optional[int] = None,
-        use_logits: bool = False,
-    ):
-        super().__init__()
-        self.base_subtb = ModifiedSubTBBalanceLoss(
-            subtb_lambda=subtb_lambda, balance=balance, eps=eps
-        )
-        self.seq_diversity_weight = seq_diversity_weight
-        self.pos_diversity_weight = pos_diversity_weight
-        self.pos_max = pos_max
-        self.eps = eps
-        self.use_logits = use_logits
-        self.requires_policy_logits = use_logits
-
-    def _batch_seq_entropy(
-        self, suffix: torch.Tensor, termination_token_id: int
-    ) -> Optional[torch.Tensor]:
-        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
-        alive_mask = eos_cum == 0
-        if not bool(alive_mask.any()):
-            return None
-        tokens = suffix[alive_mask]
-        vocab = int(tokens.max().item()) + 1
-        counts = torch.bincount(tokens, minlength=vocab).to(torch.float32)
-        return _entropy_from_counts(counts, eps=self.eps)
-
-    def _batch_pos_entropy_tokens(
-        self, suffix: torch.Tensor, termination_token_id: int, max_pos: Optional[int]
-    ) -> Optional[torch.Tensor]:
-        B, L = suffix.shape
-        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
-        ent_acc = torch.zeros((), device=suffix.device, dtype=torch.float32)
-        ent_cnt = torch.zeros((), device=suffix.device, dtype=torch.float32)
-        limit = L if max_pos is None else min(L, int(max_pos))
-        vocab = int(suffix.max().item()) + 1
-        for t in range(limit):
-            mask = eos_cum[:, t] == 0
-            if not bool(mask.any()):
-                continue
-            toks = suffix[mask, t]
-            counts = torch.bincount(toks, minlength=vocab).to(torch.float32)
-            ent_acc = ent_acc + _entropy_from_counts(counts, eps=self.eps)
-            ent_cnt = ent_cnt + 1.0
-        if ent_cnt.item() == 0:
-            return None
-        return ent_acc / ent_cnt.clamp_min(1.0)
-
-    def _batch_pos_entropy_logits(
-        self,
-        policy_logits: torch.Tensor,
-        suffix: torch.Tensor,
-        termination_token_id: int,
-        max_pos: Optional[int],
-    ) -> Optional[torch.Tensor]:
-        if policy_logits is None:
-            return None
-        B, L = suffix.shape
-        logits = policy_logits[:, :L, :]
-        ptheta = logits.log_softmax(dim=-1).exp()
-        eos_cum = (suffix == termination_token_id).cumsum(dim=1)
-        ent_acc = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
-        ent_cnt = torch.zeros((), device=suffix.device, dtype=ptheta.dtype)
-        limit = L if max_pos is None else min(L, int(max_pos))
-        for t in range(limit):
-            mask = eos_cum[:, t] == 0
-            if not bool(mask.any()):
-                continue
-            p_bar = ptheta[mask, t].mean(dim=0)
-            ent_acc = ent_acc + (-(p_bar * p_bar.add(self.eps).log())).sum()
-            ent_cnt = ent_cnt + 1.0
-        if ent_cnt.item() == 0:
-            return None
-        return ent_acc / ent_cnt.clamp_min(1.0)
-
-    def forward(
-        self,
-        log_pf: torch.Tensor,
-        log_r: torch.Tensor,
-        log_pterm: torch.Tensor,
-        generated_text: torch.Tensor,
-        termination_token_id: int,
-        prompt_len: int,
-        policy_logits: Optional[torch.Tensor] = None,
-        weight_overrides: Optional[dict] = None,
-        global_step: Optional[int] = None,
-        **kwargs,
-    ) -> dict[str, torch.Tensor]:
-        suffix = generated_text[:, prompt_len:]
-        subtb_out = self.base_subtb(
-            log_pf=log_pf,
-            log_r=log_r,
-            log_pterm=log_pterm,
-            generated_text=generated_text,
-            termination_token_id=termination_token_id,
-            prompt_len=prompt_len,
-        )
-        subtb_loss = subtb_out["loss"] if isinstance(subtb_out, dict) else subtb_out
-        loss_total = subtb_loss
-        logs = {"loss_subtb": subtb_loss.detach()}
-
-        seq_w = self._resolve_weight(
-            "seq_diversity_weight", self.seq_diversity_weight, weight_overrides
-        )
-        pos_w = self._resolve_weight(
-            "pos_diversity_weight", self.pos_diversity_weight, weight_overrides
-        )
-
-        if seq_w >= 0.0:
-            seq_ent = self._batch_seq_entropy(suffix, termination_token_id)
-            if seq_ent is not None:
-                loss_total = loss_total - seq_w * seq_ent
-                logs["loss_batch_seq_entropy"] = (-seq_w * seq_ent).detach()
-
-        if pos_w >= 0.0:
-            if self.use_logits:
-                pos_ent = self._batch_pos_entropy_logits(
-                    policy_logits, suffix, termination_token_id, self.pos_max
-                )
-            else:
-                pos_ent = self._batch_pos_entropy_tokens(
-                    suffix, termination_token_id, self.pos_max
-                )
-            if pos_ent is not None:
-                loss_total = loss_total - pos_w * pos_ent
-                logs["loss_batch_pos_entropy"] = (-pos_w * pos_ent).detach()
-
-        logs["loss"] = loss_total
-        return logs

@@ -252,6 +252,7 @@ class BufferDataModule(LightningDataModule):
             self.buffer_sample = torch.load(buffer_sample_path)
         else:
             self.buffer_sample = None
+        self.dataset_buffer = self.buffer_sample
 
     def prepare_data(self) -> None:
         pass

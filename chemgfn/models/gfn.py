@@ -83,6 +83,7 @@ class ChemGFNModule(LightningModule):
         optimizer: Callable[[Any], torch.optim.Optimizer],
         scheduler: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler.LRScheduler] | None,
         factor_schedulers: dict[str, Any],
+        coverage_config: dict[str, Any] | None = None,
         compile_model: bool | None = None,
         compile: bool | None = None,
         disable_peft: bool = False,
@@ -120,6 +121,18 @@ class ChemGFNModule(LightningModule):
         self.constraint_config = constraint_config
         self.training_mixed_config = training_mixed_config
         self.end_of_sentence_token_id: int = int(self.tokenizer.eos_token_id)
+        eos_override = getattr(self.constraint_config, "end_of_sentence_token", None) or getattr(
+            self.constraint_config, "termination_token", None
+        )
+        if eos_override is not None:
+            eos_text = str(eos_override)
+            token_ids = self.tokenizer.encode(eos_text, add_special_tokens=False)
+            if len(token_ids) != 1:
+                raise ValueError(
+                    "end_of_sentence_token/termination_token must map to exactly one token. "
+                    f"Got {len(token_ids)} tokens for {eos_text!r}: {token_ids}"
+                )
+            self.end_of_sentence_token_id = int(token_ids[0])
 
         # Initialize all schedulers from config
         # Can use either hydra instantiate or direct parameter specification
@@ -141,6 +154,11 @@ class ChemGFNModule(LightningModule):
         self.reward = reward
         self.reward_buffer: ReplayBuffer = reward_buffer
         self.reward_buffer.set_termination_token_id(self.end_of_sentence_token_id)
+
+        # Keep reward/validator termination consistent with our generation EOS.
+        sentence_validator = getattr(self.reward, "sentence_validator", None)
+        if sentence_validator is not None and hasattr(sentence_validator, "termination_token_id"):
+            sentence_validator.termination_token_id = int(self.end_of_sentence_token_id)
         (
             self.legal_tokens_mask,
             self.illegal_tokens_mask,
@@ -239,6 +257,15 @@ class ChemGFNModule(LightningModule):
         self.test_condvar_ref_log_pterm: list[torch.Tensor] = []
         self.test_repeat_suffix: str = ""
         self.test_repeat_suffix: str = ""
+
+        self.coverage_config = coverage_config or {}
+        self._coverage_enabled = bool(self.coverage_config.get("enabled", False))
+        self._coverage_reference_set: set[tuple[int, ...]] = set()
+        self._coverage_seen_set: set[tuple[int, ...]] = set()
+        self._coverage_total = 0
+        self._coverage_steps_to_full: int | None = None
+        self._coverage_total_samples = 0
+        self._coverage_initialized = False
 
         self.skip_baseline_sampling = self.training_mixed_config.skip_baseline_sampling
         # If True, skip heavy epoch-end logging and only persist replay buffer.
@@ -584,6 +611,7 @@ class ChemGFNModule(LightningModule):
             prompt_len=prompt_len,
         )
         tokens = generated_text[:, prompt_len:]
+        self._update_coverage_from_tokens(tokens)
         self._accumulate_log_pterm_by_length(
             tokens,
             log_pterm,
@@ -731,7 +759,7 @@ class ChemGFNModule(LightningModule):
             replay_buffer_stats = self.reward_buffer.stat()
             self._log_metrics(
                 {
-                    f"train/replay_buffer_{key}": value
+                    f"train/replay_buffer_{key}": float(value)
                     for key, value in replay_buffer_stats.items()
                 },
                 on_step=True,
@@ -783,7 +811,15 @@ class ChemGFNModule(LightningModule):
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         encoded_prompt = batch["encoded_prompt"]
         prompt_len = encoded_prompt.shape[-1]
-        result_dict = self.forward(batch, reward_temperature=1.0, pf_temperature=1.0)
+        pf_temp_eval = getattr(self.training_mixed_config, "pf_temp_eval", None)
+        pf_temp_eval = (
+            pf_temp_eval
+            if pf_temp_eval is not None
+            else getattr(self.training_mixed_config, "pf_temp_high", 1.0)
+        )
+        result_dict = self.forward(
+            batch, reward_temperature=1.0, pf_temperature=float(pf_temp_eval)
+        )
         generated_text = result_dict["state"]
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
@@ -835,6 +871,7 @@ class ChemGFNModule(LightningModule):
             prompt_len=prompt_len,
         )
         tokens = generated_text[:, prompt_len:]
+        self._update_coverage_from_tokens(tokens)
         self._accumulate_log_pterm_by_length(
             tokens,
             log_pterm,
@@ -908,6 +945,12 @@ class ChemGFNModule(LightningModule):
             self.val_batch_fp_div_topk_count += 1
         self._log_validator_core_metrics(
             "val",
+            validator_metric_dict,
+            sync_dist=True,
+            on_epoch=True,
+        )
+        self._log_validator_full_metrics(
+            "val/validator",
             validator_metric_dict,
             sync_dist=True,
             on_epoch=True,
@@ -1023,7 +1066,15 @@ class ChemGFNModule(LightningModule):
     def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         encoded_prompt = batch["encoded_prompt"]
         prompt_len = encoded_prompt.shape[-1]
-        result_dict = self.forward(batch, reward_temperature=1.0, pf_temperature=1.0)
+        pf_temp_eval = getattr(self.training_mixed_config, "pf_temp_eval", None)
+        pf_temp_eval = (
+            pf_temp_eval
+            if pf_temp_eval is not None
+            else getattr(self.training_mixed_config, "pf_temp_high", 1.0)
+        )
+        result_dict = self.forward(
+            batch, reward_temperature=1.0, pf_temperature=float(pf_temp_eval)
+        )
         generated_text = result_dict["state"]
         log_pf = result_dict["log_pf"]
         log_pterm = result_dict["log_pterm"]
@@ -1946,6 +1997,7 @@ class ChemGFNModule(LightningModule):
                     json.dump(metrics, f, indent=2, sort_keys=True)
 
     def on_train_start(self):
+        self._init_coverage_reference()
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
         val_probes = torch.utils.data.Subset(
             val_dataset, random.sample(range(len(val_dataset)), 10)
@@ -2121,7 +2173,18 @@ class ChemGFNModule(LightningModule):
                     generated_text,
                 )
                 generated_text = self.tokenizer.batch_decode(generated_text)
-                generated_text = [text.replace(".", "") for text in generated_text]
+                eos_piece = self.tokenizer.decode(
+                    [int(self.end_of_sentence_token_id)], skip_special_tokens=False
+                )
+                eos_piece = eos_piece.strip()
+                if eos_piece:
+                    stripped: list[str] = []
+                    for text in generated_text:
+                        t = text.rstrip()
+                        if t.endswith(eos_piece):
+                            t = t[: -len(eos_piece)]
+                        stripped.append(t)
+                    generated_text = stripped
                 return {"sample": generated_text}
 
         samples = {}
@@ -2272,6 +2335,109 @@ class ChemGFNModule(LightningModule):
         if isinstance(value, (float, int)):
             return torch.tensor(value, device=self.device)
         return value
+
+    def _normalize_sequence_for_coverage(
+        self, sequence: list[int] | torch.Tensor
+    ) -> tuple[int, ...] | None:
+        if isinstance(sequence, torch.Tensor):
+            sequence = sequence.detach().cpu().tolist()
+        if not sequence:
+            return None
+        token_ids = [int(x) for x in sequence]
+        token_ids = self._strip_eos_token_ids(token_ids)
+        token_ids = self._strip_special_token_ids(token_ids)
+        if not token_ids:
+            return None
+        return tuple(token_ids)
+
+    def _iter_coverage_reference_sequences(self, reference: Any) -> list[list[int]]:
+        sequences: list[list[int]] = []
+        if isinstance(reference, torch.Tensor):
+            if reference.dim() == 2:
+                sequences = reference.detach().cpu().tolist()
+            elif reference.dim() == 1:
+                sequences = [reference.detach().cpu().tolist()]
+        elif isinstance(reference, (list, tuple)):
+            for entry in reference:
+                if isinstance(entry, torch.Tensor):
+                    sequences.append(entry.detach().cpu().tolist())
+                elif isinstance(entry, (list, tuple)):
+                    sequences.append([int(x) for x in entry])
+        return sequences
+
+    def _init_coverage_reference(self) -> None:
+        if not self._coverage_enabled or self._coverage_initialized:
+            return
+
+        reference = None
+        source = self.coverage_config.get("reference_source", "dataset_buffer")
+        if source == "dataset_buffer":
+            datamodule = getattr(self.trainer, "datamodule", None)
+            if datamodule is not None:
+                reference = getattr(datamodule, "buffer_sample", None)
+                if reference is None:
+                    reference = getattr(datamodule, "dataset_buffer", None)
+
+        if reference is None:
+            reference_path = self.coverage_config.get("reference_path")
+            if reference_path and os.path.exists(reference_path):
+                reference = torch.load(reference_path, map_location="cpu")
+
+        reference_set: set[tuple[int, ...]] = set()
+        for seq in self._iter_coverage_reference_sequences(reference):
+            norm = self._normalize_sequence_for_coverage(seq)
+            if norm is not None:
+                reference_set.add(norm)
+
+        self._coverage_reference_set = reference_set
+        self._coverage_total = len(reference_set)
+        self._coverage_initialized = True
+
+    def _update_coverage_from_tokens(self, tokens: torch.Tensor) -> None:
+        if not self._coverage_enabled:
+            return
+        if not self._coverage_initialized:
+            self._init_coverage_reference()
+        if not self._coverage_reference_set:
+            return
+
+        sequences = self._strip_eos_from_batch(tokens)
+        self._coverage_total_samples += len(sequences)
+        for seq in sequences:
+            norm = self._normalize_sequence_for_coverage(seq)
+            if norm is None:
+                continue
+            if norm in self._coverage_reference_set:
+                self._coverage_seen_set.add(norm)
+
+        coverage_num = len(self._coverage_seen_set)
+        coverage_total = self._coverage_total
+        coverage_rate = coverage_num / float(coverage_total) if coverage_total else 0.0
+        unique_correct_rate = (
+            coverage_num / float(self._coverage_total_samples)
+            if self._coverage_total_samples
+            else 0.0
+        )
+        if (
+            self._coverage_steps_to_full is None
+            and coverage_total
+            and coverage_num >= coverage_total
+        ):
+            self._coverage_steps_to_full = int(self.global_step)
+        steps_to_full = (
+            self._coverage_steps_to_full if self._coverage_steps_to_full is not None else -1
+        )
+
+        self._log_metrics(
+            {
+                "coverage/overall_rate": coverage_rate,
+                "coverage/overall_num": coverage_num,
+                "coverage/unique_correct_rate": unique_correct_rate,
+                "coverage/steps_to_full": steps_to_full,
+            },
+            on_step=True,
+            sync_dist=True,
+        )
 
     def _strip_special_token_ids(self, token_ids: list[int]) -> list[int]:
         special_ids = set(self.tokenizer.all_special_ids)

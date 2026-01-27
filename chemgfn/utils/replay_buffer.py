@@ -26,7 +26,9 @@ except Exception:
 
 class ReplayBuffer:
     """
-    A relay buffer that uses a heap to keep the max_size items with the highest reward
+    A relay buffer that uses a heap to keep the max_size items with the highest reward.
+    Adds reward-prioritized replay sampling (Shen et al., 2023) while keeping the
+    original add/add_batch/sample interfaces intact.
     """
 
     def __init__(
@@ -35,11 +37,20 @@ class ReplayBuffer:
         sim_tolerance=0.25,
         strict_mode: bool = False,
         buffer_aug_value: float = 0,
+        prioritized_replay: bool = False,
+        replay_alpha: float = 0.7,
+        replay_beta: float = 0.2,
+        min_replay_size: int = 1,
     ):
         self.buffer_size = buffer_size
         self.sim_tolerance = sim_tolerance
         self.strict_mode = strict_mode
         self.buffer_aug_value = buffer_aug_value
+        self.prioritized_replay = prioritized_replay
+        self.replay_alpha = float(max(0.0, min(1.0, replay_alpha)))
+        self.replay_beta = float(max(0.0, min(1.0, replay_beta)))
+        self.min_replay_size = max(1, int(min_replay_size))
+        self.termination_token_id = None
         self.reset()
 
     def set_termination_token_id(self, termination_token_id):
@@ -52,8 +63,18 @@ class ReplayBuffer:
         """
         add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
         """
-        # if item is already in the buffer, skip it
+        if self.termination_token_id is None:
+            raise ValueError(
+                "termination_token_id is not set. Call set_termination_token_id first."
+            )
+
         str_prompt = item["str_prompt"]
+        if str_prompt not in self._buffer:
+            self._buffer[str_prompt] = {
+                "tensor_prompt": item.get("tensor_prompt"),
+                "sentences": [],
+                "exists": set(),
+            }
 
         # Hashable string for prompt+answer
         if item["str_sentence"] in self._buffer[str_prompt]["exists"]:
@@ -69,6 +90,9 @@ class ReplayBuffer:
         )
         buffer = self._buffer[str_prompt]["sentences"]
 
+        if self.strict_mode and (not force_add):
+            return
+
         for buffer_item in list(buffer):  # Iterate over a copy
             existing_answer = [
                 x for x in buffer_item[3].tolist() if x != self.termination_token_id
@@ -82,27 +106,18 @@ class ReplayBuffer:
             ):
                 if buffer_item[0] >= item["logreward"] and (not force_add):
                     return
-        # Critical fix: Only add to 'exists' AFTER successful heap insertion
-        if len(buffer) >= self.buffer_size:
-            # Push off the smallest item if buffer is full
-            popped = heapq.heappop(buffer)
-            # self._buffer[str_prompt]["exists"].remove(popped[1])
+
+        if force_add:
+            new_item = list(new_item)
+            # ensure validated items are preferred
+            new_item[-2][..., -1] = new_item[-2][..., -1] + self.buffer_aug_value
+            new_item = tuple(new_item)
+
+        inserted, popped = self._safe_heappush(buffer, new_item)
+        if inserted:
+            if popped is not None and popped[1] in self._buffer[str_prompt]["exists"]:
+                self._buffer[str_prompt]["exists"].remove(popped[1])
             self._buffer[str_prompt]["exists"].add(item["str_sentence"])
-        else:
-            if force_add:
-                new_item = list(new_item)
-                # ensure validated items are preferred
-                new_item[-2][..., -1] = new_item[-2][..., -1] + self.buffer_aug_value
-                new_item = tuple(new_item)
-            if self.strict_mode:
-                if force_add:
-                    heapq.heappush(buffer, new_item)
-                    self._buffer[str_prompt]["exists"].add(item["str_sentence"])
-                else:
-                    return
-            else:
-                heapq.heappush(buffer, new_item)
-                self._buffer[str_prompt]["exists"].add(item["str_sentence"])
 
     def add_batch(self, prompt, sentences, logrewards, tokenizer, result_dict=None):
         """
@@ -155,11 +170,9 @@ class ReplayBuffer:
         if len(self._buffer[str_prompt]["sentences"]) < batch_size:
             return None, None
         prompt_buffer = self._buffer[str_prompt]["sentences"]
-        idx = np.random.choice(
-            len(prompt_buffer),
-            batch_size,
-            replace=True,
-        )
+        idx = self._prioritized_indices(prompt_buffer, batch_size)
+        if idx is None or len(idx) == 0:
+            return None, None
         return torch.nn.utils.rnn.pad_sequence(
             [prompt_buffer[i][2] for i in idx],
             batch_first=True,
@@ -185,6 +198,73 @@ class ReplayBuffer:
                 }
             )
         return stats
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _safe_heappush(self, heap, item: tuple) -> Tuple[bool, Optional[tuple]]:
+        """
+        Keep the top-K items by reward (item[0]). Returns (inserted, popped_item).
+        """
+        if self.buffer_size <= 0:
+            return False, None
+
+        if len(heap) < self.buffer_size:
+            heapq.heappush(heap, item)
+            return True, None
+
+        popped = heapq.heappushpop(heap, item)
+        # If the new item was the smallest, it is returned and not stored.
+        if popped is item:
+            return False, None
+        return True, popped
+
+    def _prioritized_indices(self, buffer: list, batch_size: int) -> Optional[np.ndarray]:
+        """
+        Reward-prioritized replay sampling inspired by Shen et al. (2023):
+        α fraction from the top-β reward tier, the rest from the lower tier.
+        Falls back to uniform sampling when prioritization is disabled or not feasible.
+        """
+        n = len(buffer)
+        if batch_size <= 0:
+            return None
+        if (not self.prioritized_replay) or n < self.min_replay_size:
+            return np.random.choice(n, batch_size, replace=True)
+
+        rewards = np.array([float(item[0]) for item in buffer], dtype=np.float64)
+        if rewards.size == 0:
+            return None
+
+        beta = self.replay_beta
+        alpha = self.replay_alpha
+        if beta <= 0.0:
+            return np.random.choice(n, batch_size, replace=True)
+
+        sorted_idx = np.argsort(rewards)  # ascending
+        high_count = max(1, int(math.ceil(beta * n)))
+        high_idx = sorted_idx[-high_count:]
+        low_idx = sorted_idx[: n - high_count] if n - high_count > 0 else high_idx
+
+        num_high = int(round(batch_size * alpha))
+        num_high = min(batch_size, max(0, num_high))
+        num_low = batch_size - num_high
+
+        def _sample(pool, k):
+            if k <= 0:
+                return np.array([], dtype=int)
+            replace = len(pool) < k
+            return np.random.choice(pool, k, replace=replace)
+
+        chosen_high = _sample(high_idx, num_high)
+        chosen_low = _sample(low_idx, num_low)
+
+        if chosen_high.size + chosen_low.size == 0:
+            return np.random.choice(n, batch_size, replace=True)
+
+        chosen = np.concatenate([chosen_high, chosen_low])
+        np.random.shuffle(chosen)
+        return chosen
 
     def print(self):
         for key in self._buffer:

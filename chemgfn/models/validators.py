@@ -224,8 +224,11 @@ class CoLASentenceValidator(SentenceValidator):
             invalid_prob = self._batch_invalid_prob(texts).to(device)
 
             invalid_mask = invalid_prob > self.invalid_threshold
-            invalid[~done, pos + 1] = invalid_mask[~done].float()
-            local_score[~done, pos + 1] = 1.0 - invalid_prob[~done]
+            invalid[~done, pos + 1] = invalid_mask[~done].to(dtype=invalid.dtype)
+            # Set local score to 0 on invalid positions; otherwise 1 - prob
+            safe_score = (1.0 - invalid_prob).clamp(min=0.0)
+            safe_score = torch.where(invalid_mask, torch.zeros_like(safe_score), safe_score)
+            local_score[~done, pos + 1] = safe_score[~done].to(dtype=local_score.dtype)
 
         for i in range(batch_size):
             row = sentences[i]
@@ -248,10 +251,241 @@ class CoLASentenceValidator(SentenceValidator):
         }
 
 
+class InfillSentenceValidator(SentenceValidator):
+    """Validator + evaluator for story infilling completions."""
+
+    name = "infill_sentence"
+    requires_target_molecule = False
+
+    def __init__(
+        self,
+        termination_token_id: int = -1,
+        bertscore_model_name: str = "microsoft/deberta-xlarge-mnli",
+        bertscore_lang: str = "en",
+        bertscore_rescale: bool = True,
+        compute_bleu: bool = True,
+        compute_gleu: bool = True,
+        compute_bertscore: bool = True,
+        compute_glue: bool = False,
+        glue_model_name: str = "textattack/roberta-base-CoLA",
+        glue_batch_size: int = 32,
+        skip_train_metrics: bool = True,
+    ) -> None:
+        super().__init__(self.name, termination_token_id=termination_token_id)
+        self.compute_bleu = bool(compute_bleu)
+        self.compute_gleu = bool(compute_gleu)
+        self.compute_bertscore = bool(compute_bertscore)
+        self.compute_glue = bool(compute_glue)
+        self.glue_batch_size = int(glue_batch_size)
+        self.skip_train_metrics = bool(skip_train_metrics)
+
+        self.bertscore_model_name = bertscore_model_name
+        self.bertscore_lang = bertscore_lang
+        self.bertscore_rescale = bool(bertscore_rescale)
+
+        self._bertscorer = None
+
+        self._glue_tokenizer = None
+        self._glue_model = None
+        if self.compute_glue:
+            self._glue_tokenizer = AutoTokenizer.from_pretrained(glue_model_name)
+            self._glue_model = AutoModelForSequenceClassification.from_pretrained(
+                glue_model_name, device_map="auto"
+            )
+            self._glue_model.eval()
+
+    def _get_bertscorer(self):
+        if not self.compute_bertscore:
+            return None
+        if self._bertscorer is not None:
+            return self._bertscorer
+        try:
+            from bert_score import BERTScorer
+        except ImportError as exc:
+            raise ImportError(
+                "BERTScore is required. Install with `pip install bert-score`."
+            ) from exc
+        device = "cpu"
+        self._bertscorer = BERTScorer(
+            model_type=self.bertscore_model_name,
+            lang=self.bertscore_lang,
+            rescale_with_baseline=self.bertscore_rescale,
+            device=device,
+        )
+        self._bertscore_device = device
+        # Ensure stable float32 compute (avoid bf16 autocast issues).
+        try:
+            model = getattr(self._bertscorer, "_model", None)
+            if model is not None:
+                model = model.float().to(dtype=torch.float32)
+                self._bertscorer._model = model
+        except Exception:
+            pass
+        return self._bertscorer
+
+    def _decode_batch(self, sentences: Tensor, tokenizer: PreTrainedTokenizer) -> list[str]:
+        termination_token_id = (
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        decoded: list[str] = []
+        for row in sentences:
+            try:
+                stop_pos = (row == termination_token_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = row.shape[0]
+            text = tokenizer.decode(row[:stop_pos], skip_special_tokens=False).strip()
+            decoded.append(text)
+        return decoded
+
+    @torch.no_grad()
+    def _glue_scores(self, candidates: list[str]) -> torch.Tensor:
+        if self._glue_model is None or self._glue_tokenizer is None:
+            return torch.zeros(len(candidates))
+        probs = []
+        for start in range(0, len(candidates), self.glue_batch_size):
+            batch = candidates[start : start + self.glue_batch_size]
+            inputs = self._glue_tokenizer(batch, padding=True, return_tensors="pt").to(
+                self._glue_model.device
+            )
+            logits = self._glue_model(**inputs).logits
+            batch_probs = logits.softmax(dim=-1)
+            probs.append(batch_probs[:, 1].detach().cpu())
+        return torch.cat(probs, dim=0)
+
+    def accuracy(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        reference: str | list[str] | None = None,
+        **kwargs,
+    ) -> dict[str, float]:
+        if self.skip_train_metrics and torch.is_grad_enabled():
+            return {}
+        if reference is None:
+            return {}
+
+        candidates = self._decode_batch(sentences, tokenizer)
+        if isinstance(reference, (list, tuple)):
+            refs = [str(x) for x in reference]
+        else:
+            refs = [str(reference)] * len(candidates)
+
+        # Match eval_infill.py: drop the first character of generated text.
+        candidates = [cand[1:] if cand else cand for cand in candidates]
+
+        metrics: dict[str, float] = {}
+
+        if self.compute_bleu or self.compute_gleu:
+            from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+            from nltk.translate.gleu_score import sentence_gleu
+
+            bleu_scores = []
+            gleu_scores = []
+            for cand, ref in zip(candidates, refs):
+                ref_tokens = ref.split()
+                cand_tokens = cand.split()
+                if self.compute_bleu:
+                    bleu_scores.append(
+                        sentence_bleu(
+                            [ref_tokens],
+                            cand_tokens,
+                            smoothing_function=SmoothingFunction().method1,
+                        )
+                    )
+                if self.compute_gleu:
+                    gleu_scores.append(sentence_gleu([ref_tokens], cand_tokens))
+            if self.compute_bleu:
+                metrics["bleu"] = float(sum(bleu_scores) / max(1, len(bleu_scores)))
+            if self.compute_gleu:
+                metrics["gleu"] = float(sum(gleu_scores) / max(1, len(gleu_scores)))
+
+        if self.compute_bertscore:
+            scorer = self._get_bertscorer()
+            if scorer is not None:
+                use_cpu = (
+                    torch.is_autocast_enabled()
+                    and torch.get_autocast_gpu_dtype() == torch.bfloat16
+                )
+                if use_cpu and getattr(scorer, "device", "cuda") != "cpu":
+                    try:
+                        scorer.device = "cpu"
+                        model = getattr(scorer, "_model", None)
+                        if model is not None:
+                            scorer._model = model.to("cpu")
+                    except Exception:
+                        pass
+                with torch.inference_mode():
+                    with torch.autocast(device_type="cuda", enabled=False):
+                        _, _, f1 = scorer.score(candidates, refs, verbose=False)
+                if use_cpu and getattr(self, "_bertscore_device", None) == "cuda":
+                    try:
+                        scorer.device = "cuda"
+                        model = getattr(scorer, "_model", None)
+                        if model is not None:
+                            scorer._model = model.to("cuda")
+                    except Exception:
+                        pass
+                metrics["bertscore_f1"] = float(f1.mean().item())
+
+        if self.compute_glue:
+            glue_probs = self._glue_scores(candidates)
+            if glue_probs.numel() > 0:
+                metrics["glue"] = float(glue_probs.mean().item())
+                metrics["glue_acc"] = float((glue_probs > 0.5).float().mean().item())
+
+        return metrics
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        reference: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor | list[str]]:
+        if sentences is None or sentences.ndim < 1:
+            empty = torch.zeros(
+                1, device=sentences.device if torch.is_tensor(sentences) else "cpu"
+            )
+            return {
+                "invalid": empty.unsqueeze(1),
+                "global_score": empty + 1.0,
+                "local_score": empty.unsqueeze(1),
+                "full_tokens": [""],
+            }
+
+        termination_token_id = (
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        invalid = torch.zeros(batch_size, seq_len + 1, device=device)
+        invalid[:, 0] = 0.0
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.ones(batch_size, device=device)
+
+        full_tokens = []
+        for row in sentences:
+            try:
+                stop_pos = (row == termination_token_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = seq_len
+            text = tokenizer.decode(row[:stop_pos], skip_special_tokens=False).strip()
+            full_tokens.append(text)
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,
+            "local_score": local_score,
+            "full_tokens": full_tokens,
+        }
+
+
 class Expr24Validator(SentenceValidator):
     """
     Target-sum validator (default target=24).
-    Supports variable-length expressions without parentheses, with digits and +-*/,
+    Supports variable-length expressions with digits and +-*/, optionally with parentheses,
     evaluated using standard precedence. Scoring modes:
       - hit24        : 1.0 if expression == target else 0.0
       - near_24      : 1.0 at target, linearly decays with distance to 0.0
@@ -259,13 +493,12 @@ class Expr24Validator(SentenceValidator):
       - near_24_dense: near_24 but local_score filled for every valid prefix
     """
 
-    TOKEN_RE = re.compile(r"\d+|[+\-*/]")
-
     def __init__(
         self,
         scorer: str = "hit24",
         amortize_valid_state: bool = False,
         target_value: int | float = 24,
+        allow_parentheses: bool = False,
     ) -> None:
         if scorer not in {"hit24", "near_24", "hit24_dense", "near_24_dense"}:
             raise ValueError(f"Unsupported scorer for Expr24Validator: {scorer}")
@@ -276,6 +509,9 @@ class Expr24Validator(SentenceValidator):
 
         # Whether to amortize the valid state of the expression to the entire batch
         self.amortize_valid_state = amortize_valid_state
+        self.allow_parentheses = bool(allow_parentheses)
+        token_pattern = r"\d+|[+\-*/]" if not self.allow_parentheses else r"\d+|[+\-*/()]"
+        self.token_re = re.compile(token_pattern)
 
     def _decode_expr(self, tokens: Tensor, tokenizer: PreTrainedTokenizer) -> str | None:
         try:
@@ -395,56 +631,158 @@ class Expr24Validator(SentenceValidator):
         normalized = expr.replace("\u00d7", "*").replace("\u00f7", "/").replace(" ", "")
         if not normalized:
             return None
-        tokens = self.TOKEN_RE.findall(normalized)
+        tokens = self.token_re.findall(normalized)
         if "".join(tokens) != normalized:
             return None
         return tokens
 
     def _parse_and_eval(self, tokens: list[str]) -> Fraction | None:
-        if len(tokens) == 0 or len(tokens) % 2 == 0:
+        if len(tokens) == 0:
             return None
 
-        # Validate token alternation: number, (op, number)*
-        for idx, tk in enumerate(tokens):
-            if idx % 2 == 0:
-                if not tk.isdigit():
-                    return None
-            else:
-                if tk not in "+-*/":
-                    return None
-
-        try:
-            values: list[Fraction] = [Fraction(int(tokens[0]))]
-        except Exception:
-            return None
-
-        pending_ops: list[str] = []
-        try:
-            for idx in range(1, len(tokens), 2):
-                op = tokens[idx]
-                nxt = Fraction(int(tokens[idx + 1]))
-
-                if op in "*/":
-                    prev = values.pop()
-                    if op == "*":
-                        values.append(prev * nxt)
-                    else:
-                        if nxt == 0:
-                            return None
-                        values.append(prev / nxt)
+        # Fast path: no parentheses allowed/used -> original alternating pattern
+        if not self.allow_parentheses:
+            if len(tokens) % 2 == 0:
+                return None
+            for idx, tk in enumerate(tokens):
+                if idx % 2 == 0:
+                    if not tk.isdigit():
+                        return None
                 else:
-                    values.append(nxt)
-                    pending_ops.append(op)
-        except Exception:
+                    if tk not in "+-*/":
+                        return None
+            try:
+                values: list[Fraction] = [Fraction(int(tokens[0]))]
+            except Exception:
+                return None
+
+            pending_ops: list[str] = []
+            try:
+                for idx in range(1, len(tokens), 2):
+                    op = tokens[idx]
+                    nxt = Fraction(int(tokens[idx + 1]))
+
+                    if op in "*/":
+                        prev = values.pop()
+                        if op == "*":
+                            values.append(prev * nxt)
+                        else:
+                            if nxt == 0:
+                                return None
+                            values.append(prev / nxt)
+                    else:
+                        values.append(nxt)
+                        pending_ops.append(op)
+            except Exception:
+                return None
+
+            try:
+                result = values[0]
+                for op, val in zip(pending_ops, values[1:]):
+                    result = result + val if op == "+" else result - val
+                return result
+            except Exception:
+                return None
+
+        # Parentheses-capable parser using shunting-yard + eval
+        def precedence(op: str) -> int:
+            return 2 if op in "*/" else 1
+
+        def apply_op(op: str, b: Fraction, a: Fraction) -> Fraction | None:
+            try:
+                if op == "+":
+                    return a + b
+                if op == "-":
+                    return a - b
+                if op == "*":
+                    return a * b
+                if op == "/":
+                    if b == 0:
+                        return None
+                    return a / b
+            except Exception:
+                return None
             return None
 
-        try:
-            result = values[0]
-            for op, val in zip(pending_ops, values[1:]):
-                result = result + val if op == "+" else result - val
-            return result
-        except Exception:
+        values: list[Fraction] = []
+        ops: list[str] = []
+
+        def pop_and_apply() -> bool:
+            if not ops or len(values) < 2:
+                return False
+            op = ops.pop()
+            b = values.pop()
+            a = values.pop()
+            res = apply_op(op, b, a)
+            if res is None:
+                return False
+            values.append(res)
+            return True
+
+        prev_token_type = None  # 'num' | ')' | 'op' | '('
+        for tk in tokens:
+            if tk.isdigit():
+                # number
+                values.append(Fraction(int(tk)))
+                prev_token_type = "num"
+            elif tk in "+-*/":
+                # operator cannot follow start, '(' or another operator
+                if prev_token_type not in {"num", ")"}:
+                    return None
+                while ops and ops[-1] not in "(" and precedence(ops[-1]) >= precedence(tk):
+                    if not pop_and_apply():
+                        return None
+                ops.append(tk)
+                prev_token_type = "op"
+            elif tk == "(":
+                # '(' allowed at start or after operator
+                if prev_token_type not in {None, "op", "("}:
+                    return None
+                ops.append(tk)
+                prev_token_type = "("
+            elif tk == ")":
+                if prev_token_type not in {"num", ")"}:
+                    return None
+                # pop until matching '('
+                found_lparen = False
+                while ops:
+                    top = ops.pop()
+                    if top == "(":
+                        found_lparen = True
+                        break
+                    if len(values) < 2:
+                        return None
+                    b = values.pop()
+                    a = values.pop()
+                    res = apply_op(top, b, a)
+                    if res is None:
+                        return None
+                    values.append(res)
+                if not found_lparen:
+                    return None
+                prev_token_type = ")"
+            else:
+                return None
+
+        if prev_token_type not in {"num", ")"}:
             return None
+
+        while ops:
+            op = ops.pop()
+            if op == "(":
+                return None
+            if len(values) < 2:
+                return None
+            b = values.pop()
+            a = values.pop()
+            res = apply_op(op, b, a)
+            if res is None:
+                return None
+            values.append(res)
+
+        if len(values) != 1:
+            return None
+        return values[0]
 
     def _score_value(self, value: Fraction) -> float:
         base_scorer = self.scorer.replace("_dense", "")
