@@ -1,0 +1,11 @@
+_target_: chemgfn.data.infill_story_datamodule.StoryInfillDataModule
+tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
+data_path: ${paths.root_dir}/gfn-lm-tuning/infill_subj_arithmetic/data/stories.csv
+train_start: 100
+train_end: 1000
+eval_start: 0
+eval_end: 100
+max_train_samples: null
+max_eval_samples: null
+num_workers: 0
+pin_memory: true

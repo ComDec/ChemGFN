@@ -1,0 +1,10 @@
+root   ::= expr
+expr   ::= factor
+       | factor op factor
+       | factor op factor op factor
+       | factor op factor op factor op factor
+       | factor op factor op factor op factor op factor
+       | factor op factor op factor op factor op factor op factor
+factor ::= num | "(" expr ")"
+op     ::= "+" | "-" | "*" | "/"
+num    ::= [0-9]

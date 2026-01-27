@@ -12,7 +12,7 @@ defaults:
 tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_CFG_TB_PRT"
+exp_name: "smiles_CFG_TB"
 seed: 42
 
 # ============================================================================
@@ -92,7 +92,6 @@ model:
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
-    prioritized_replay: True
     buffer_size: 200
     sim_tolerance: 0.25
     strict_mode: false

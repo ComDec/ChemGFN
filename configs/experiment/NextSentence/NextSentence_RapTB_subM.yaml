@@ -31,8 +31,12 @@ trainer:
 
 model:
   reward:
+    _target_: chemgfn.models.reward.NextSentence_Score_Positive_Mixed_Invalid_Mask
+    illegal_vocab_penalty: -50
+    grammar_disagree_penalty: -99
+    score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.validators.RuleSentenceValidator
+      _target_: chemgfn.models.validators.CoLASentenceValidator
 
   loss_fn:
     _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
@@ -45,11 +49,12 @@ model:
     target_mode: "mix"
     k_min: 2
     mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.1
+    soft_beta: 8.0
+    soft_rho: 0.3
 
   reward_buffer:
     _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    diversity_valid_only: true
     buffer_size: 200
     weight_div: 2.0
     weight_val: 1.0
@@ -97,7 +102,7 @@ model:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 20
-      end: 12
+      end: 8
       horizon: 5000
 
 data:

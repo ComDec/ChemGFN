@@ -1,14 +1,14 @@
 # @package _global_
 
 defaults:
-  - override /data: next_sentence
-  - override /model: next_sentence
+  - override /data: infill_story
+  - override /model: infill_story
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "next_sentence", "TB"]
+tags: ["ChemGFN", "infill_story", "SubTB"]
 
-exp_name: "NextSentence_TB"
+exp_name: "InfillStory_SubTB"
 seed: 27
 
 callbacks:
@@ -16,10 +16,10 @@ callbacks:
     monitor: "val/diversity"
     mode: "max"
     save_top_k: 0
-    save_last: true
+    save_last: false
 
 trainer:
-  max_steps: 5000
+  max_steps: 4000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -30,16 +30,8 @@ trainer:
   limit_val_batches: 50
 
 model:
-  reward:
-    _target_: chemgfn.models.reward.NextSentence_Score_Positive_Mixed_Invalid_Mask
-    illegal_vocab_penalty: -50
-    grammar_disagree_penalty: -99
-    score_function: "score_fast"
-    sentence_validator:
-      _target_: chemgfn.models.validators.CoLASentenceValidator
-
   loss_fn:
-    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
+    _target_: chemgfn.models.losses.ModifiedSubTBLoss
     subtb_lambda: 1.0
     eps: 1e-8
 
@@ -56,19 +48,16 @@ model:
 
   factor_schedulers:
     reward_temp:
-      horizon: 750
+      horizon: 1000
     replay_buffer:
       start: 0.25
       end: 0.5
-      horizon: 5000
+      horizon: 4000
     dataset_buffer:
       start: 0
       end: 0
-      horizon: 5000
+      horizon: 4000
     scaling_factor:
       start: 1
       end: 1
       horizon: 1000
-
-data:
-  limit_prompts: 1000

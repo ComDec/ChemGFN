@@ -29,11 +29,22 @@ scheduler:
   power: 1.0
 
 reward:
-  _target_: chemgfn.models.reward.FrozenModelSentenceGivenPrompt
+  _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
   invalid_start_ratio: 0.2
   invalid_end_ratio: 1.2
+  disable_peft: ${model.disable_peft}
+  illegal_vocab_penalty: 0
+  grammar_disagree_penalty: 0
+  phi_weight: 0
+  score_function: "score_fast"
   sentence_validator:
-    _target_: chemgfn.models.validators.CoLASentenceValidator
+    _target_: chemgfn.models.validators.InfillSentenceValidator
+    compute_bleu: true
+    compute_gleu: true
+    compute_bertscore: true
+    compute_glue: false
+    skip_train_metrics: true
+    bertscore_model_name: "microsoft/deberta-xlarge-mnli"
 
 loss_fn:
   _target_: chemgfn.models.losses.ModifiedSubTBLoss
@@ -43,7 +54,7 @@ loss_fn:
 reward_config:
   reward_temp_start: 2.0
   reward_temp_end: 0.8
-  reward_temp_horizon: 5000
+  reward_temp_horizon: 750
   diversity_metric: "sequence_embedding"
   diversity_model_name: "sentence-transformers/all-mpnet-base-v2"
 
@@ -56,36 +67,12 @@ reward_buffer:
 
 constraint_config:
   min_sentence_len: 1
-  max_sentence_len: 20
-  # NextSentence treats '.' as EOS (not tokenizer.eos_token_id).
-  end_of_sentence_token: "."
+  max_sentence_len: 25
   grammar_path: ${paths.assets_dir}/text_grammars/free.ebnf
   disable_grammar: true
   processor_type: "prefix"
   legal_tokens: null
-  illegal_tokens: [
-    "<|endoftext|>",
-    "\n", "\n\n", "\t", "\"", "\"\"", "\"\"\"",
-    "http", "https", "://", "www",
-    "Â", "\"?", "?\"",
-    "$$", "$$$$",
-    "@@", "@@@@", "@@@@@@@@",
-    "##", "###", "####", "########", "################", "################################",
-    "%%", "%%%%",
-    "^", "^^", "^^^^",
-    "&&",
-    "|", "||", "||||",
-    "~", "~~", "~~~~", "~~~~~~~~", "~~~~~~~~~~~~~~~~",
-    "!", "!!", "!!!", "!!!!", "!!!!!", "!!!!!!!!",
-    "?", "??", "????", "?????", "????????",
-    "..", "...", "....", ".....", "......", ".......", "........", ".........", ".............", "................", "..................", "........................", "................................", "................................................................",
-    "**", "***", "****", "*****", "********", "************", "****************", "********************************",
-    "--", "---", "----", "-----", "------", "-------", "--------", "---------", "----------", "-----------", "------------", "-------------", "--------------", "---------------", "----------------", "--------------------", "------------------------", "--------------------------------", "------------------------------------------------", "--------------------------------------------------------", "----------------------------------------------------------------",
-    "==", "===", "====", "======", "========", "============", "================", "================================", "================================================================",
-    "__", "___", "____", "_____", "______", "_______", "________", "________________", "________________________", "________________________________", "________________________________________________________________",
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-    "US", "Mr", "Mrs", "M", "Ms", "Dr", "Prof", "Jr", "St", "Av",
-  ]
+  illegal_tokens: []
   illegal_vocab_penalty: -50
   parse_mode: "limited"
 
@@ -100,6 +87,7 @@ training_mixed_config:
   buffer_mixture_ratio: 0.5
   skip_baseline_sampling: true
   opt_task: false
+  grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
 
 factor_schedulers:
   reward_temp:

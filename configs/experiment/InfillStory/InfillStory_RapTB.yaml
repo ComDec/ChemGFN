@@ -1,14 +1,14 @@
 # @package _global_
 
 defaults:
-  - override /data: next_sentence
-  - override /model: next_sentence
+  - override /data: infill_story
+  - override /model: infill_story
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "next_sentence", "TB"]
+tags: ["ChemGFN", "infill_story", "RapTB"]
 
-exp_name: "NextSentence_TB"
+exp_name: "InfillStory_RapTB"
 seed: 27
 
 callbacks:
@@ -16,7 +16,7 @@ callbacks:
     monitor: "val/diversity"
     mode: "max"
     save_top_k: 0
-    save_last: true
+    save_last: false
 
 trainer:
   max_steps: 5000
@@ -26,22 +26,23 @@ trainer:
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 400
+  limit_train_batches: 500
   limit_val_batches: 50
 
 model:
-  reward:
-    _target_: chemgfn.models.reward.NextSentence_Score_Positive_Mixed_Invalid_Mask
-    illegal_vocab_penalty: -50
-    grammar_disagree_penalty: -99
-    score_function: "score_fast"
-    sentence_validator:
-      _target_: chemgfn.models.validators.CoLASentenceValidator
-
   loss_fn:
-    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
+    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
+    aux_weight: 0.25
+    gamma: 0.99
+    detach_pterm_in_aux: true
     eps: 1e-8
+    extra_absorb_eps: 1e-6
+    target_mode: "mix"
+    k_min: 2
+    mix_weight: 0.5
+    soft_beta: 5.0
+    soft_rho: 0.1
 
   training_mixed_config:
     pf_temp_high: 2.0
@@ -56,7 +57,7 @@ model:
 
   factor_schedulers:
     reward_temp:
-      horizon: 750
+      horizon: 1000
     replay_buffer:
       start: 0.25
       end: 0.5
@@ -69,6 +70,9 @@ model:
       start: 1
       end: 1
       horizon: 1000
-
-data:
-  limit_prompts: 1000
+    k_min:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 20
+      end: 12
+      horizon: 5000

@@ -19,20 +19,24 @@ callbacks:
     save_last: true
 
 trainer:
-  max_steps: 4000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches: 400
+  limit_train_batches: 500
   limit_val_batches: 50
 
 model:
   reward:
+    _target_: chemgfn.models.reward.NextSentence_Score_Positive_Mixed_Invalid_Mask
+    illegal_vocab_penalty: -50
+    grammar_disagree_penalty: -99
+    score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.validators.RuleSentenceValidator
+      _target_: chemgfn.models.validators.CoLASentenceValidator
 
   loss_fn:
     _target_: chemgfn.models.losses.ModifiedSubTBBalanceLoss
@@ -56,11 +60,11 @@ model:
     replay_buffer:
       start: 0.25
       end: 0.5
-      horizon: 4000
+      horizon: 5000
     dataset_buffer:
       start: 0
       end: 0
-      horizon: 4000
+      horizon: 5000
     scaling_factor:
       start: 1
       end: 1

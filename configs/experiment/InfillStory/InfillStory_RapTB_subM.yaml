@@ -1,22 +1,22 @@
 # @package _global_
 
 defaults:
-  - override /data: next_sentence
-  - override /model: next_sentence
+  - override /data: infill_story
+  - override /model: infill_story
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "next_sentence", "RapTB", "submodular_buffer"]
+tags: ["ChemGFN", "infill_story", "RapTB", "submodular_buffer"]
 
-exp_name: "NextSentence_RapTB"
+exp_name: "InfillStory_RapTB_subM"
 seed: 27
 
 callbacks:
   checkpoint:
     monitor: "val/diversity"
     mode: "max"
-    save_top_k: 1
-    save_last: true
+    save_top_k: 0
+    save_last: false
 
 trainer:
   max_steps: 5000
@@ -30,14 +30,6 @@ trainer:
   limit_val_batches: 50
 
 model:
-  reward:
-    _target_: chemgfn.models.reward.NextSentence_Score_Positive_Mixed_Invalid_Mask
-    illegal_vocab_penalty: -50
-    grammar_disagree_penalty: -99
-    score_function: "score_fast"
-    sentence_validator:
-      _target_: chemgfn.models.validators.CoLASentenceValidator
-
   loss_fn:
     _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
@@ -49,8 +41,27 @@ model:
     target_mode: "mix"
     k_min: 2
     mix_weight: 0.5
-    soft_beta: 8.0
-    soft_rho: 0.3
+    soft_beta: 5.0
+    soft_rho: 0.1
+
+  reward_buffer:
+    _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
+    buffer_size: 200
+    weight_div: 2.0
+    weight_val: 1.0
+    weight_rew: 1.0
+    default_strategy: "standard"
+    validator_key: "global_score"
+    validator_type: "last"
+    stochastic_epsilon: 0.1
+    ltlg_epsilon: 0.1
+    set_function_obj:
+      _target_: chemgfn.utils.replay_buffer.FacilityLengthSetFunction
+    similarity_backend:
+      _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
+    length_bin_size: 2
+    length_alpha_power: 1.0
+    weight_len: 1.0
 
   training_mixed_config:
     pf_temp_high: 2.0
@@ -82,8 +93,5 @@ model:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 20
-      end: 8
+      end: 12
       horizon: 5000
-
-data:
-  limit_prompts: 1000

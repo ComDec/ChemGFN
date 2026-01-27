@@ -4,31 +4,31 @@
 # Run with: python chemgfn/train.py experiment=debug_expr24
 
 defaults:
-  - override /data: smiles_opt
-  - override /model: llama3_smiles_opt
+  - override /data: expr24
+  - override /model: llama3_expr24
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "expr12_toy", "CFG", "RapTB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
-exp_name: "smiles_CFG_TB_PRT"
+exp_name: "Expr12_Toy_RapTB"
 seed: 42
 
 # ============================================================================
 # Trainer Configuration
 # ============================================================================
 trainer:
-  max_steps:   5000
+  max_steps:   500
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
+  check_val_every_n_epoch: 1
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
   num_sanity_val_steps: 0
-  limit_train_batches:  500
-  limit_val_batches:  50
-
+  limit_train_batches:  100
+  limit_val_batches:  20
 
 # ============================================================================
 # Model Overrides (only parameters that differ from base config)
@@ -40,71 +40,49 @@ model:
     lr: 0.0001
 
   reward:
-    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Memory_PrefixShaping_NoBackoff
+    _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask_PrefixShaping
+    invalid_start_ratio: 0.2
+    invalid_end_ratio: 1.2
     disable_peft: ${model.disable_peft}
-
-     # config params
     illegal_vocab_penalty: 0
     grammar_disagree_penalty: 0 # for any baseline, we MUST set this to 0
-
-    # phi params
     phi_weight: 0
-
-    # reward strategy
-    reward_strategy: "smiles_absorbing"
-    smiles_len_weight: 0.0
-    smiles_score_clip: [0.0, 1.0]
-    pv_update_strategy: smiles_global_score
-
-    # entropy gate, UNDER DEVELOPMENT
-    use_entropy_gate: false
-    use_token_entropy_gate: false
-    ent_lo: 0.10
-    ent_hi: 0.55
-
-    # phi build params
-    phi_eta: 1.0
-    phi_clamp: 2.0
-
-    # split logic
-    pv_split: 2
-    pv_split_inclusive: true
-
-    # pv memory params
-    pv_memory_kwargs:
-      alpha: 1.0
-      gamma: 0.999
-      max_keys: 500000
-      prune_every: 200
-      prune_threshold: 1.0
-      tau_conf: 20.0
-
     score_function: "score_fast"
     sentence_validator:
-      _target_: chemgfn.models.validators.RDKitValidator
-      scorer: "qed"
-      backend: "pa"
+      _target_: chemgfn.models.validators.Expr24Validator
+      scorer: "hit24_dense"
+      target_value: 12
+      amortize_valid_state: false
 
   loss_fn:
-    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
+    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLossFixTBLogZv2
     subtb_lambda: 1.0
+    aux_weight: 0.75
+    gamma: 0.99
+    detach_pterm_in_aux: true
     eps: 1e-8
+    extra_absorb_eps: 1e-6
+    target_mode: "future_max"
+    k_min: 2
+    # mix mode params
+    mix_weight: 0.5
+    soft_beta: 5.0
+    soft_rho: 0.1
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
-    prioritized_replay: True
     buffer_size: 200
     sim_tolerance: 0.25
     strict_mode: false
     buffer_aug_value: 0
 
   constraint_config:
-    min_sentence_len: 1
-    max_sentence_len: 10
-    grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
+    min_sentence_len: 3
+    max_sentence_len: 3
+    grammar_path: ${paths.assets_dir}/24_grammars/var_length.ebnf
     disable_grammar: false
     processor_type: "prefix"
-    legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
+    legal_tokens: ${paths.assets_dir}/token_list/24_points/general
     illegal_vocab_penalty: -50
     parse_mode: "limited"
 
@@ -114,10 +92,9 @@ model:
     pf_temp_low: 1.0
     pf_temp_prob: 0.666
     n_samples: 32
-    buffer_mixture_ratio: 0.7
+    buffer_mixture_ratio: 0.5
     skip_baseline_sampling: true
     opt_task: false
-    # without applying grammar disagree penalty to forward side
     grammar_disagree_penalty: ${model.reward.grammar_disagree_penalty}
 
   factor_schedulers:
@@ -126,43 +103,49 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 50000
+      horizon: 500
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.50
-      end: 0.25
-      horizon: 50000
+      start: 0
+      end: 0
+      horizon: 500
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 0.75
-      end: 0.25
-      horizon: 25000
+      start: 1
+      end: 0
+      horizon: 250
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 50000
+      horizon: 500
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 50000
+      horizon: 500
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 50000
+      horizon: 500
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 10000
+      horizon: 500
+    k_min:
+      _target_: chemgfn.models.gfn.Scheduler
+      schedule_type: "linear"
+      start: 0
+      end: 0
+      horizon: 100
 
   disable_peft: false
 
@@ -171,13 +154,11 @@ model:
 # ============================================================================
 data:
   num_workers: 0
-  data_path: ${paths.data_dir}SMILES/sidechain_prompts_qed.json
-  buffer_sample_path: null
-
+  buffer_sample_path: ${paths.data_dir}/24_points/buffer_12_toy.pt
 # ============================================================================
 # Logger Configuration
 # ============================================================================
 logger:
   wandb:
     project: "ChemGFN"
-    offline: False
+    offline: false

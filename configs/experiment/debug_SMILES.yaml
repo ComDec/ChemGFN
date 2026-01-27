@@ -98,22 +98,14 @@ model:
       backend: "pa"
 
   loss_fn:
-    _target_: chemgfn.models.losses.RootAbsorbExtraSubTBLoss
+    _target_: chemgfn.models.losses.LLMTrajectoryBalanceLoss
     subtb_lambda: 1.0
-    aux_weight: 0.25
-    gamma: 0.99
-    detach_pterm_in_aux: true
     eps: 1e-8
-    extra_absorb_eps: 1e-6
-    target_mode: "future_max"
-    # mix mode params
-    mix_weight: 0.5
-    soft_beta: 5.0
-    soft_rho: 0.0
 
   reward_buffer:
     _target_: chemgfn.utils.gfn_utils.ReplayBuffer
     buffer_size: 200
+    prioritized_replay: True
     sim_tolerance: 0.25
     strict_mode: false
     buffer_aug_value: 0
