@@ -30,3 +30,6 @@ rdkit
 peft
 matplotlib
 partialsmiles
+sentence-transformers
+bert-score
+nltk
