@@ -6,13 +6,14 @@ CLI to merge numeric-suffixed CSV files and optionally compress+cleanup wandb.
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import gzip
 import re
 import shutil
 import tarfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
@@ -45,6 +46,7 @@ def merge_group(
     chunksize: int = 20000,
     delete_source: bool = False,
     step_col: str | None = "source_step",
+    on_bad_lines: str = "warn",
 ) -> None:
     """Merge sorted files into a single gzip-compressed CSV; optionally delete inputs.
 
@@ -55,13 +57,33 @@ def merge_group(
         out_path.unlink()
 
     first_header = True
+    reader_kwargs: dict[str, Any] = {"chunksize": chunksize}
+    if on_bad_lines:
+        reader_kwargs["on_bad_lines"] = on_bad_lines
+        if on_bad_lines != "error":
+            reader_kwargs["engine"] = "python"
+
     with gzip.open(out_path, "wt", encoding="utf-8") as f_out:
         for _, file_path in sorted(files):
-            for chunk in pd.read_csv(file_path, chunksize=chunksize):
-                if step_col:
-                    chunk[step_col] = _
-                chunk.to_csv(f_out, index=False, header=first_header)
-                first_header = False
+            try:
+                for chunk in pd.read_csv(file_path, **reader_kwargs):
+                    if step_col:
+                        chunk[step_col] = _
+                    chunk.to_csv(f_out, index=False, header=first_header)
+                    first_header = False
+            except (pd.errors.ParserError, csv.Error) as exc:
+                if on_bad_lines == "error":
+                    raise
+                print(f"[warn] {file_path} parse error, retrying with QUOTE_NONE: {exc}")
+                fallback_kwargs = dict(reader_kwargs)
+                fallback_kwargs["quoting"] = csv.QUOTE_NONE
+                fallback_kwargs.setdefault("engine", "python")
+                fallback_kwargs.setdefault("escapechar", "\\")
+                for chunk in pd.read_csv(file_path, **fallback_kwargs):
+                    if step_col:
+                        chunk[step_col] = _
+                    chunk.to_csv(f_out, index=False, header=first_header)
+                    first_header = False
     if delete_source:
         for _, file_path in sorted(files):
             file_path.unlink()
@@ -74,6 +96,7 @@ def merge_all(
     delete_source: bool,
     dry_run: bool,
     step_col: str | None,
+    on_bad_lines: str,
 ) -> None:
     groups = find_groups(root)
     if not groups:
@@ -91,6 +114,7 @@ def merge_all(
             chunksize=chunksize,
             delete_source=delete_source,
             step_col=step_col,
+            on_bad_lines=on_bad_lines,
         )
     print("[done] merging complete")
 
@@ -222,6 +246,13 @@ def parse_args() -> argparse.Namespace:
         help="Keep source CSVs and wandb/PNG after compression.",
     )
     parser.add_argument(
+        "--on-bad-lines",
+        type=str,
+        default="warn",
+        choices=["error", "warn", "skip"],
+        help="How to handle malformed CSV rows. Default: warn (skip bad lines).",
+    )
+    parser.add_argument(
         "--step-col",
         type=str,
         default="source_step",
@@ -253,6 +284,7 @@ def main() -> None:
             delete_source=args.delete_source,
             dry_run=args.dry_run,
             step_col=args.step_col if args.step_col else None,
+            on_bad_lines=args.on_bad_lines,
         )
         if args.compress_wandb:
             compress_wandb(root=root, delete_source=args.delete_source, dry_run=args.dry_run)
