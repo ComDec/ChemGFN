@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 import random
+import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -504,15 +505,38 @@ class ShingleJaccardBackend(SimilarityBackend):
     Useful for expr24 (expressions) or any string domain.
     """
 
-    def __init__(self, k: int = 2, tokenizer: Optional[callable] = None):
+    def __init__(
+        self,
+        k: int = 2,
+        tokenizer: Optional[callable] = None,
+        tokenizer_mode: Optional[str] = None,
+        lowercase: bool = True,
+    ):
         self.k = int(k)
         self.tokenizer = tokenizer  # optional: str -> list[str]
+        self.tokenizer_mode = None if tokenizer_mode is None else str(tokenizer_mode)
+        self.lowercase = bool(lowercase)
+
+    @staticmethod
+    def _word_tokenize(s: str) -> list[str]:
+        # Keep it lightweight and dependency-free.
+        return re.findall(r"[A-Za-z0-9']+", s)
 
     def _rep(self, s: str):
         if not s:
             return None
-        if self.tokenizer is not None:
-            toks = self.tokenizer(s)
+        s0 = str(s)
+        if self.lowercase:
+            s0 = s0.lower()
+
+        tok_fn = self.tokenizer
+        if tok_fn is None and self.tokenizer_mode is not None:
+            mode = self.tokenizer_mode.lower()
+            if mode in {"word", "words", "whitespace"}:
+                tok_fn = self._word_tokenize
+
+        if tok_fn is not None:
+            toks = tok_fn(s0)
             if not toks:
                 return None
             k = max(1, self.k)
@@ -521,9 +545,9 @@ class ShingleJaccardBackend(SimilarityBackend):
             return frozenset(" ".join(toks[i : i + k]) for i in range(len(toks) - k + 1))
         # char shingles
         k = max(1, self.k)
-        if len(s) <= k:
-            return frozenset([s])
-        return frozenset(s[i : i + k] for i in range(len(s) - k + 1))
+        if len(s0) <= k:
+            return frozenset([s0])
+        return frozenset(s0[i : i + k] for i in range(len(s0) - k + 1))
 
     def prepare(self, candidates: list) -> list:
         reps = []
@@ -1091,7 +1115,7 @@ class ReplayBufferSubmodular:
             new_items.append((bi, sample_data))
 
         if self.per_prompt:
-            self._update_buffer_for_prompt(st, new_items, strat, epoch_end)
+            self._update_buffer_for_prompt(st, new_items, strat, epoch_end, prompt_key=prompt_key)
         else:
             self._update_buffer_single(st, new_items, strat, epoch_end)
 
@@ -1222,7 +1246,14 @@ class ReplayBufferSubmodular:
         st["items"] = selected_items
         st["data"] = {id(it): data_map.get(id(it), {}) for it in selected_items}
 
-    def _update_buffer_for_prompt(self, st: dict, new_items_list, strategy: str, epoch_end: bool):
+    def _update_buffer_for_prompt(
+        self,
+        st: dict,
+        new_items_list,
+        strategy: str,
+        epoch_end: bool,
+        prompt_key: str | None = None,
+    ):
         # identical to single, just on st
         new_items = []
         new_data = {}
@@ -1289,6 +1320,11 @@ class ReplayBufferSubmodular:
             st["data"] = {id(it): data_map.get(id(it), {}) for it in st["items"]}
             return
 
+        import hashlib
+        import time
+
+        start_time = time.time()
+
         if strategy == "standard":
             selected_items = self._select_standard(candidates, self.buffer_size)
         elif strategy == "lazy":
@@ -1308,6 +1344,15 @@ class ReplayBufferSubmodular:
                 f"Unknown strategy: {strategy}. Choose from 'standard', 'lazy', 'stochastic', "
                 f"'lazier_than_lazy', 'random'."
             )
+
+        end_time = time.time()
+        tag = ""
+        if prompt_key is not None:
+            try:
+                tag = f" prompt={hashlib.md5(str(prompt_key).encode('utf-8')).hexdigest()[:8]}"
+            except Exception:
+                tag = ""
+        print(f"Selection of {strategy} time: {end_time - start_time} seconds{tag}")
 
         st["items"] = selected_items
         st["data"] = {id(it): data_map.get(id(it), {}) for it in selected_items}

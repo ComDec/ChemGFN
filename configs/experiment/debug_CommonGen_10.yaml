@@ -1,0 +1,46 @@
+# @package _global_
+
+defaults:
+  - override /data: common_gen
+  - override /model: common_gen
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["ChemGFN", "common_gen", "debug", "subset10"]
+
+exp_name: "debug_CommonGen_10"
+seed: 42
+
+data:
+  limit_train: 10
+  limit_val: 10
+  limit_test: 10
+  shuffle_train: false
+
+trainer:
+  devices: 1
+  precision: bf16-true
+  max_steps: 50
+  accumulate_grad_batches: 1
+  limit_train_batches: 10
+  limit_val_batches: 10
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: 0
+
+model:
+  reward:
+    sentence_validator:
+      valid_step_weight: 0.0
+      valid_step_every: 1
+      valid_terminal_bonus: 0.0
+  # Match paper-style evaluation: 1 output per prompt.
+  training_mixed_config:
+    n_samples: 1
+    use_buffer_prob: 0.0
+
+  reward_config:
+    diversity_metric: null
+
+logger:
+  wandb:
+    offline: true

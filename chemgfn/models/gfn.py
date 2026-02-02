@@ -871,6 +871,21 @@ class ChemGFNModule(LightningModule):
             prompt_len=prompt_len,
         )
         tokens = generated_text[:, prompt_len:]
+
+        # Mean generated length (token ids) for validation logging.
+        # This is computed directly from token ids and is robust when EOS is absent.
+        eos_id = int(self.end_of_sentence_token_id)
+        if tokens is not None and tokens.numel() > 0:
+            eos_mask = tokens.eq(eos_id)
+            has_eos = eos_mask.any(dim=1)
+            first_eos = eos_mask.float().argmax(dim=1)
+            full_len = int(tokens.shape[1])
+            lengths_tok = torch.where(
+                has_eos, first_eos, first_eos.new_full(first_eos.shape, full_len)
+            ).to(dtype=torch.float32)
+            mean_len_tok_ids = lengths_tok.mean()
+        else:
+            mean_len_tok_ids = torch.tensor(0.0, device=generated_text.device)
         self._update_coverage_from_tokens(tokens)
         self._accumulate_log_pterm_by_length(
             tokens,
@@ -1028,6 +1043,11 @@ class ChemGFNModule(LightningModule):
                 "val/logP(s) unpenalized (avg)": log_ps_unpenalized.mean(),
                 "val/logP(s) unpenalized (max)": log_ps_unpenalized.max(),
                 "val/Mean(log_pterm - log_pterm_ref)": (log_pterm - log_pterm_ref).mean(),
+                # Two length views for debugging/monitoring.
+                # - sentence_len: length from get_termination_vals (EOS position)
+                # - len_tok_ids: length computed directly from token ids
+                "val/sentence_len": sentence_len.float().mean(),
+                "val/len_tok_ids": mean_len_tok_ids,
             },
             sync_dist=True,
         )
@@ -1999,9 +2019,9 @@ class ChemGFNModule(LightningModule):
     def on_train_start(self):
         self._init_coverage_reference()
         val_dataset = self.trainer.datamodule.val_dataloader().dataset
-        val_probes = torch.utils.data.Subset(
-            val_dataset, random.sample(range(len(val_dataset)), 10)
-        )
+        n_probe = min(10, int(len(val_dataset)))
+        probe_idx = random.sample(range(len(val_dataset)), n_probe) if n_probe > 0 else []
+        val_probes = torch.utils.data.Subset(val_dataset, probe_idx)
         if val_probes is not None:
             self.val_probes = val_probes
             samples_table = self.sample_probes(val_probes)
@@ -2281,6 +2301,26 @@ class ChemGFNModule(LightningModule):
 
         if tokens_path:
             print(f"Legal tokens file not found: {tokens_path}")
+
+        # Fallback: support explicit illegal token strings (common for text tasks).
+        illegal_tokens = getattr(self.constraint_config, "illegal_tokens", None)
+        if isinstance(illegal_tokens, (list, tuple)) and len(illegal_tokens) > 0:
+            vocab_size = len(self.tokenizer)
+            legal_mask = torch.ones(vocab_size, dtype=torch.bool)
+            illegal_mask = torch.zeros(vocab_size, dtype=torch.bool)
+            bad_ids: list[int] = []
+            for tok in illegal_tokens:
+                try:
+                    ids = self.tokenizer.encode(str(tok), add_special_tokens=False)
+                except Exception:
+                    continue
+                if len(ids) == 1:
+                    bad_ids.append(int(ids[0]))
+            if bad_ids:
+                illegal_mask[bad_ids] = True
+                # No explicit legal id list in this mode.
+                return legal_mask, illegal_mask, None
+
         return None, None, None
 
     def _build_pre_grammar_processor(self, parsed_grammar):

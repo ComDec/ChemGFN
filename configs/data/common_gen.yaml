@@ -1,0 +1,22 @@
+_target_: chemgfn.data.common_gen_datamodule.CommonGenDataModule
+tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
+dataset_name: "allenai/common_gen"
+
+# Use validation for test by default (HF test has no targets).
+train_split: "train"
+val_split: "validation"
+test_split: "validation"
+
+prompt_template: "Write one short, fluent sentence that uses ALL of these concepts: {concepts}.\nSentence:"
+
+limit_train: 5000
+limit_val: 1000
+limit_test: 1000
+
+# Optionally repeat the (possibly limited) train subset to this size.
+train_repeat_to: null
+
+shuffle_train: true
+seed: ${seed}
+num_workers: 0
+pin_memory: true

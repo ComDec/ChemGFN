@@ -316,19 +316,37 @@ class Reference_Target_Score_Positive_Mixed_Invalid_Mask:
 
 
 @torch.no_grad()
-class NextSentence_Score_Positive_Mixed_Invalid_Mask:
+class CommonGen_Score_Positive_Mixed_Invalid_Mask:
     def __init__(
         self,
         sentence_validator,
+        invalid_start_ratio: float = 0.2,
+        invalid_end_ratio: float = 1.2,
         illegal_vocab_penalty: float = -99,
         grammar_disagree_penalty: float = -99,
         score_function: Literal["score_fast", "score_fast_expr24_pterm_last_only"] = "score_fast",
         **kwargs,
     ) -> None:
         self.sentence_validator = sentence_validator
+        self.invalid_start_ratio = float(invalid_start_ratio)
+        self.invalid_end_ratio = float(invalid_end_ratio)
         self.illegal_vocab_penalty = float(illegal_vocab_penalty)
         self.grammar_disagree_penalty = float(grammar_disagree_penalty)
         self.score_function = score_function
+
+    @staticmethod
+    def mix(
+        reference_logP: Tensor, local_score: Tensor, scaling_factor: float, eos_pos: Tensor
+    ) -> Tensor:
+        """Terminal-only mixing (no prefix shaping).
+
+        eos_pos: (B,) terminal state index in [0, L_state-1].
+        """
+        B, L_state = reference_logP.shape
+        term_score = local_score.gather(1, eos_pos.view(B, 1)).to(reference_logP.dtype)  # (B,1)
+        bonus = torch.zeros_like(reference_logP)
+        bonus.scatter_(1, eos_pos.view(B, 1), float(scaling_factor) * term_score)
+        return reference_logP + bonus
 
     def score(
         self,
@@ -371,12 +389,8 @@ class NextSentence_Score_Positive_Mixed_Invalid_Mask:
                 input_batch[:, prompt_length:], tokenizer, scaffold
             )
             local_score = validator_dict["local_score"].to(reference_logP.dtype)
-            y = local_score[:, -1].clamp(0.0, 1.0)  # (B,)
-            reward_mixed = (
-                reference_logP
-                + (-1) * (reference_logP[..., -1]).unsqueeze(-1) * local_score
-                + scaling_factor * local_score
-            )
+            reward_mixed = reference_logP + float(scaling_factor) * local_score
+
         return {
             "reward": reward_mixed,
             "reward_unpenalized": reference_logP,
