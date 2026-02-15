@@ -1,8 +1,5 @@
 # @package _global_
 
-# Debug experiment for 24-points task
-# Run with: python chemgfn/train.py experiment=debug_expr24
-
 defaults:
   - override /data: expr24
   - override /model: llama3_expr24

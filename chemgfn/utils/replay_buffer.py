@@ -224,7 +224,7 @@ class ReplayBuffer:
     def _prioritized_indices(self, buffer: list, batch_size: int) -> Optional[np.ndarray]:
         """
         Reward-prioritized replay sampling inspired by Shen et al. (2023):
-        α fraction from the top-β reward tier, the rest from the lower tier.
+        alpha fraction from the top-beta reward tier, the rest from the lower tier.
         Falls back to uniform sampling when prioritization is disabled or not feasible.
         """
         n = len(buffer)
@@ -1106,7 +1106,7 @@ class ReplayBufferSubmodular:
                 else logrewards[i],
                 "is_valid": is_valid,
                 "reward": r_raw,
-                # lengths for stat/debug
+                # lengths for stats/monitoring
                 "prompt_len": int(prompt_len),
                 "seq_len": int(seq_len),
                 "gen_len": int(gen_len),
@@ -1517,7 +1517,7 @@ class ReplayBufferSubmodular:
     def stat(self) -> dict:
         """
         Minimal, safe, O(buffer_size) stats.
-        Includes token length stats (gen_len/seq_len) for debugging length SF.
+        Includes token length stats (gen_len/seq_len) for monitoring length SF.
         """
 
         def _summ(items: list, data_map: dict) -> dict:

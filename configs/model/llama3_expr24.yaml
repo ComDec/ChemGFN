@@ -58,7 +58,12 @@ loss_fn:
   eps: 1e-8
 
 reward_config:
-  test_key: test_value
+  reward_temp_start: 1
+  reward_temp_end: 1
+  reward_temp_horizon: 5000
+  scaling_factor_start: 50
+  scaling_factor_end: 50
+  scaling_factor_horizon: 1000
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer

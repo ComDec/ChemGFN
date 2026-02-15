@@ -8,7 +8,7 @@ default_root_dir: ${paths.output_dir}
 accelerator: gpu
 devices: 1
 
-strategy: ddp
+strategy: auto
 
 # mixed precision for extra speed-up
 # precision: 16

@@ -1,15 +1,12 @@
 # @package _global_
 
-# Debug experiment for 24-points task
-# Run with: python chemgfn/train.py experiment=debug_expr24
-
 defaults:
   - override /data: smiles_opt
   - override /model: llama3_smiles_opt
   - override /callbacks: default
   - override /trainer: default
 
-tags: ["ChemGFN", "debug", "smiles_opt", "CFG", "qed", "TB"]
+tags: ["ChemGFN", "smiles_opt", "CFG", "qed", "TB"]
 
 # add CFG, add valid score to reward, we always need a reward to guide the generation
 exp_name: "smiles_RapTB_v2_kmin_5_to_2_max_only"

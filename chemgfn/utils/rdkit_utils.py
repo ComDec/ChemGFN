@@ -122,7 +122,7 @@ def qed(mol) -> float:
 
 
 def tpsa(mol) -> float:
-    """Topological polar surface area (Å^2)."""
+    """Topological polar surface area (A^2)."""
     if mol is None:
         return 0.0
     try:

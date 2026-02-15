@@ -180,7 +180,7 @@ class TestCalculateDiversity:
             ]
         )
         diversity = calculate_diversity(token_ids)
-        # Should be close to log(3) ≈ 1.099
+        # Should be close to log(3) ~= 1.099
         assert diversity > 1.0
 
     def test_diversity_with_long_sequences(self):

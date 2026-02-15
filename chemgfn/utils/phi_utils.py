@@ -10,8 +10,8 @@ from torch import Tensor
 
 # token-wise prefix value estimation
 def batch_prefix_value_kgram(
-    sentences: torch.Tensor,  # (B,T) 生成部分 tokens（不含 prompt）
-    y: torch.Tensor,  # (B,) 终局 0/1
+    sentences: torch.Tensor,  # (B,T) generated tokens (no prompt)
+    y: torch.Tensor,  # (B,) terminal 0/1
     k: int = 6,
     alpha: float = 1.0,
     min_count: int = 2,
@@ -56,14 +56,14 @@ def batch_prefix_value_kgram(
 
 def build_prefix_potential(
     pv: Tensor,  # (B,T) in (0,1)
-    ref_log_pf: Tensor,  # (B,T) 每步 token logprob
+    ref_log_pf: Tensor,  # (B,T) per-step token logprob
     non_term_mask: Tensor,  # (B,T) bool
     counts: Tensor | None = None,  # (B,T) decayed counts
     eta: float = 1.0,
     clamp: float = 2.0,
     tau_conf: float = 20.0,
     *,
-    base_rate: float | Tensor | None = None,  # ✅ 支持 float 或 (B,T)/(1,1)
+    base_rate: float | Tensor | None = None,  # supports float or (B,T)/(1,1)
     center_by_base: bool = True,
     conf_mode: Literal["none", "inc", "inv_sqrt"] = "inv_sqrt",
 ) -> Tensor:
@@ -141,15 +141,15 @@ def apply_phi_shaping(
     dphi_clip: float | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
-    将 token-wise φ 映射到 state-wise φ，并把 shaping 应用到 reward_mixed。
+    Map token-wise phi to state-wise phi and apply shaping to reward_mixed.
 
-    - differential:  reward[:,1:] += w * Δφ   (Δφ = φ_{t+1}-φ_t, masked by active_before)
-    - tokenwise:     reward[:,1:] += w * φ_tok (masked by active_before)
+    - differential:  reward[:,1:] += w * delta_phi   (delta_phi = phi_{t+1}-phi_t, masked by active_before)
+    - tokenwise:     reward[:,1:] += w * phi_tok (masked by active_before)
 
-    返回:
+    Returns:
       reward_out: (B, L_state)
       phi_state:  (B, L_state)
-      dphi:       (B, T_tok)  (对 token transition 的 φ 差分，已 mask，且可 clip)
+      dphi:       (B, T_tok)  (token transition phi difference, masked and clipped)
     """
     assert reward_mixed.ndim == 2 and phi_tok.ndim == 2
     B, L_state = reward_mixed.shape
@@ -186,7 +186,7 @@ def apply_phi_shaping(
 
 class PrefixValueMemory:
     """
-    Cross-batch exp-decayed (EMA-like) Beta-Binomial PV estimator with position buckets (方案A).
+    Cross-batch exp-decayed (EMA-like) Beta-Binomial PV estimator with position buckets (variant A).
 
     Keeps exp-decayed counts (N,S) for keys:
         key = (pos_bucket, k, tuple(tokens[s:t+1]))
@@ -201,8 +201,8 @@ class PrefixValueMemory:
         kmax: int = 4,
         alpha: float = 1.0,
         gamma: float = 0.999,  # per-step decay factor
-        min_count: float = 50.0,  # 继续保留：作为 unigram 的门槛（向后兼容）
-        min_count_ngram: float = 2.0,  # 新增：k>=2 的门槛（让高阶前缀更早生效）
+        min_count: float = 50.0,  # keep unigram threshold for backward compatibility
+        min_count_ngram: float = 2.0,  # threshold for k>=2 to activate higher-order prefixes earlier
         max_keys: int = 500_000,
         prune_every: int = 2000,
         prune_threshold: float = 1.0,
@@ -575,7 +575,7 @@ class PrefixValueMemory:
             logit = self._logit(p)
             logit = max(-float(phi_clamp), min(float(phi_clamp), logit))
 
-            # memory-side φ magnitude proxy
+            # memory-side phi magnitude proxy
             phi = float(phi_eta) * float(step_scale) * logit * conf
             phi_abs = abs(phi)
 
@@ -770,13 +770,15 @@ class PrefixValueMemory:
 def compute_active_before(gen_tokens: torch.Tensor, eos: int) -> torch.Tensor:
     """
     gen_tokens: (B, T_tok)
-    active_before[:, t] = Π_{j < t} 1[token_j != eos]
+    active_before[:, t] = prod_{j < t} 1[token_j != eos]
     """
     B, T = gen_tokens.shape
     active_before = torch.ones((B, T), device=gen_tokens.device, dtype=torch.bool)
     if T > 1:
-        alive_after = (gen_tokens != eos).to(torch.long).cumprod(dim=1).to(torch.bool)  # Π_{j<=t}
-        active_before[:, 1:] = alive_after[:, :-1]  # Π_{j< t}
+        alive_after = (
+            (gen_tokens != eos).to(torch.long).cumprod(dim=1).to(torch.bool)
+        )  # prod_{j<=t}
+        active_before[:, 1:] = alive_after[:, :-1]  # prod_{j< t}
     return active_before
 
 
@@ -790,7 +792,7 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor, dim=None, eps: float = 1e-
 def _masked_var_across_batch(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8):
     """
     x, mask: (B, T)
-    返回 per_step_var: (T,)
+    Returns per_step_var: (T,)
     """
     m = _masked_mean(x, mask, dim=0, eps=eps)
     m2 = _masked_mean(x * x, mask, dim=0, eps=eps)
@@ -801,7 +803,7 @@ def _masked_var_across_batch(x: torch.Tensor, mask: torch.Tensor, eps: float = 1
 def compute_prefix_diagnostics(
     pv: torch.Tensor,  # (B, T_tok) in (0,1)
     phi_state: torch.Tensor,  # (B, L_state)
-    active_before: torch.Tensor,  # (B, T_tok) True=该 token 动作发生时 still active（包含 EOS 那一步）
+    active_before: torch.Tensor,  # (B, T_tok) True when token action occurs while still active (including EOS step)
     phi_tok: torch.Tensor | None = None,  # (B, T_tok)
     pv_sat_lo: float = 0.05,
     pv_sat_hi: float = 0.95,
@@ -813,8 +815,8 @@ def compute_prefix_diagnostics(
         L_state = phi_state.shape[1]
         assert L_state == T_tok + 1, f"expect L_state=T_tok+1, got {L_state} vs {T_tok}"
 
-        # --- masks 对齐 ---
-        # state_active_mask: (B, L_state)  state 0..L_state-2 用 active_before，最后 state 无效
+        # --- mask alignment ---
+        # state_active_mask: (B, L_state) states 0..L_state-2 use active_before, final state inactive
         state_active_mask = torch.cat(
             [active_before, active_before.new_zeros((B, 1))], dim=1
         )  # (B, L_state)
@@ -826,13 +828,13 @@ def compute_prefix_diagnostics(
         phi_counts = state_active_mask.sum(dim=0)  # (L_state,)
         phi_var_mean = phi_var_per_step[phi_counts > 0].mean()
 
-        # --- Δphi on transitions (token steps) ---
+        # --- delta phi on transitions (token steps) ---
         dphi = phi_state[:, 1:] - phi_state[:, :-1]  # (B, T_tok)
         dphi_abs_per_step = _masked_mean(dphi.abs(), active_before, dim=0, eps=eps)  # (T_tok,)
         dphi_counts = active_before.sum(dim=0)
         dphi_abs_mean = dphi_abs_per_step[dphi_counts > 0].mean()
 
-        # --- Δ^2 phi (second difference) ---
+        # --- delta^2 phi (second difference) ---
         if T_tok >= 2:
             d2phi = dphi[:, 1:] - dphi[:, :-1]  # (B, T_tok-1)
             mask2 = active_before[:, 1:] & active_before[:, :-1]  # (B, T_tok-1)
@@ -857,11 +859,11 @@ def compute_prefix_diagnostics(
         pv_logit = p.log() - (1.0 - p).log()  # logit(p)
         pv_logit_abs_mean = _masked_mean(pv_logit.abs(), active_before, dim=None, eps=eps)
 
-        # 你也可以额外看信号强度（和 grammar penalty 对比）
+        # optional: inspect signal strength (compare with grammar penalty)
         phi_abs_mean = _masked_mean(phi_state.abs(), state_active_mask, dim=None, eps=eps)
 
         out = {
-            # scalars (直接 log)
+            # scalars (log directly)
             "phi_var_mean": phi_var_mean.detach(),
             "phi_abs_mean": phi_abs_mean.detach(),
             "dphi_abs_mean": dphi_abs_mean.detach(),
@@ -1261,7 +1263,7 @@ class PrefixValueMemoryNoBackoff:
             ent = self._bernoulli_entropy(p)
             sat = 1.0 if (p < pv_sat_lo or p > pv_sat_hi) else 0.0
 
-            # ✅ length-conditioned baseline for this key length
+            # length-conditioned baseline for this key length
             p0L = float(self.get_base_rate_by_len(L))
             p0L = self._clip01(p0L)
 
@@ -1313,7 +1315,7 @@ class PrefixValueMemoryNoBackoff:
             out[f"pv_mem/{name}/phi_abs_est"] = float(a["sumPhiAbs"] / n)
             out[f"pv_mem/{name}/p0_len_mean_est"] = float(
                 a["sumP0"] / n
-            )  # ✅ 新增：length-conditioned baseline mean
+            )  # length-conditioned baseline mean
 
         if len(lens) > 0:
             lens_sorted = sorted(lens)
@@ -1336,7 +1338,7 @@ class PrefixValueMemoryNoBackoff:
 
             pv_used = torch.where(short_mask, 1.0 - pv_raw, pv_raw).clamp(1e-6, 1.0 - 1e-6)
 
-            # ✅ FIX: length-conditioned baseline per position (not scalar p0_mixed)
+            # FIX: length-conditioned baseline per position (not scalar p0_mixed)
             p0_vec = self.get_base_rate_vec(T, device=device, dtype=pv_raw.dtype)  # (T,)
             p0_mat = p0_vec.view(1, T).expand(B, T).clamp(1e-6, 1.0 - 1e-6)
             p0_used = torch.where(short_mask, 1.0 - p0_mat, p0_mat).clamp(1e-6, 1.0 - 1e-6)
@@ -1354,7 +1356,7 @@ class PrefixValueMemoryNoBackoff:
                 eta=float(phi_eta),
                 clamp=float(phi_clamp),
                 tau_conf=float(tau_conf),
-                base_rate=p0_used,  # ✅ tensor baseline
+                base_rate=p0_used,  # tensor baseline
                 center_by_base=True,
                 conf_mode=str(conf_mode),
             )
@@ -1389,7 +1391,7 @@ class PrefixValueMemoryNoBackoff:
                     ),
                     "pv_probe/pv_raw_mean": masked_mean(pv_raw),
                     "pv_probe/pv_used_mean": masked_mean(pv_used),
-                    "pv_probe/p0_len_mean": masked_mean(p0_mat),  # ✅ 新增
+                    "pv_probe/p0_len_mean": masked_mean(p0_mat),
                     "pv_probe/p0_len_short_mean": masked_mean2(p0_mat, short_f),
                     "pv_probe/p0_len_long_mean": masked_mean2(p0_mat, long_f),
                     "pv_probe/entropy_raw_mean": masked_mean(ent_raw),

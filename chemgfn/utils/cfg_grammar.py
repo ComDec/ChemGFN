@@ -3,10 +3,7 @@ Fork from transformers_cfg repo.
 """
 
 import copy
-import logging
 import math
-import os
-import pprint
 from typing import Literal, Optional
 
 import torch
@@ -17,8 +14,6 @@ from transformers.generation.logits_process import (
 from transformers.utils import add_start_docstrings
 from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
 from transformers_cfg.token_grammar_recognizer import AbsTokenRecognizer
-
-logger = logging.getLogger(__name__)
 
 
 class GrammarConstrainedLogitsProcessor(LogitsProcessor):
@@ -90,28 +85,6 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
             )
             acceptance = torch.cat((acceptance, false_tensor), dim=-1)
 
-        # acceptance is a tensor of shape (batch_size, vocab_size)
-        # get the indices of the accepted tokens
-        # do the following operation only in debug mode
-        if os.getenv("DEBUG_MODE") == "True":
-            # convert acceptance to numpy array
-            batch_size, vocab_size = acceptance.shape
-            acceptance_np = acceptance.cpu().numpy()
-            accepted_x, accepted_y = acceptance_np.nonzero()
-            # dict of {batch_index: [accepted_token_indices]}
-            # initialize the dict with empty list
-            accepted_token_indices = {i: [] for i in range(batch_size)}
-            for x, y in zip(accepted_x, accepted_y):
-                accepted_token_indices[x].append(y)
-            logger.debug("Accepted token indices for the current batch:")
-            logger.debug("\n" + pprint.pformat(accepted_token_indices))
-            # convert token_ids to tokens
-            accepted_tokens = {
-                i: [self.grammar_constraint.tokenizer.decode([token_id]) for token_id in token_ids]
-                for i, token_ids in accepted_token_indices.items()
-            }
-            logger.debug("Accepted tokens for the current batch:")
-            logger.debug("\n" + pprint.pformat(accepted_tokens))
         # Logits to -inf where False
         masked_logits[~acceptance] = -math.inf
         # masked_logits[acceptance] += torch.var(masked_logits) * self.shift_vars
@@ -137,23 +110,9 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
                 for _ in range(len(input_ids))
             ]
 
-        if os.getenv("DEBUG_MODE") == "True":
-            print("-" * 80)
-
-        logger.debug("input_ids: \n" + pprint.pformat(input_ids))
-        # logger.debug("scores: \n" + pprint.pformat(scores))
-        logger.debug("last_size: \n" + pprint.pformat(self.last_size))
-        logger.debug(
-            "num of stacks: \n"
-            + pprint.pformat([len(acc_state.stacks) for acc_state in self.batch_parsing_states])
-        )
-        # logger.debug("stacks: \n" + pprint.pformat(self.batch_parsing_states.stacks))
-
         self.batch_parsing_states = self.grammar_constraint.update_state_with_batch_token_seqs(
             input_ids, self.batch_parsing_states, self.valid_token_start_idx
         )
-        logger.debug(f"input_ids: {input_ids}")
-
         masked_scores = self.mask_logits(scores, device)
         return masked_scores
 

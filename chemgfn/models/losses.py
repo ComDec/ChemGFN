@@ -52,7 +52,7 @@ class GFNLoss(nn.Module, ABC):
     ) -> float:
         step = self.global_step if step is None else step
         if overrides is not None and name in overrides and overrides[name] is not None:
-            # overrides 直接覆盖为常数
+            # overrides replace the base value with a constant
             return float(overrides[name])
         if self.weight_schedulers and name in self.weight_schedulers and step is not None:
             try:
@@ -1172,7 +1172,7 @@ class RootAbsorbExtraSubTBLossFixTBLogZv3(GFNLoss):
             )  # set self.k_window=4 in __init__ (or keep getattr)
 
             if W > 1:
-                # per-sample window start k0 ∈ [kmin, max_start], ensuring room for W steps
+                # per-sample window start k0 in [kmin, max_start], ensuring room for W steps
                 max_start = (h - (W - 1)).clamp(min=kmin)  # [B]
                 # sample k0 per sample (breaks fixed constraint at k=kmin)
                 # NOTE: randomness is per batch; good enough for now
@@ -1298,7 +1298,7 @@ def _first_eos_index(gen_tokens: torch.Tensor, eos_id: int) -> torch.Tensor:
     B, S = gen_tokens.shape
     is_eos = gen_tokens == eos_id
     has_eos = is_eos.any(dim=1)
-    first = is_eos.float().argmax(dim=1)  # 若全 False -> 0，需要修正
+    first = is_eos.float().argmax(dim=1)  # if all False -> 0, fix below
     first = torch.where(has_eos, first, torch.full_like(first, S - 1))
     return first
 
@@ -1307,11 +1307,11 @@ class LLMTrajectoryBalanceLoss(nn.Module):
     """
     Trajectory Balance (TB) loss for LLM-GFlowNet with separate (log_pf, log_pterm, log_r grid).
 
-    兼容你的“log_r 是 terminate-at-t 的 logR 表格”设计：
-      - 终止发生在 τ（首次 EOS）：
-         logP(traj) = sum_{t<τ} log_pf[t] + log_pterm[τ]
-         logR(traj) = log_r[τ]
-      - PB=1（tree/backward deterministic）时不需要 log_pb 项
+    Compatible with the design where log_r is a terminate-at-t logR table:
+      - termination happens at tau (first EOS):
+         logP(traj) = sum_{t<tau} log_pf[t] + log_pterm[tau]
+         logR(traj) = log_r[tau]
+      - when PB=1 (tree/backward deterministic), log_pb is not needed
     """
 
     def __init__(self, learn_log_z: bool = True, **kwargs):
@@ -1320,9 +1320,9 @@ class LLMTrajectoryBalanceLoss(nn.Module):
 
     def forward(
         self,
-        log_pf: torch.Tensor,  # (B, S) 或 (B, S-1)
-        log_r: torch.Tensor,  # (B, S)  terminate-at-t 的 logR 表
-        log_pterm: torch.Tensor,  # (B, S)  每个 state 的 EOS logprob
+        log_pf: torch.Tensor,  # (B, S) or (B, S-1)
+        log_r: torch.Tensor,  # (B, S) terminate-at-t logR table
+        log_pterm: torch.Tensor,  # (B, S) EOS logprob per state
         generated_text: torch.Tensor,  # (B, prompt_len + S)
         termination_token_id: int,
         prompt_len: int,
@@ -1336,28 +1336,28 @@ class LLMTrajectoryBalanceLoss(nn.Module):
             S,
         ), f"log_r shape {log_r.shape} must match log_pterm shape {(B,S)}"
 
-        # 允许 log_pf 少 1（有人只存非终止动作的 pf）
+        # allow log_pf to be shorter by 1 (non-terminal actions only)
         if log_pf.shape[1] == S - 1:
             log_pf = torch.cat([log_pf, log_pf.new_zeros((B, 1))], dim=1)
         assert log_pf.shape == (B, S), f"log_pf shape {log_pf.shape} must be (B,S) or (B,S-1)"
 
-        # 从 generated_text 找 τ：prompt 后前 S 个 token
+        # find tau from generated_text: first S tokens after prompt
         gen = generated_text[:, prompt_len : prompt_len + S]
         tau = _first_eos_index(gen, termination_token_id)  # (B,)
 
-        # mask: t < τ 的 token 步（非终止前缀）
+        # mask: token steps where t < tau (non-terminal prefixes)
         t = torch.arange(S, device=log_pf.device).view(1, S)
         pre_mask = t < tau.view(B, 1)  # (B, S)
 
-        # logP(traj) = sum_{t<τ} log_pf[t] + log_pterm[τ]
+        # logP(traj) = sum_{t<tau} log_pf[t] + log_pterm[tau]
         token_logp = (log_pf * pre_mask.to(log_pf.dtype)).sum(dim=1)  # (B,)
         term_logp = log_pterm.gather(1, tau.view(B, 1)).squeeze(1)  # (B,)
         logp_traj = token_logp + term_logp
 
-        # logR(traj) = log_r[τ] （你的 scorer 已经把 prefix+eos 概率塞进 log_r[t] 了）
+        # logR(traj) = log_r[tau] (scorer already includes prefix+eos probability in log_r[t])
         logr_traj = log_r.gather(1, tau.view(B, 1)).squeeze(1)
 
-        # logZ：外部传入优先，否则学一个全局标量
+        # logZ: use external value if provided, otherwise learn a global scalar
         if log_z is None:
             if self.log_z is None:
                 raise ValueError("No log_z provided and learn_log_z=False.")

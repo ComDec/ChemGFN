@@ -147,11 +147,11 @@ class TestCosineRestartSchedule:
         values = [schedule(s) for s in steps]
 
         # Check approximate cosine shape
-        # At t=0: cos(0) = 1 → value = 1.0
-        # At t=0.25: cos(π/4) ≈ 0.707 → value ≈ 0.854
-        # At t=0.5: cos(π/2) = 0 → value = 0.5
-        # At t=0.75: cos(3π/4) ≈ -0.707 → value ≈ 0.146
-        # At t=1: cos(π) = -1 → value ≈ 0
+        # At t=0: cos(0) = 1 -> value = 1.0
+        # At t=0.25: cos(pi/4) ~= 0.707 -> value ~= 0.854
+        # At t=0.5: cos(pi/2) = 0 -> value = 0.5
+        # At t=0.75: cos(3*pi/4) ~= -0.707 -> value ~= 0.146
+        # At t=1: cos(pi) = -1 -> value ~= 0
 
         expected = [1.0, 0.854, 0.5, 0.146, 0.0]
         for i, (actual, exp) in enumerate(zip(values, expected)):

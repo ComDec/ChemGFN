@@ -1,5 +1,4 @@
 import os
-import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -39,12 +38,6 @@ from chemgfn.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
-
-# Support --debug flag (strip before Hydra parses args)
-DEBUG_FLAG = False
-if "--debug" in sys.argv:
-    sys.argv.remove("--debug")
-    DEBUG_FLAG = True
 
 
 @task_wrapper
@@ -103,8 +96,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     if cfg.get("test"):
         log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.last_model_path
-        if ckpt_path == "":
+        checkpoint_callback = trainer.checkpoint_callback
+        ckpt_path = (
+            getattr(checkpoint_callback, "last_model_path", "") if checkpoint_callback else ""
+        )
+        if not ckpt_path:
             log.warning("Last ckpt not found! Using current weights for testing...")
             ckpt_path = None
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
@@ -129,15 +125,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     extras(cfg)
-
-    # If --debug flag is set, apply debug-friendly defaults unless explicitly overridden
-    if DEBUG_FLAG:
-        with open_dict(cfg):
-            cfg.logger.wandb.offline = True
-            cfg.exp_name = "debug"
-            cfg.trainer.devices = 1
-            os.environ.setdefault("CHEMGFN_DEBUG_SHAPES", "1")
-            os.environ.setdefault("CHEMGFN_DEBUG_SHAPES_STEPS", "1")
 
     # train the model
     metric_dict, _ = train(cfg)

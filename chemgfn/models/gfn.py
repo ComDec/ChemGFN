@@ -21,10 +21,8 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer
 from transformers_cfg.generation.logits_process import (
     GrammarConstrainedLogitsProcessor,
-    GrammarIncrementalLogitsProcessorForNumberOnly,
     GrammarIncrementalLogitsProcessorGeneral,
     GrammarIncrementalLogitsProcessorSampleEnhanced,
-    GrammarLogitsProcessorPartheseness,
 )
 from transformers_cfg.grammar_utils import IncrementalGrammarConstraint
 from transformers_cfg.parser import parse_ebnf
@@ -317,12 +315,6 @@ class ChemGFNModule(LightningModule):
         self._pv_probe_cache = None
         self._pv_report_epoch = -1
 
-        # debug flags
-        debug_shapes = os.environ.get("CHEMGFN_DEBUG_SHAPES", "0") == "1"
-        debug_steps = int(os.environ.get("CHEMGFN_DEBUG_SHAPES_STEPS", "1"))
-        self.debug_shapes = debug_shapes
-        self._debug_shapes_remaining = debug_steps if debug_shapes else 0
-
     def forward(
         self,
         encoded_data,
@@ -391,44 +383,6 @@ class ChemGFNModule(LightningModule):
         }
 
         result = generate_and_return_termination_logprob(**generation_config)
-
-        if self._debug_shapes_remaining > 0:
-            self._debug_shapes_remaining -= 1
-            state = result["state"]
-            log_pf = result["log_pf"]
-            log_pterm = result["log_pterm"]
-            log_r = result.get("log_r")
-            log_r_unpenalized = result.get("log_r_unpenalized")
-            log_pf_ref = result.get("log_pf_ref")
-            log_pterm_ref = result.get("log_pterm_ref")
-
-            B = state.shape[0]
-            T_tok = log_pf.shape[1] if log_pf is not None else None
-            L_state = (
-                log_r.shape[1]
-                if log_r is not None
-                else (log_pterm.shape[1] if log_pterm is not None else None)
-            )
-            gen_tokens = state[:, prompt_len : prompt_len + T_tok] if T_tok is not None else None
-
-            assert log_pf is not None and log_pf.ndim == 2
-            assert log_pterm is not None and log_pterm.ndim == 2
-            assert log_pf.shape[0] == B and log_pterm.shape[0] == B
-            if log_r is not None:
-                assert log_r.shape[0] == B
-
-            print(
-                "[forward debug] step="
-                f"{int(self.global_step)} B={B} T_tok={T_tok} L_state={L_state} "
-                f"state={tuple(state.shape)} "
-                f"gen_tokens={None if gen_tokens is None else tuple(gen_tokens.shape)} "
-                f"log_pf={tuple(log_pf.shape)} log_pterm={tuple(log_pterm.shape)} "
-                f"log_r={None if log_r is None else tuple(log_r.shape)} "
-                f"log_r_unpenalized="
-                f"{None if log_r_unpenalized is None else tuple(log_r_unpenalized.shape)} "
-                f"log_pf_ref={None if log_pf_ref is None else tuple(log_pf_ref.shape)} "
-                f"log_pterm_ref={None if log_pterm_ref is None else tuple(log_pterm_ref.shape)}"
-            )
 
         return result
 
@@ -1043,7 +997,7 @@ class ChemGFNModule(LightningModule):
                 "val/logP(s) unpenalized (avg)": log_ps_unpenalized.mean(),
                 "val/logP(s) unpenalized (max)": log_ps_unpenalized.max(),
                 "val/Mean(log_pterm - log_pterm_ref)": (log_pterm - log_pterm_ref).mean(),
-                # Two length views for debugging/monitoring.
+                # Two length views for monitoring.
                 # - sentence_len: length from get_termination_vals (EOS position)
                 # - len_tok_ids: length computed directly from token ids
                 "val/sentence_len": sentence_len.float().mean(),
@@ -2336,8 +2290,6 @@ class ChemGFNModule(LightningModule):
         processor_map = {
             "prefix": GrammarIncrementalLogitsProcessorGeneral,
             "prefix_enhanced": GrammarIncrementalLogitsProcessorSampleEnhanced,
-            "parenthese": GrammarLogitsProcessorPartheseness,
-            "number_only": GrammarIncrementalLogitsProcessorForNumberOnly,
         }
 
         processor_cls = processor_map.get(processor_type)
@@ -3674,14 +3626,6 @@ class ChemGFNModule(LightningModule):
     def _decode_generated_tokens(
         self, tokens: torch.Tensor, skip_special_tokens: bool = True
     ) -> str:
-        if self.constraint_config.processor_type == "number_only":
-            pieces = []
-            for token in tokens:
-                if token.item() == self.tokenizer.eos_token_id:
-                    break
-                pieces.append(self.tokenizer.decode(token, skip_special_tokens=False))
-            return ",".join(pieces)
-
         return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _ema_cfg(self, key: str, default: Any) -> Any:

@@ -42,7 +42,7 @@ def create_buffer_samples(
     # Save
     torch.save(buffer_samples, output_path)
 
-    print(f"\n✓ Buffer samples saved to: {output_path}")
+    print(f"\nOK: Buffer samples saved to: {output_path}")
     print(f"  Shape: {buffer_samples.shape}")
     print(f"  Dtype: {buffer_samples.dtype}")
     print(f"\nExample sample:")
@@ -65,38 +65,38 @@ def verify_buffer_samples(buffer_path: str):
 
         # Check type
         if isinstance(buffer, torch.Tensor):
-            print(f"✓ Type: Tensor")
-            print(f"✓ Shape: {buffer.shape}")
-            print(f"✓ Dtype: {buffer.dtype}")
-            print(f"✓ Number of elements: {buffer.numel()}")
+            print(f"OK: Type: Tensor")
+            print(f"OK: Shape: {buffer.shape}")
+            print(f"OK: Dtype: {buffer.dtype}")
+            print(f"OK: Number of elements: {buffer.numel()}")
 
             if buffer.numel() == 0:
-                print("⚠ Warning: Buffer is empty!")
+                print("WARN: Buffer is empty!")
                 return False
 
         elif isinstance(buffer, list):
-            print(f"✓ Type: List")
-            print(f"✓ Length: {len(buffer)}")
+            print(f"OK: Type: List")
+            print(f"OK: Length: {len(buffer)}")
 
             if len(buffer) == 0:
-                print("⚠ Warning: Buffer is empty!")
+                print("WARN: Buffer is empty!")
                 return False
 
-            print(f"✓ First element type: {type(buffer[0])}")
+            print(f"OK: First element type: {type(buffer[0])}")
             if isinstance(buffer[0], torch.Tensor):
-                print(f"✓ First element shape: {buffer[0].shape}")
+                print(f"OK: First element shape: {buffer[0].shape}")
         else:
-            print(f"✗ Unknown type: {type(buffer)}")
+            print(f"ERROR: Unknown type: {type(buffer)}")
             return False
 
-        print(f"\n✓ Buffer samples verification passed!")
+        print(f"\nOK: Buffer samples verification passed!")
         return True
 
     except FileNotFoundError:
-        print(f"✗ File not found: {buffer_path}")
+        print(f"ERROR: File not found: {buffer_path}")
         return False
     except Exception as e:
-        print(f"✗ Loading failed: {e}")
+        print(f"ERROR: Loading failed: {e}")
         return False
 
 
@@ -115,7 +115,7 @@ def create_empty_buffer(output_path: str = "empty_buffer.pt"):
     # Save
     torch.save(empty_buffer, output_path)
 
-    print(f"✓ Empty buffer created: {output_path}")
+    print(f"OK: Empty buffer created: {output_path}")
     print(
         f"  This file will be automatically detected as invalid, buffer sampling will be disabled"
     )
@@ -183,5 +183,8 @@ if __name__ == "__main__":
     print("\n3. Create empty buffer (test automatic detection):")
     print("   python buffer_sample_example.py --action create-empty --output empty.pt")
     print("\n4. Use in training:")
-    print("   python chemgfn/train.py experiment=debug data.buffer_sample_path=my_buffer.pt")
+    print(
+        "   python chemgfn/train.py experiment=SMILES_basic/SMILES_cfg_TB "
+        "data.buffer_sample_path=my_buffer.pt"
+    )
     print()

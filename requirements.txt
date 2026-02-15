@@ -7,7 +7,6 @@ torchmetrics>=0.11.4
 # --------- hydra --------- #
 hydra-core==1.3.2
 hydra-colorlog==1.2.0
-hydra-optuna-sweeper==1.2.0
 
 # --------- loggers --------- #
 wandb
@@ -18,18 +17,17 @@ wandb
 
 # --------- others --------- #
 rootutils       # standardizing the project root setup
-pre-commit      # hooks for applying linters on commit
 rich            # beautiful text formatting in terminal
 pytest          # tests
 # sh            # for running bash commands in some tests (linux/macos only)
 
 editdistance
-spacy
+numpy
 pandas
 rdkit
 peft
 matplotlib
 partialsmiles
 sentence-transformers
-bert-score
-nltk
+transformers
+transformers_cfg==0.2.6

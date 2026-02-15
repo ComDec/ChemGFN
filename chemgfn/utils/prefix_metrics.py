@@ -59,7 +59,7 @@ def prefix_collapse_by_position(
     *,
     max_T: int | None = None,
     collapse_thr: float = 0.95,
-    # NEW: invalid[i]=True means the whole sequence is invalid (最终不是合法SMILES)
+    # NEW: invalid[i]=True means the whole sequence is invalid (final output is not a valid SMILES)
     invalid: Sequence[bool] | None = None,
 ) -> PrefixCollapseResult:
     """
@@ -118,7 +118,7 @@ def prefix_collapse_by_position(
             toks_all.append(tok)
 
             if want_correct:
-                # correct prefix ⇔ this sequence is ultimately valid SMILES ⇔ invalid[i] == False
+                # correct prefix <=> this sequence is ultimately valid SMILES <=> invalid[i] == False
                 if i < len(invalid) and (not invalid[i]):
                     toks_cor.append(tok)
 

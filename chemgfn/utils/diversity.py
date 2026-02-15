@@ -10,8 +10,8 @@ from sentence_transformers.util import cos_sim
 class SequenceDiversity:
     """Embedding-based sequence diversity metric.
 
-    Mirrors the metric used in the ``next_sentence`` experiments: diversity is computed
-    as ``1 - mean_cosine_similarity`` across all unordered pairs of sentence embeddings.
+    Diversity is computed as ``1 - mean_cosine_similarity`` across all unordered
+    pairs of sentence embeddings.
     """
 
     def __init__(
