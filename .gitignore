@@ -163,7 +163,9 @@ configs/local/default.yaml
 *.slout
 *.slerr
 
-# Config template backups
+# temporary files
 configs/experiment/templates/*.backup.*
 notebooks/zinc15_250k.txt
 notebooks/ppo_expr24_eval.csv
+evaluation/**/*.json
+logs_s3/

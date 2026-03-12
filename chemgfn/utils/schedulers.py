@@ -28,6 +28,8 @@ class Scheduler:
         start: float,
         end: float,
         horizon: int,
+        warmup_steps: int = 0,
+        warmup_start: float | None = 0.0,
         restart_period: int = None,
         t_mult: float = 1.0,
         restart_decay: float = 1.0,
@@ -40,6 +42,8 @@ class Scheduler:
             start: Initial value
             end: Final value
             horizon: Number of steps for the schedule
+            warmup_steps: Number of warmup steps before the main schedule
+            warmup_start: Start value for warmup (linearly ramps to `start`)
             restart_period: Period for restarts (only for cosine_restart)
             t_mult: Period multiplication factor after each restart (only for cosine_restart)
             restart_decay: Amplitude decay factor after each restart (only for cosine_restart)
@@ -48,6 +52,10 @@ class Scheduler:
         self.start = float(start)
         self.end = float(end)
         self.horizon = float(horizon)
+        self.warmup_steps = float(warmup_steps)
+        if warmup_start is None:
+            warmup_start = 0.0
+        self.warmup_start = float(warmup_start)
         self.restart_period = (
             float(restart_period) if restart_period is not None else float(horizon)
         )
@@ -56,6 +64,8 @@ class Scheduler:
 
         if self.horizon <= 0:
             raise ValueError(f"horizon must be positive, got {horizon}")
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be non-negative, got {warmup_steps}")
 
         if self.schedule_type not in ["linear", "cosine", "cosine_restart"]:
             raise ValueError(
@@ -74,6 +84,9 @@ class Scheduler:
             Scheduled value at the given step
         """
         step_value = self._normalize_scalar(step)
+        if self.warmup_steps > 0 and step_value < self.warmup_steps:
+            return self._warmup(step_value)
+        step_value = max(0.0, step_value - self.warmup_steps)
 
         if self.schedule_type == "linear":
             return self._linear(step_value)
@@ -89,6 +102,11 @@ class Scheduler:
         if hasattr(value, "item"):
             return float(value.item())
         return float(value)
+
+    def _warmup(self, step: float) -> float:
+        """Linear warmup before the main schedule."""
+        progress = 0.0 if self.warmup_steps == 0 else min(1.0, step / self.warmup_steps)
+        return self.warmup_start + (self.start - self.warmup_start) * progress
 
     def _linear(self, step: float) -> float:
         """Linear schedule."""
@@ -130,14 +148,17 @@ class Scheduler:
 
     def __repr__(self) -> str:
         """String representation of the scheduler."""
+        warmup = ""
+        if self.warmup_steps > 0:
+            warmup = f", warmup_steps={self.warmup_steps}, warmup_start={self.warmup_start}"
         if self.schedule_type == "cosine_restart":
             return (
                 f"Scheduler(type={self.schedule_type}, start={self.start}, end={self.end}, "
                 f"restart_period={self.restart_period}, t_mult={self.t_mult}, "
-                f"restart_decay={self.restart_decay})"
+                f"restart_decay={self.restart_decay}{warmup})"
             )
         else:
             return (
                 f"Scheduler(type={self.schedule_type}, start={self.start}, end={self.end}, "
-                f"horizon={self.horizon})"
+                f"horizon={self.horizon}{warmup})"
             )

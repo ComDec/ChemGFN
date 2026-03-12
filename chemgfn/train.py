@@ -1,5 +1,4 @@
 import os
-import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -8,7 +7,7 @@ import rootutils
 from hydra.core.hydra_config import HydraConfig
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
@@ -39,12 +38,6 @@ from chemgfn.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
-
-# Support --debug flag (strip before Hydra parses args)
-DEBUG_FLAG = False
-if "--debug" in sys.argv:
-    sys.argv.remove("--debug")
-    DEBUG_FLAG = True
 
 
 @task_wrapper
@@ -101,19 +94,22 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     train_metrics = trainer.callback_metrics
 
-    # if cfg.get("test"):
-    #     log.info("Starting testing!")
-    #     ckpt_path = trainer.checkpoint_callback.best_model_path
-    #     if ckpt_path == "":
-    #         log.warning("Best ckpt not found! Using current weights for testing...")
-    #         ckpt_path = None
-    #     trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-    #     log.info(f"Best ckpt path: {ckpt_path}")
+    if cfg.get("test"):
+        log.info("Starting testing!")
+        checkpoint_callback = trainer.checkpoint_callback
+        ckpt_path = (
+            getattr(checkpoint_callback, "last_model_path", "") if checkpoint_callback else ""
+        )
+        if not ckpt_path:
+            log.warning("Last ckpt not found! Using current weights for testing...")
+            ckpt_path = None
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
+        log.info(f"Last ckpt path: {ckpt_path}")
 
-    # test_metrics = trainer.callback_metrics
+    test_metrics = trainer.callback_metrics
 
     # merge train and test metrics
-    metric_dict = {**train_metrics}
+    metric_dict = {**train_metrics, **test_metrics}
 
     return metric_dict, object_dict
 
@@ -129,17 +125,6 @@ def main(cfg: DictConfig) -> Optional[float]:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     extras(cfg)
-
-    # If --debug flag is set, apply debug-friendly defaults unless explicitly overridden
-    if DEBUG_FLAG:
-        hydra_overrides = HydraConfig.get().overrides.task
-
-        def _has_override(prefix: str) -> bool:
-            return any(item.startswith(prefix) for item in hydra_overrides)
-
-        cfg.logger.wandb.offline = True
-        cfg.exp_name = "debug"
-        cfg.trainer.devices = 1
 
     # train the model
     metric_dict, _ = train(cfg)

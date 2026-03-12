@@ -6,11 +6,12 @@ defaults:
 
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "epoch_{epoch:03d}"
+  filename: "epoch_{epoch:03d}_diversity_{val/diversity:.4f}"
   every_n_epochs: 10
-  monitor: "val/loss"
+  monitor: "val/diversity_valid"
   save_last: True
   auto_insert_metric_name: False
+  mode: "max"
 
 early_stopping:
   monitor: "val/loss"

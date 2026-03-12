@@ -1,0 +1,9 @@
+{
+  "exclude": [
+    "logs_s3",
+    "logs",
+    "data",
+    "notebooks",
+    "chemgfn.egg-info"
+  ]
+}

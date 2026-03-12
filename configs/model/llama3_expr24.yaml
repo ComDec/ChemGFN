@@ -35,6 +35,13 @@ scheduler:
   total_iters: 100000
   power: 1.0
 
+ema_config:
+  enabled: false
+  decay: 0.999
+  ema_start_epoch: 0
+  reference_start_epoch: 0
+  reference_update_interval: 1
+
 reward:
   _target_: chemgfn.models.reward.Reference_Target_Score_Positive_Mixed_Invalid_Mask
   invalid_start_ratio: 0.2
@@ -43,7 +50,7 @@ reward:
   illegal_vocab_penalty: -99
   grammar_disagree_penalty: 0
   sentence_validator:
-    _target_: chemgfn.models.reward.Expr24Validator
+    _target_: chemgfn.models.validators.Expr24Validator
 
 loss_fn:
   _target_: chemgfn.models.losses.ModifiedSubTBLoss
@@ -51,7 +58,12 @@ loss_fn:
   eps: 1e-8
 
 reward_config:
-  test_key: test_value
+  reward_temp_start: 1
+  reward_temp_end: 1
+  reward_temp_horizon: 5000
+  scaling_factor_start: 50
+  scaling_factor_end: 50
+  scaling_factor_horizon: 1000
 
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer

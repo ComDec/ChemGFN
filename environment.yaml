@@ -5,7 +5,7 @@
 # - conda allows for installing packages without requiring certain compilers or
 #   libraries to be available in the system, since it installs precompiled binaries
 
-name: myenv
+name: chemgfn
 
 channels:
   - pytorch
@@ -27,8 +27,11 @@ dependencies:
   - lightning=2.*
   - torchmetrics=0.*
   - hydra-core=1.*
+  - numpy
+  - pandas
+  - matplotlib
+  - rdkit
   - rich=13.*
-  - pre-commit=3.*
   - pytest=7.*
 
   # --------- loggers --------- #
@@ -40,6 +43,12 @@ dependencies:
 
   - pip>=23
   - pip:
-      - hydra-optuna-sweeper
       - hydra-colorlog
       - rootutils
+      - editdistance
+      - partialsmiles
+      - peft
+      - sentence-transformers
+      - transformers
+      - transformers_cfg==0.2.6
+      - wandb

@@ -8,13 +8,13 @@ default_root_dir: ${paths.output_dir}
 accelerator: gpu
 devices: 1
 
-strategy: ddp
+strategy: auto
 
 # mixed precision for extra speed-up
 # precision: 16
 
 # perform a validation loop every N training epochs
-check_val_every_n_epoch: 1
+check_val_every_n_epoch: 4
 
 # set True to to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds
@@ -25,6 +25,7 @@ precision: bf16-true
 accumulate_grad_batches: 4
 
 num_sanity_val_steps: 0
+log_every_n_steps: 1
 
 # profiler:
 #   _target_: lightning.pytorch.profilers.PyTorchProfiler

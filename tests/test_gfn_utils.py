@@ -180,7 +180,7 @@ class TestCalculateDiversity:
             ]
         )
         diversity = calculate_diversity(token_ids)
-        # Should be close to log(3) ≈ 1.099
+        # Should be close to log(3) ~= 1.099
         assert diversity > 1.0
 
     def test_diversity_with_long_sequences(self):
@@ -403,7 +403,7 @@ class TestReplayBuffer:
         # Mock result_dict
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -428,7 +428,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -456,7 +456,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -485,7 +485,7 @@ class TestReplayBuffer:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }

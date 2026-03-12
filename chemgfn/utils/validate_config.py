@@ -7,7 +7,7 @@ Run this before training to catch configuration errors early.
 
 Usage:
     python validate_config.py                    # Validate default config
-    python validate_config.py experiment=debug   # Validate specific experiment
+    python validate_config.py experiment=SMILES_basic/SMILES_cfg_TB   # Validate a specific experiment
     python validate_config.py --cfg job          # Show full composed config
 """
 
@@ -25,31 +25,31 @@ def check_penalty_values(cfg: DictConfig) -> list[str]:
     constraint_penalty = cfg.model.constraint_config.get("illegal_vocab_penalty", -50)
     if constraint_penalty > 0:
         issues.append(
-            f"⚠️  constraint_config.illegal_vocab_penalty ({constraint_penalty}) should be negative"
+            f"WARN: constraint_config.illegal_vocab_penalty ({constraint_penalty}) should be negative"
         )
     if constraint_penalty < -200:
         issues.append(
-            f"⚠️  constraint_config.illegal_vocab_penalty ({constraint_penalty}) is very negative (< -200)"
+            f"WARN: constraint_config.illegal_vocab_penalty ({constraint_penalty}) is very negative (< -200)"
         )
 
     # Check illegal_vocab_penalty in reward
     reward_penalty = cfg.model.reward.get("illegal_vocab_penalty", -50)
     if reward_penalty > 0:
-        issues.append(f"⚠️  reward.illegal_vocab_penalty ({reward_penalty}) should be negative")
+        issues.append(f"WARN: reward.illegal_vocab_penalty ({reward_penalty}) should be negative")
     if reward_penalty < -200:
         issues.append(
-            f"⚠️  reward.illegal_vocab_penalty ({reward_penalty}) is very negative (< -200)"
+            f"WARN: reward.illegal_vocab_penalty ({reward_penalty}) is very negative (< -200)"
         )
 
     # Check grammar_disagree_penalty
     disagree_penalty = cfg.model.reward.get("grammar_disagree_penalty", -99)
     if disagree_penalty > 0:
         issues.append(
-            f"⚠️  reward.grammar_disagree_penalty ({disagree_penalty}) should be negative"
+            f"WARN: reward.grammar_disagree_penalty ({disagree_penalty}) should be negative"
         )
 
     if not issues:
-        print(f"✓ Penalty values:")
+        print("OK: Penalty values:")
         print(f"  - constraint_config.illegal_vocab_penalty: {constraint_penalty}")
         print(f"  - reward.illegal_vocab_penalty: {reward_penalty}")
         print(f"  - reward.grammar_disagree_penalty: {disagree_penalty}")
@@ -65,16 +65,18 @@ def check_sequence_lengths(cfg: DictConfig) -> list[str]:
     max_len = cfg.model.constraint_config.max_sentence_len
 
     if min_len >= max_len:
-        issues.append(f"❌ min_sentence_len ({min_len}) must be < max_sentence_len ({max_len})")
+        issues.append(
+            f"ERROR: min_sentence_len ({min_len}) must be < max_sentence_len ({max_len})"
+        )
 
     if min_len < 0:
-        issues.append(f"❌ min_sentence_len ({min_len}) must be >= 0")
+        issues.append(f"ERROR: min_sentence_len ({min_len}) must be >= 0")
 
     if max_len > 100:
-        issues.append(f"⚠️  max_sentence_len ({max_len}) is very large (> 100)")
+        issues.append(f"WARN: max_sentence_len ({max_len}) is very large (> 100)")
 
     if not issues:
-        print(f"\n✓ Sequence lengths: min={min_len}, max={max_len}")
+        print(f"\nOK: Sequence lengths: min={min_len}, max={max_len}")
 
     return issues
 
@@ -87,13 +89,13 @@ def check_temperature_values(cfg: DictConfig) -> list[str]:
     temp_end = cfg.model.reward_config.reward_temp_end
 
     if temp_start <= 0:
-        issues.append(f"❌ reward_temp_start ({temp_start}) must be > 0")
+        issues.append(f"ERROR: reward_temp_start ({temp_start}) must be > 0")
     if temp_end <= 0:
-        issues.append(f"❌ reward_temp_end ({temp_end}) must be > 0")
+        issues.append(f"ERROR: reward_temp_end ({temp_end}) must be > 0")
 
     if temp_end > temp_start:
         issues.append(
-            f"⚠️  reward_temp_end ({temp_end}) > reward_temp_start ({temp_start}) - unusual but allowed"
+            f"WARN: reward_temp_end ({temp_end}) > reward_temp_start ({temp_start}) - unusual but allowed"
         )
 
     # Check forward policy temperatures
@@ -101,14 +103,14 @@ def check_temperature_values(cfg: DictConfig) -> list[str]:
     pf_low = cfg.model.training_mixed_config.pf_temp_low
 
     if pf_high <= 0 or pf_low <= 0:
-        issues.append(f"❌ pf_temp values must be > 0 (high={pf_high}, low={pf_low})")
+        issues.append(f"ERROR: pf_temp values must be > 0 (high={pf_high}, low={pf_low})")
 
     if pf_low > pf_high:
-        issues.append(f"⚠️  pf_temp_low ({pf_low}) > pf_temp_high ({pf_high}) - unusual")
+        issues.append(f"WARN: pf_temp_low ({pf_low}) > pf_temp_high ({pf_high}) - unusual")
 
     if not issues:
-        print(f"\n✓ Temperatures:")
-        print(f"  - Reward: {temp_start} → {temp_end}")
+        print("\nOK: Temperatures:")
+        print(f"  - Reward: {temp_start} -> {temp_end}")
         print(f"  - Forward policy: {pf_low} to {pf_high}")
 
     return issues
@@ -120,18 +122,18 @@ def check_buffer_config(cfg: DictConfig) -> list[str]:
 
     buffer_ratio = cfg.model.training_mixed_config.buffer_mixture_ratio
     if not (0 <= buffer_ratio <= 1):
-        issues.append(f"❌ buffer_mixture_ratio ({buffer_ratio}) must be in [0, 1]")
+        issues.append(f"ERROR: buffer_mixture_ratio ({buffer_ratio}) must be in [0, 1]")
 
     sim_tolerance = cfg.model.reward_buffer.sim_tolerance
     if not (0 <= sim_tolerance <= 1):
-        issues.append(f"❌ sim_tolerance ({sim_tolerance}) must be in [0, 1]")
+        issues.append(f"ERROR: sim_tolerance ({sim_tolerance}) must be in [0, 1]")
 
     buffer_size = cfg.model.reward_buffer.buffer_size
     if buffer_size <= 0:
-        issues.append(f"❌ buffer_size ({buffer_size}) must be > 0")
+        issues.append(f"ERROR: buffer_size ({buffer_size}) must be > 0")
 
     if not issues:
-        print(f"\n✓ Buffer configuration:")
+        print("\nOK: Buffer configuration:")
         print(f"  - buffer_size: {buffer_size}")
         print(f"  - sim_tolerance: {sim_tolerance}")
         print(f"  - buffer_mixture_ratio: {buffer_ratio}")
@@ -159,12 +161,12 @@ def check_horizon_values(cfg: DictConfig) -> list[str]:
         "balance_horizon": cfg.model.training_mixed_config.balance_horizon,
     }
 
-    print(f"\n✓ Horizons (estimated total steps: ~{estimated_steps}):")
+    print(f"\nOK: Horizons (estimated total steps: ~{estimated_steps}):")
     for name, value in horizons.items():
-        status = "✓" if value <= estimated_steps * 2 else "⚠️"
+        status = "OK" if value <= estimated_steps * 2 else "WARN"
         print(f"  {status} {name}: {value}")
         if value > estimated_steps * 5:
-            issues.append(f"⚠️  {name} ({value}) >> estimated total steps ({estimated_steps})")
+            issues.append(f"WARN: {name} ({value}) >> estimated total steps ({estimated_steps})")
 
     return issues
 
@@ -189,12 +191,12 @@ def check_deprecated_params(cfg: DictConfig) -> list[str]:
             found_deprecated.append((old_name, new_name))
 
     if found_deprecated:
-        print(f"\n⚠️  Deprecated parameters found:")
+        print("\nWARN: Deprecated parameters found:")
         for old, new in found_deprecated:
-            print(f"  - '{old}' → please use '{new}'")
+            print(f"  - '{old}' -> please use '{new}'")
             issues.append(f"Deprecated parameter: {old}")
     else:
-        print(f"\n✓ No deprecated parameters found")
+        print("\nOK: No deprecated parameters found")
 
     return issues
 
@@ -224,11 +226,11 @@ def main(cfg: DictConfig):
     # Summary
     print("\n" + "=" * 70)
     if not all_issues:
-        print("✅ ALL CHECKS PASSED - Configuration is valid!")
+        print("OK: ALL CHECKS PASSED - Configuration is valid!")
         print("=" * 70)
         return 0
     else:
-        print(f"⚠️  FOUND {len(all_issues)} ISSUE(S):")
+        print(f"WARN: FOUND {len(all_issues)} ISSUE(S):")
         print("=" * 70)
         for i, issue in enumerate(all_issues, 1):
             print(f"{i}. {issue}")

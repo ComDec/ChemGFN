@@ -228,7 +228,7 @@ class TestReplayBufferIntegration:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -254,7 +254,7 @@ class TestReplayBufferIntegration:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, seq_len).bool(),
+                "local_score": torch.ones(batch_size, seq_len).bool(),
                 "invalid": torch.zeros(batch_size, seq_len).bool(),
                 "global_score": torch.randn(batch_size),
             }
@@ -572,7 +572,7 @@ class TestIntegrationScenarios:
 
         result_dict = {
             "validator_dict": {
-                "valid_score": torch.ones(batch_size, 10).bool(),
+                "local_score": torch.ones(batch_size, 10).bool(),
                 "invalid": torch.zeros(batch_size, 10).bool(),
                 "global_score": torch.randn(batch_size),
             }
