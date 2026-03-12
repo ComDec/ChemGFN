@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import sys
@@ -51,6 +52,8 @@ from chemgfn.utils.prefix_metrics import (
 )
 from chemgfn.utils.replay_buffer import ReplayBuffer
 from chemgfn.utils.schedulers import Scheduler
+
+log = logging.getLogger(__name__)
 
 # Re-export Scheduler for backward compatibility with config files
 __all__ = ["ChemGFNModule", "Scheduler"]
@@ -309,7 +312,7 @@ class ChemGFNModule(LightningModule):
                     self.net_frozen, mode="max-autotune", fullgraph=False
                 )
         except Exception as exc:  # pragma: no cover - defensive logging
-            print(f"torch.compile failed, continuing without compilation: {exc}")
+            log.warning("torch.compile failed, continuing without compilation: %s", exc)
 
         # phi cache
         self._pv_probe_cache = None
@@ -2254,7 +2257,7 @@ class ChemGFNModule(LightningModule):
             return prepare_token_mask(self.tokenizer, tokens_path)
 
         if tokens_path:
-            print(f"Legal tokens file not found: {tokens_path}")
+            log.warning("Legal tokens file not found: %s", tokens_path)
 
         # Fallback: support explicit illegal token strings (common for text tasks).
         illegal_tokens = getattr(self.constraint_config, "illegal_tokens", None)
@@ -2283,7 +2286,7 @@ class ChemGFNModule(LightningModule):
             return None
         if processor_type == "general":
             if self.grammar is None:
-                print("Grammar parsing failed with current tokenizer, disable general processor")
+                log.warning("Grammar parsing failed with current tokenizer, disabling general processor")
                 return None
             return GrammarConstrainedLogitsProcessor(self.grammar)
 

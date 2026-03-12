@@ -139,7 +139,6 @@ def score_fast(
 
     logits = logits.detach()[:, skip_first - 1 :]
 
-    # TODO: remove all penalty from the logits
     if invalid_vocab_mask is not None:
         logits = logits.clone()
         logits[:, :, invalid_vocab_mask] += illegal_vocab_penalty
