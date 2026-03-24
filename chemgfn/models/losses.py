@@ -15,6 +15,7 @@ import torch.nn.functional as F
 __all__ = [
     "GFNLoss",
     "ModifiedSubTBLoss",
+    "AvgPrefixTBLoss",
 ]
 
 
@@ -1301,6 +1302,182 @@ def _first_eos_index(gen_tokens: torch.Tensor, eos_id: int) -> torch.Tensor:
     first = is_eos.float().argmax(dim=1)  # if all False -> 0, fix below
     first = torch.where(has_eos, first, torch.full_like(first, S - 1))
     return first
+
+
+class AvgPrefixTBLoss(GFNLoss):
+    """
+    Average Prefix TB Loss with two modes:
+
+    Mode "avgprefix" (Version A — strict reviewer baseline):
+        Loss = (1/|K|) * sum_{k in K} (Delta_k^TB)^2
+        where K = {0, 1, ..., tau} (all valid prefixes including terminal).
+
+    Mode "tb_plus_avgaux" (Version B — controlled):
+        Loss_i = (Delta_tau^TB)^2 + eta_i * weighted_mean_{k in [kmin, h-1]} (Delta_k^TB)^2
+        with terminal TB residual as main anchor and prefix average as weighted auxiliary.
+
+    Prefix TB residual at position k:
+        Delta_k^TB = logZ + sum_{t=0}^{k-1} log_pf[t] + log_pterm[k] - log_r[k]
+
+    Tensor conventions (match existing codebase):
+        log_pf:    [B, L]   meaningful token steps are log_pf[:, :-1] (length L-1)
+        log_pterm: [B, L]   EOS log-prob at each state k=0..L-1
+        log_r:     [B, L]   per-state terminate-at-k log-reward
+        generated_text: [B, prompt_len + L] includes forced terminal EOS
+    """
+
+    def __init__(
+        self,
+        mode: str = "avgprefix",
+        aux_eta: float = 0.25,
+        k_min: int = 0,
+        subtb_lambda: float = 1.0,
+        detach_pterm_in_aux: bool = False,
+        eps: float = 1e-8,
+        init_logZ: float = 0.0,
+    ):
+        super().__init__()
+        if mode not in ("avgprefix", "tb_plus_avgaux"):
+            raise ValueError(f"Unknown mode: {mode!r}, expected 'avgprefix' or 'tb_plus_avgaux'")
+        self.mode = mode
+        self.aux_eta = float(aux_eta)
+        self.k_min = int(k_min)
+        self.subtb_lambda = float(subtb_lambda)
+        self.detach_pterm_in_aux = bool(detach_pterm_in_aux)
+        self.eps = float(eps)
+        self.logZ = nn.Parameter(torch.tensor([float(init_logZ)], dtype=torch.float32))
+
+    def forward(
+        self,
+        log_pf: torch.Tensor,
+        log_r: torch.Tensor,
+        log_pterm: torch.Tensor,
+        generated_text: torch.Tensor,
+        termination_token_id: int,
+        prompt_len: int,
+        k_min: int | None = None,
+        max_prefix_len: int | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        B, L = log_pf.shape
+        assert log_r.shape == (B, L), f"log_r {log_r.shape} vs (B,L)={(B, L)}"
+        assert log_pterm.shape == (B, L), f"log_pterm {log_pterm.shape} vs (B,L)={(B, L)}"
+        assert generated_text.shape[0] == B
+        assert generated_text.shape[1] - prompt_len == L, (
+            f"generated_text post-prompt length must equal L. "
+            f"got generated_text.shape={generated_text.shape}, prompt_len={prompt_len}, L={L}"
+        )
+        assert L > 1, "Need L>=2 (at least one step + terminal state)"
+
+        # --- tau computation (same pattern as RapTBv2, lines 727-731) ---
+        eos_or_after = (
+            generated_text[:, prompt_len:-1] == int(termination_token_id)
+        ).cumsum(dim=-1) >= 1  # [B, L-1]
+        valid_end = ~eos_or_after  # [B, L-1] True before first EOS
+        tau = valid_end.sum(dim=1).clamp(0, L - 1)  # [B] in [0, L-1]
+
+        # --- logZ ---
+        logZ_b = self.logZ.to(device=log_pf.device, dtype=log_pf.dtype).expand(B)  # [B]
+
+        # --- prefix_logpf: cumulative sum of forward log-probs ---
+        # prefix_logpf[:, k] = sum_{t=0}^{k-1} log_pf[t], using meaningful steps log_pf[:, :-1]
+        # For k=0, the sum is 0.
+        zeros_col = torch.zeros(B, 1, device=log_pf.device, dtype=log_pf.dtype)
+        prefix_logpf = torch.cat(
+            [zeros_col, log_pf[:, :-1].cumsum(dim=1)], dim=1
+        )  # [B, L]
+
+        # --- Prefix TB residuals: Delta_k = logZ + prefix_logpf[k] + log_pterm[k] - log_r[k] ---
+        # Shape: [B, L], one residual per position k=0..L-1
+        residuals = logZ_b.unsqueeze(1) + prefix_logpf + log_pterm - log_r  # [B, L]
+
+        # --- position indices ---
+        k_idx = torch.arange(L, device=log_pf.device).unsqueeze(0)  # [1, L]
+
+        # --- valid mask: k <= tau (positions 0..tau are valid) ---
+        valid_mask = k_idx <= tau.unsqueeze(1)  # [B, L]
+
+        if self.mode == "avgprefix":
+            # Version A: simple mean of squared residuals over K = {0, ..., tau}
+            if self.detach_pterm_in_aux:
+                res_use = (
+                    logZ_b.unsqueeze(1)
+                    + prefix_logpf
+                    + log_pterm.detach()
+                    - log_r
+                )
+            else:
+                res_use = residuals
+
+            sq_res = res_use ** 2  # [B, L]
+            masked_sq = sq_res * valid_mask.to(log_pf.dtype)  # [B, L]
+            count = valid_mask.to(log_pf.dtype).sum(dim=1).clamp_min(1.0)  # [B]
+            loss_per_sample = masked_sq.sum(dim=1) / count  # [B]
+            loss = loss_per_sample.mean()
+
+            return {"loss": loss, "logZ": self.logZ.detach()}
+
+        else:
+            # Mode "tb_plus_avgaux"
+            # --- Terminal TB residual at tau ---
+            tau_idx = tau.unsqueeze(1)  # [B, 1]
+            res_terminal = residuals.gather(1, tau_idx).squeeze(1)  # [B]
+            loss_tb_i = res_terminal ** 2  # [B]
+            loss_tb = loss_tb_i.mean()
+
+            # --- Aux prefix residuals ---
+            kmin = self.k_min if k_min is None else int(k_min)
+            kmin = max(0, kmin)
+
+            # h = min(tau, max_prefix_len) if max_prefix_len given, else h = tau
+            if max_prefix_len is not None:
+                K = int(max_prefix_len)
+                h = torch.minimum(tau, tau.new_full(tau.shape, K))  # [B]
+            else:
+                h = tau  # [B]
+
+            # Aux range: k in [kmin, h-1]
+            after_kmin = k_idx >= kmin  # [1, L]
+            before_h = k_idx <= (h.unsqueeze(1) - 1)  # [B, L], k <= h-1
+            aux_mask = valid_mask & after_kmin & before_h  # [B, L]
+
+            # Weights: w_k = subtb_lambda^(k - kmin) for eligible positions
+            w_exp = (k_idx - kmin).clamp_min(0).to(log_pf.dtype)  # [1, L]
+            w = self.subtb_lambda ** w_exp  # [1, L]
+
+            # Aux residuals (optionally detach pterm)
+            if self.detach_pterm_in_aux:
+                res_aux = (
+                    logZ_b.unsqueeze(1)
+                    + prefix_logpf
+                    + log_pterm.detach()
+                    - log_r
+                )
+            else:
+                res_aux = residuals
+
+            sq_res_aux = res_aux ** 2  # [B, L]
+            mw = aux_mask.to(log_pf.dtype) * w  # [B, L]
+            num_i = (sq_res_aux * mw).sum(dim=1)  # [B]
+            den_i = mw.sum(dim=1)  # [B]
+
+            # Per-sample eta: 0 if no eligible aux prefixes
+            active_i = den_i > self.eps
+            eta_i = self.aux_eta * active_i.to(log_pf.dtype)  # [B]
+
+            loss_aux_i = torch.zeros_like(num_i)
+            loss_aux_i[active_i] = num_i[active_i] / den_i[active_i].clamp_min(self.eps)
+            loss_aux = loss_aux_i.mean()
+
+            loss_i = loss_tb_i + eta_i * loss_aux_i  # [B]
+            loss = loss_i.mean()
+
+            return {
+                "loss": loss,
+                "loss_tb": loss_tb.detach(),
+                "loss_aux": loss_aux.detach(),
+                "logZ": self.logZ.detach(),
+            }
 
 
 class LLMTrajectoryBalanceLoss(nn.Module):
