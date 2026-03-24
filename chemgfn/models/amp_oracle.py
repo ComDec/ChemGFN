@@ -86,25 +86,54 @@ class AMPOracle:
             return
         from transformers import AlbertModel, AlbertTokenizer
 
-        self._tokenizer = AlbertTokenizer.from_pretrained(self._prot_albert_name)
+        self._tokenizer = AlbertTokenizer.from_pretrained(
+            self._prot_albert_name, do_lower_case=False
+        )
+        # Build AA -> token_id lookup from vocab (tokens are "▁A", "▁C", etc.)
+        vocab = self._tokenizer.get_vocab()
+        self._aa_to_id = {}
+        for aa in "ACDEFGHIKLMNPQRSTVWY":
+            key = f"\u2581{aa}"  # ▁ + AA
+            if key in vocab:
+                self._aa_to_id[aa] = vocab[key]
+        self._cls_id = self._tokenizer.cls_token_id  # [CLS] = 2
+        self._sep_id = self._tokenizer.sep_token_id  # [SEP] = 3
+        self._pad_id = self._tokenizer.pad_token_id  # [PAD] = 0
+
         self._encoder = AlbertModel.from_pretrained(self._prot_albert_name)
         self._encoder.to(self.device).eval()
+
+    def _tokenize_sequences(self, sequences: Sequence[str]) -> dict[str, Tensor]:
+        """Manually tokenize AA sequences to bypass broken SentencePiece lowercase."""
+        max_len = max(len(s) for s in sequences) + 2  # +2 for [CLS] and [SEP]
+        input_ids = torch.full((len(sequences), max_len), self._pad_id, dtype=torch.long)
+        attention_mask = torch.zeros(len(sequences), max_len, dtype=torch.long)
+        for i, seq in enumerate(sequences):
+            ids = [self._cls_id]
+            for aa in seq:
+                ids.append(self._aa_to_id.get(aa, self._tokenizer.unk_token_id))
+            ids.append(self._sep_id)
+            input_ids[i, : len(ids)] = torch.tensor(ids)
+            attention_mask[i, : len(ids)] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
     @torch.no_grad()
     def _embed(self, sequences: Sequence[str]) -> Tensor:
         """Mean-pooled ProtTrans AlBert embeddings (4096-dim)."""
         self._ensure_encoder()
-        # ProtTrans expects space-separated amino acid characters
-        spaced = [" ".join(list(seq)) for seq in sequences]
-        enc = self._tokenizer(
-            spaced, add_special_tokens=True, padding=True, return_tensors="pt"
-        )
+        enc = self._tokenize_sequences(sequences)
         enc = {k: v.to(self.device) for k, v in enc.items()}
         output = self._encoder(**enc)
-        # Mean-pool over amino acid tokens only (exclude [CLS] and [SEP])
-        mask = enc["attention_mask"][:, 1:-1].unsqueeze(-1).float()
-        hidden = output.last_hidden_state[:, 1:-1, :]
-        emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # (B, 4096)
+        # Mean-pool over AA tokens only (exclude [CLS] at 0 and [SEP] at end)
+        # For each sequence of length L: positions 1..L are AA tokens
+        mask = enc["attention_mask"].clone()
+        mask[:, 0] = 0  # exclude [CLS]
+        # exclude [SEP]: find last 1 in each row, set to 0
+        for i in range(mask.shape[0]):
+            last_one = mask[i].nonzero()[-1].item()
+            mask[i, last_one] = 0
+        mask = mask.unsqueeze(-1).float()
+        emb = (output.last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         return emb
 
     @torch.no_grad()
