@@ -147,8 +147,10 @@ dmypy.json
 
 # Lightning-Hydra-Template
 configs/local/default.yaml
-/data/
 /logs/
+
+# Large data files (exclude from repo)
+data/SMILES/buffer_smiles_test.pt
 .env
 
 # Aim logging

@@ -1,0 +1,10 @@
+[{
+    "prompt": "Optimize the molecule: O=C1Nc2cc(*)ccc2N1 by replacing the marked * with valid molecule fragments to improve the logP, you only need to generate the fragement in SMILES format: ",
+    "molecule": "O=C1Nc2cc(*)ccc2N1"
+}
+,
+{
+    "prompt": "Optimize the molecule: O=C1Nc2cc(*)ccc2N1 by replacing the marked * with valid molecule fragments to improve the logP, you only need to generate the fragement in SMILES format: ",
+    "molecule": "O=C1Nc2cc(*)ccc2N1"
+}
+]
