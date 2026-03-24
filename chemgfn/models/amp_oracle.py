@@ -101,9 +101,9 @@ class AMPOracle:
         )
         enc = {k: v.to(self.device) for k, v in enc.items()}
         output = self._encoder(**enc)
-        # Mean-pool using attention_mask to exclude padding and [SEP]
-        mask = enc["attention_mask"][:, :-1].unsqueeze(-1).float()  # exclude [SEP]
-        hidden = output.last_hidden_state[:, :-1, :]
+        # Mean-pool over amino acid tokens only (exclude [CLS] and [SEP])
+        mask = enc["attention_mask"][:, 1:-1].unsqueeze(-1).float()
+        hidden = output.last_hidden_state[:, 1:-1, :]
         emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)  # (B, 4096)
         return emb
 

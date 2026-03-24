@@ -52,3 +52,5 @@ dependencies:
       - transformers
       - transformers_cfg==0.2.6
       - wandb
+      - polyleven
+      - protobuf
