@@ -725,3 +725,186 @@ class RDKitValidator(SentenceValidator):
             "local_score": local_score,
             "full_tokens": full_tokens_list,
         }
+
+
+class AMPValidator(SentenceValidator):
+    """Validator for AMP (Antimicrobial Peptide) generation.
+
+    Uses a pre-trained oracle (ProtTrans AlBert + MLP) to score sequences.
+    Per-position reward uses absorbing pattern: score placed only at terminal position.
+    All amino acid prefixes are considered valid.
+    """
+
+    AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
+
+    def __init__(
+        self,
+        oracle_weights_path: str | None = None,
+        oracle_device: str = "cpu",
+        mc_samples: int = 0,
+        training_set_path: str | None = None,
+        topk: int = 100,
+    ) -> None:
+        super().__init__("amp_validator")
+        from chemgfn.models.amp_oracle import AMPOracle
+
+        self.oracle = AMPOracle(
+            weights_path=oracle_weights_path,
+            device=oracle_device,
+            mc_samples=mc_samples,
+        )
+        self.topk = topk
+
+        # Load training set for novelty computation
+        self._training_sequences: list[str] | None = None
+        if training_set_path is not None:
+            with open(training_set_path) as f:
+                self._training_sequences = [line.strip() for line in f if line.strip()]
+
+    def _decode_sequence(self, tokens: Tensor, tokenizer) -> str:
+        """Decode token IDs to amino acid string, stopping at EOS."""
+        return _decode_tokens_to_string(tokens, tokenizer)
+
+    def _is_valid_aa_sequence(self, seq: str) -> bool:
+        return len(seq) > 0 and all(c in self.AMINO_ACIDS for c in seq)
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer,
+        scaffold: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        if sentences is None or sentences.ndim < 1:
+            return {
+                "invalid": torch.zeros(1, 1),
+                "global_score": torch.zeros(1),
+                "local_score": torch.zeros(1, 1),
+                "full_tokens": [],
+            }
+
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.zeros(batch_size, device=device)
+        full_tokens_list: list[str] = []
+
+        # Decode all sequences and find stop positions
+        decoded_seqs: list[str] = []
+        stop_positions: list[int] = []
+        for i in range(batch_size):
+            seq = self._decode_sequence(sentences[i], tokenizer)
+            decoded_seqs.append(seq)
+            full_tokens_list.append(seq)
+
+            # Find stop position (first EOS or end)
+            stop_pos = seq_len
+            for pos in range(seq_len):
+                if sentences[i, pos].item() == tokenizer.eos_token_id:
+                    stop_pos = pos
+                    break
+            stop_positions.append(stop_pos)
+
+            # All AA positions are valid (any prefix of AAs is valid)
+            for pos in range(min(stop_pos, seq_len)):
+                invalid[i, pos + 1] = 0.0
+
+        # Batch oracle scoring for valid sequences
+        valid_indices = [i for i, s in enumerate(decoded_seqs) if self._is_valid_aa_sequence(s)]
+        if valid_indices:
+            valid_seqs = [decoded_seqs[i] for i in valid_indices]
+            scores = self.oracle.score_sequences(valid_seqs)
+            scores = scores.to(device)
+            for j, i in enumerate(valid_indices):
+                score_val = scores[j].item()
+                global_score[i] = score_val
+                # Absorbing: place score at terminal position
+                term_pos = min(stop_positions[i], seq_len)
+                local_score[i, term_pos] = score_val
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,
+            "local_score": local_score,
+            "full_tokens": full_tokens_list,
+        }
+
+    def accuracy(
+        self,
+        sentences: Tensor,
+        tokenizer,
+        scaffold: str | None = None,
+        *,
+        return_hist: bool = False,
+        **kwargs,
+    ) -> dict[str, Any]:
+        from chemgfn.utils.sequence_metrics import (
+            levenshtein_diversity,
+            levenshtein_novelty,
+            select_topk,
+        )
+
+        num_samples = int(sentences.shape[0])
+        if num_samples == 0:
+            return {"acc": 0.0, "amp_score": 0.0, "diversity": 0.0, "novelty": 0.0}
+
+        # Decode and score
+        decoded: list[str] = []
+        for i in range(num_samples):
+            seq = self._decode_sequence(sentences[i], tokenizer)
+            decoded.append(seq)
+
+        valid_flags = [self._is_valid_aa_sequence(s) for s in decoded]
+        valid_seqs = [s for s, v in zip(decoded, valid_flags) if v]
+        total_valid = len(valid_seqs)
+
+        scores_list = [0.0] * num_samples
+        if valid_seqs:
+            oracle_scores = self.oracle.score_sequences(valid_seqs)
+            j = 0
+            for i, v in enumerate(valid_flags):
+                if v:
+                    scores_list[i] = float(oracle_scores[j].item())
+                    j += 1
+
+        # Top-K metrics (paper Eq. 1, 2, 3)
+        topk_seqs, topk_scores = select_topk(decoded, scores_list, k=self.topk)
+        performance = sum(topk_scores) / len(topk_scores) if topk_scores else 0.0
+        diversity = levenshtein_diversity(topk_seqs) if len(topk_seqs) >= 2 else 0.0
+        novelty = (
+            levenshtein_novelty(topk_seqs, self._training_sequences)
+            if self._training_sequences and topk_seqs
+            else 0.0
+        )
+
+        # Length stats
+        eos_id = int(tokenizer.eos_token_id)
+        tok_lens = []
+        for i in range(num_samples):
+            length = int(sentences.shape[1])
+            for pos in range(sentences.shape[1]):
+                if sentences[i, pos].item() == eos_id:
+                    length = pos
+                    break
+            tok_lens.append(length)
+
+        out: dict[str, Any] = {
+            "acc": float(total_valid / num_samples),
+            "amp_score": float(sum(scores_list) / num_samples),
+            "amp_score_filter": float(
+                sum(s for s, v in zip(scores_list, valid_flags) if v) / total_valid
+            ) if total_valid else 0.0,
+            "performance_topk": float(performance),
+            "diversity": float(diversity),
+            "novelty": float(novelty),
+            "len_tok_mean": float(sum(tok_lens) / len(tok_lens)) if tok_lens else 0.0,
+        }
+
+        if return_hist:
+            out["len_tok_hist"] = tok_lens
+            out["score_hist"] = scores_list
+
+        return out
