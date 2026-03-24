@@ -69,7 +69,7 @@ reward:
   sentence_validator:
     _target_: chemgfn.models.validators.AMPValidator
     oracle_weights_path: ${paths.data_dir}AMP/oracle_weights.pt
-    oracle_device: "cpu"
+    oracle_device: "cuda"
     mc_samples: 0
     training_set_path: ${paths.data_dir}AMP/training_sequences.txt
     topk: 100
