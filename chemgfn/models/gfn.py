@@ -236,6 +236,8 @@ class ChemGFNModule(LightningModule):
         self.test_batch_fp_div_topk_count = 0
         self.test_text_diversity_sum = 0.0
         self.test_text_diversity_count = 0
+        self.val_decoded_seqs_and_scores: list[tuple[str, float]] = []
+        self.test_decoded_seqs_and_scores: list[tuple[str, float]] = []
         self.test_condvar_tokens: list[torch.Tensor] = []
         self.test_condvar_log_pf_steps: list[torch.Tensor] = []
         self.test_condvar_log_pterm: list[torch.Tensor] = []
@@ -1013,6 +1015,14 @@ class ChemGFNModule(LightningModule):
         if result_dict.get("full_tokens", None) is not None:
             generated_sequences = result_dict["full_tokens"]
 
+        # Accumulate decoded sequences + scores for Top-K metrics (AMP etc.)
+        if validator_dict is not None and "global_score" in validator_dict:
+            g_scores = validator_dict["global_score"]
+            for idx_s, seq_s in enumerate(generated_sequences):
+                self.val_decoded_seqs_and_scores.append(
+                    (seq_s, float(g_scores[idx_s].item()))
+                )
+
         if valid_flags is None:
             valid_flags = [None] * len(generated_sequences)
 
@@ -1283,6 +1293,14 @@ class ChemGFNModule(LightningModule):
         if result_dict.get("full_tokens", None) is not None:
             generated_sequences = result_dict["full_tokens"]
 
+        # Accumulate decoded sequences + scores for Top-K metrics (AMP etc.)
+        if validator_dict is not None and "global_score" in validator_dict:
+            g_scores = validator_dict["global_score"]
+            for idx_s, seq_s in enumerate(generated_sequences):
+                self.test_decoded_seqs_and_scores.append(
+                    (seq_s, float(g_scores[idx_s].item()))
+                )
+
         if valid_flags is None:
             valid_flags = [None] * len(generated_sequences)
 
@@ -1510,6 +1528,7 @@ class ChemGFNModule(LightningModule):
         self.val_batch_fp_div_internal_count = 0
         self.val_batch_fp_div_topk_sum = 0.0
         self.val_batch_fp_div_topk_count = 0
+        self.val_decoded_seqs_and_scores: list[tuple[str, float]] = []
 
     def on_validation_epoch_end(self):
         diversity = self._calculate_diversity_ragged(self.val_samples_ids)
@@ -1670,6 +1689,40 @@ class ChemGFNModule(LightningModule):
             index=False,
         )
 
+        # Top-K Levenshtein diversity/novelty for sequence tasks (AMP etc.)
+        if self.val_decoded_seqs_and_scores:
+            try:
+                from chemgfn.utils.sequence_metrics import (
+                    levenshtein_diversity,
+                    levenshtein_novelty,
+                    select_topk,
+                )
+
+                seqs = [s for s, _ in self.val_decoded_seqs_and_scores]
+                scores = [sc for _, sc in self.val_decoded_seqs_and_scores]
+                validator = self.reward.sentence_validator
+                k = getattr(validator, "topk", 100)
+                topk_seqs, topk_scores = select_topk(seqs, scores, k=k)
+                if topk_seqs:
+                    perf = sum(topk_scores) / len(topk_scores)
+                    div = levenshtein_diversity(topk_seqs) if len(topk_seqs) >= 2 else 0.0
+                    nov = 0.0
+                    training_seqs = getattr(validator, "_training_sequences", None)
+                    if training_seqs:
+                        nov = levenshtein_novelty(topk_seqs, training_seqs)
+                    self._log_metrics(
+                        {
+                            "val/topk_performance": perf,
+                            "val/topk_diversity": div,
+                            "val/topk_novelty": nov,
+                        },
+                        sync_dist=True,
+                        on_epoch=True,
+                    )
+            except ImportError:
+                pass
+            self.val_decoded_seqs_and_scores.clear()
+
         if self.val_log_rs and self.val_log_pfss:
             log_rs = torch.cat(self.val_log_rs)
             log_pfss = torch.cat(self.val_log_pfss)
@@ -1701,6 +1754,7 @@ class ChemGFNModule(LightningModule):
         self.test_batch_fp_div_topk_count = 0
         self.test_text_diversity_sum = 0.0
         self.test_text_diversity_count = 0
+        self.test_decoded_seqs_and_scores: list[tuple[str, float]] = []
         self.test_condvar_tokens.clear()
         self.test_condvar_log_pf_steps.clear()
         self.test_condvar_log_pterm.clear()
@@ -1840,6 +1894,40 @@ class ChemGFNModule(LightningModule):
         cond_var_log, cond_var_json = self._compute_test_conditional_variance_metrics()
         if cond_var_log:
             self._log_metrics(cond_var_log, sync_dist=True, on_epoch=True)
+
+        # Top-K Levenshtein diversity/novelty for sequence tasks (AMP etc.)
+        if self.test_decoded_seqs_and_scores:
+            try:
+                from chemgfn.utils.sequence_metrics import (
+                    levenshtein_diversity,
+                    levenshtein_novelty,
+                    select_topk,
+                )
+
+                seqs = [s for s, _ in self.test_decoded_seqs_and_scores]
+                scores = [sc for _, sc in self.test_decoded_seqs_and_scores]
+                validator = self.reward.sentence_validator
+                k = getattr(validator, "topk", 100)
+                topk_seqs, topk_scores = select_topk(seqs, scores, k=k)
+                if topk_seqs:
+                    perf = sum(topk_scores) / len(topk_scores)
+                    div = levenshtein_diversity(topk_seqs) if len(topk_seqs) >= 2 else 0.0
+                    nov = 0.0
+                    training_seqs = getattr(validator, "_training_sequences", None)
+                    if training_seqs:
+                        nov = levenshtein_novelty(topk_seqs, training_seqs)
+                    self._log_metrics(
+                        {
+                            "test/topk_performance": perf,
+                            "test/topk_diversity": div,
+                            "test/topk_novelty": nov,
+                        },
+                        sync_dist=True,
+                        on_epoch=True,
+                    )
+            except ImportError:
+                pass
+            self.test_decoded_seqs_and_scores.clear()
 
         if self.test_samples_table:
             samples_table = pd.DataFrame(self.test_samples_table)
