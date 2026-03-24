@@ -74,6 +74,14 @@ reward:
     training_set_path: ${paths.data_dir}AMP/training_sequences.txt
     topk: 100
 
+reward_config:
+  reward_temp_start: 1
+  reward_temp_end: 1
+  reward_temp_horizon: 50000
+  scaling_factor_start: 50
+  scaling_factor_end: 50
+  scaling_factor_horizon: 50000
+
 reward_buffer:
   _target_: chemgfn.utils.gfn_utils.ReplayBuffer
   prioritized_replay: True
