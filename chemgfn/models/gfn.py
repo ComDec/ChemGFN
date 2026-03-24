@@ -687,16 +687,12 @@ class ChemGFNModule(LightningModule):
                     "reward_temp": float(self.reward.temperature),
                     "logP": float(log_ps[0].item()),
                     "logR": float(last_log_r[0].item()),
-                    "log_pf_list": [float(x) for x in log_pf[0].detach().cpu().tolist()],
-                    "log_pf_ref_list": [float(x) for x in log_pf_ref[0].detach().cpu().tolist()],
-                    "log_r_list": [float(x) for x in log_r[0].detach().cpu().tolist()],
-                    "log_r_unpenalized_list": [
-                        float(x) for x in log_r_unpenalized[0].detach().cpu().tolist()
-                    ],
-                    "log_pterm_list": [float(x) for x in log_pterm[0].detach().cpu().tolist()],
-                    "log_pterm_ref_list": [
-                        float(x) for x in log_pterm_ref[0].detach().cpu().tolist()
-                    ],
+                    "log_pf_list": log_pf[0].detach().cpu().tolist(),
+                    "log_pf_ref_list": log_pf_ref[0].detach().cpu().tolist(),
+                    "log_r_list": log_r[0].detach().cpu().tolist(),
+                    "log_r_unpenalized_list": log_r_unpenalized[0].detach().cpu().tolist(),
+                    "log_pterm_list": log_pterm[0].detach().cpu().tolist(),
+                    "log_pterm_ref_list": log_pterm_ref[0].detach().cpu().tolist(),
                     "phi_state_list": [
                         round(float(x), 3) for x in phi_state[0].detach().cpu().tolist()
                     ],

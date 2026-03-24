@@ -137,11 +137,10 @@ def score_fast(
         batched_cache = _repeat_past_key_values(prompt_cache[1], encoded_input.shape[0])
         logits = model(encoded_input, past_key_values=batched_cache).logits
 
-    logits = logits.detach()[:, skip_first - 1 :]
+    logits = logits[:, skip_first - 1 :]
 
-    # TODO: remove all penalty from the logits
     if invalid_vocab_mask is not None:
-        logits = logits.clone()
+        logits = logits.clone()  # clone only when mutating
         logits[:, :, invalid_vocab_mask] += illegal_vocab_penalty
 
     if agree_list is not None:
