@@ -1,0 +1,25 @@
+We thank Reviewer QHmk for the thorough review. We address each concern below.
+
+**W1: RL contextualization.** We agree and will revise. Our setting is reward-proportional posterior sampling within the broader MaxEnt/KL-regularized RL family [Tiapkin et al., 2024; Deleu et al., 2024]. The introduction's "in contrast to reward-maximizing RL" overstates the distinction and will be corrected. Our contribution is specifically about balance-based training objectives on terminable prefix trees, which applies regardless of whether one views GFlowNets as a standalone framework or as a special case of entropy-regularized RL.
+
+**W2: PPO/GRPO baselines.** We agree these have value as reward-maximization references. Our primary comparison targets the TB-family because we modify the TB objective itself; PPO/GRPO solve a different problem (mode-seeking reward maximization vs. reward-proportional sampling). We will clarify this distinction and add a qualitative positioning in the revision. A fair quantitative comparison requires matching the full training pipeline and is best addressed in follow-up work.
+
+**W3: TBA baseline.** TBA [Bartoldson et al., 2025] is the most relevant system-level related work. Its core contribution is asynchronous search, prioritized replay, and distributed TB training at 410M-7B scale. Our contribution is orthogonal: improving credit assignment and termination calibration within the TB objective. RapTB could serve as a drop-in replacement for the TB loss inside TBA's training loop. We will add explicit TBA discussion in related work and framing.
+
+**W4/W5: Mathematical explanation and terminology.** We expand the key design rationale:
+- The learnable Z is NOT removed. It remains in the terminal TB anchor (Eq. 9). The rooted residual (Eq. 4) cancels Z only in the auxiliary branch, creating a root-anchored local consistency signal that avoids O(N) redundant optimization of the same global scalar.
+- The absorbed suffix backup (Eqs. 5-7) reduces early-prefix target variance: u_k^max provides a continuation lower-bound, u_k^soft smoothly aggregates suffix evidence, and alpha interpolates between them. Table 6 confirms that neither endpoint alone matches the mixed target.
+- We will define "termination drift" at first mention (Section 1) and forward-reference Appendix C.6.
+
+**Q1: Global optimum guarantee.** No new exact guarantee is claimed for the full composite RapTB objective. The exact reward-proportional fixed point remains tied to the terminal TB anchor; the auxiliary branch is introduced as a variance-reducing optimization aid. This is stated in Eq. (9): "The TB term remains the only exact balance condition."
+
+**Q2: Averaged-prefix TB baseline.** We implement and evaluate exactly this baseline. We test three variants:
+(a) AvgPrefixTB: average (Delta_k^TB)^2 over all k in [0, tau] — the strict version of your suggestion.
+(b) AvgPrefixTB + detach pterm: same, but stop-gradient on log p_term in the auxiliary branch.
+(c) TB + AvgAux: terminal TB anchor + averaged prefix auxiliary (controlled comparison with RapTB).
+
+[RESULTS TO BE INSERTED — experiments in progress on Expr24 RP + Oracle, 3 seeds each]
+
+The key diagnostic to watch is whether naive prefix-averaging induces termination drift (as diagnosed in Section 4.5), since every prefix residual pushes on the shared termination head. If the detach-pterm variant recovers performance, it validates the stop-gradient design. If RapTB still outperforms both, the absorbed suffix backup provides additional benefit through lower-variance prefix targets.
+
+Regardless of outcome, this baseline isolates whether RapTB's gains come from "any dense prefix supervision" or from its specific design choices (rooting, absorption, termination stop-gradient).

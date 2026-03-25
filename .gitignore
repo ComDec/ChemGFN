@@ -171,3 +171,7 @@ notebooks/zinc15_250k.txt
 notebooks/ppo_expr24_eval.csv
 evaluation/**/*.json
 logs_s3/
+
+# External repos cloned into project dir
+Auto-claude-code-research-in-sleep/
+gfn-lm-tuning/

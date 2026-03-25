@@ -7,6 +7,10 @@
 # =============================================================================
 set -euo pipefail
 
+# --------------- environment -------------------------------------------------
+PYTHON=/data1/xw3763/miniforge3/envs/torch/bin/python
+cd /data2/xw3763/gflow/ChemGFN
+
 # --------------- user config ------------------------------------------------
 GPUS=(0 1 2 3 4 5 6 7)
 SEEDS=(42 123 2024)
@@ -57,7 +61,7 @@ launch() {
   # For SMILES, k_min range is different (5->2 paper default); override if needed
   echo "[Full] GPU ${gpu}: ${name}  seed=${seed}"
 
-  CUDA_VISIBLE_DEVICES="${gpu}" python chemgfn/train.py \
+  CUDA_VISIBLE_DEVICES="${gpu}" ${PYTHON} chemgfn/train.py \
     experiment="${exp}" \
     exp_name="${name}" \
     seed="${seed}" \
@@ -70,20 +74,28 @@ launch() {
     model.factor_schedulers.k_min.horizon="${khor}" \
     tags="[full_validation,${tag}]" \
     logger.wandb.project="${WANDB_PROJECT}" \
-    logger.wandb.group="full_validation" &
+    logger.wandb.group="full_validation" \
+    +test=True &
 
   pids+=("$!")
-  ((idx++))
+  idx=$((idx + 1))
 
   if (( ${#pids[@]} >= per_batch )); then
     wait_batch
   fi
 }
 
+# SMILES-specific k_min (paper default: 5->2)
+SMILES_KMIN_START=5
+SMILES_KMIN_END=2
+SMILES_KMIN_HORIZON=5000
+
 # =============================================================================
+# Launch all 18 runs — natural batching by GPU count (no inter-phase waits)
+# =============================================================================
+echo "===== Launching all 18 runs (8 GPUs, batched by availability) ====="
+
 # Phase A: Expr24 + RP replay — both configs, 3 seeds
-# =============================================================================
-echo "===== Phase A: Expr24 + RP replay ====="
 for seed in "${SEEDS[@]}"; do
   launch "${GPUS[$((idx % per_batch))]}" \
     "full_${A_TAG}_expr24_rp_s${seed}" "${EXPR24_RP}" \
@@ -98,12 +110,7 @@ for seed in "${SEEDS[@]}"; do
     "${seed}" "${B_TAG}"
 done
 
-wait_batch
-
-# =============================================================================
 # Phase B: Expr24 + Oracle — both configs, 3 seeds
-# =============================================================================
-echo "===== Phase B: Expr24 + Oracle ====="
 for seed in "${SEEDS[@]}"; do
   launch "${GPUS[$((idx % per_batch))]}" \
     "full_${A_TAG}_expr24_oracle_s${seed}" "${EXPR24_ORACLE}" \
@@ -118,18 +125,7 @@ for seed in "${SEEDS[@]}"; do
     "${seed}" "${B_TAG}"
 done
 
-wait_batch
-
-# =============================================================================
-# Phase C: SMILES main setting — both configs, 3 seeds
-# NOTE: For SMILES, k_min defaults are 5->2. Adjust if sweep 3 says otherwise.
-# =============================================================================
-echo "===== Phase C: SMILES ====="
-# SMILES-specific k_min (adjust per sweep 3 findings for SMILES)
-SMILES_KMIN_START=5
-SMILES_KMIN_END=2
-SMILES_KMIN_HORIZON=5000
-
+# Phase C: SMILES — both configs, 3 seeds
 for seed in "${SEEDS[@]}"; do
   launch "${GPUS[$((idx % per_batch))]}" \
     "full_${A_TAG}_smiles_s${seed}" "${SMILES_BASE}" \
