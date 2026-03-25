@@ -12,7 +12,7 @@ exp_name: "AMP_CFG_RapTB"
 seed: 42
 
 trainer:
-  max_steps: 5000
+  max_steps: 10000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
@@ -62,43 +62,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 5000
+      horizon: 10000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 5000
+      horizon: 10000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.75
       end: 0.25
-      horizon: 2500
+      horizon: 5000
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 5000
+      horizon: 10000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 5000
+      horizon: 10000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 5000
+      horizon: 10000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 1000
+      horizon: 2000
     alpha_reference:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
@@ -108,9 +108,9 @@ model:
     k_min:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
-      start: 5
-      end: 2
-      horizon: 5000
+      start: 25
+      end: 10
+      horizon: 10000
 
 data:
   num_workers: 0

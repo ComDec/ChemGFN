@@ -91,7 +91,7 @@ reward_buffer:
   buffer_aug_value: 0
 
 constraint_config:
-  min_sentence_len: 5
+  min_sentence_len: 15
   max_sentence_len: 50
   grammar_path: ${paths.assets_dir}/protein_grammars/amp.ebnf
   disable_grammar: false

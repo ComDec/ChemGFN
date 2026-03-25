@@ -12,7 +12,7 @@ exp_name: "AMP_CFG_TB"
 seed: 42
 
 trainer:
-  max_steps: 5000
+  max_steps: 10000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 4
   default_root_dir: ${paths.output_dir}
