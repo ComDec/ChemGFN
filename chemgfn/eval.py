@@ -1,10 +1,15 @@
 from typing import Any, Dict, List, Tuple
 
+import torch
 import hydra
 import rootutils
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, ListConfig, open_dict
+
+# Checkpoint contains omegaconf objects — override PyTorch 2.6+ safety restriction
+_orig_torch_load = torch.load
+torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
