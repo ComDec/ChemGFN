@@ -5,10 +5,13 @@ This module provides loss function implementations for training GFlowNets,
 including SubTrajectory Balance (SubTB) losses with various enhancements.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
+
+log = logging.getLogger(__name__)
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -603,7 +606,7 @@ class RootAbsorbExtraSubTBLossFixTBLogZv2(GFNLoss):
         if not (self.gamma < 1.0):
             raise ValueError(f"gamma must be < 1.0, got gamma={self.gamma}")
         if self.k_min < 1:
-            print(f"k_min must be >= 1, got k_min={self.k_min}, setting to 1 automatically")
+            log.warning("k_min must be >= 1, got k_min=%d, setting to 1 automatically", self.k_min)
             self.k_min = 1
 
         self.logZ = torch.nn.Parameter(torch.tensor([float(init_logZ)], dtype=torch.float32))

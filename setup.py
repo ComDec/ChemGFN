@@ -1,14 +1,35 @@
 #!/usr/bin/env python
 
+import os
+import subprocess
+
 from setuptools import find_packages, setup
+
+
+def get_version() -> str:
+    base = "0.1.0"
+    try:
+        commit = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+        return f"{base}+{commit}"
+    except Exception:
+        return base
+
 
 setup(
     name="chemgfn",
-    version="0.0.1",
-    description="Gflownet for chemistry",
+    version=get_version(),
+    description="GFlowNet with LLMs for chemistry and arithmetic generation",
     author="",
     author_email="",
-    url="https://github.com/user/project",
+    url="https://github.com/ComDec/ChemGFN",
     install_requires=[
         "torch",
         "torchvision",

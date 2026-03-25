@@ -324,7 +324,6 @@ def generate_and_return_termination_logprob(
                 )
             else:
                 token_ids = action_seq[:, idx].unsqueeze(-1).to(device)
-                # TODO: simple mask, no-eos before max_len;
                 scores = logits.clone().detach()
                 scores = default_processor(state, scores)
                 results = logits_processor(state, scores, disable_grammar=disable_grammar)
