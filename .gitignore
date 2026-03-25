@@ -175,3 +175,4 @@ logs_s3/
 # External repos cloned into project dir
 Auto-claude-code-research-in-sleep/
 gfn-lm-tuning/
+wandb/
