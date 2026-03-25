@@ -8,6 +8,10 @@
 # =============================================================================
 set -euo pipefail
 
+# --------------- environment -------------------------------------------------
+PYTHON=/data1/xw3763/miniforge3/envs/torch/bin/python
+cd /data2/xw3763/gflow/ChemGFN
+
 # --------------- user config ------------------------------------------------
 GPUS=(0 1 2 3 4 5 6 7)          # available CUDA devices
 MAX_STEPS=1750                   # screening: ~35% of full 5000 steps
@@ -41,7 +45,7 @@ for beta in "${BETAS[@]}"; do
 
     echo "[Sweep 1] GPU ${gpu}: beta=${beta}  rho=${rho}  (${run_name})"
 
-    CUDA_VISIBLE_DEVICES="${gpu}" python chemgfn/train.py \
+    CUDA_VISIBLE_DEVICES="${gpu}" ${PYTHON} chemgfn/train.py \
       experiment="${BASE_EXP}" \
       exp_name="${run_name}" \
       seed="${SEED}" \
@@ -50,7 +54,8 @@ for beta in "${BETAS[@]}"; do
       model.loss_fn.soft_rho="${rho}" \
       tags="[${SWEEP_TAG},beta_${beta},rho_${rho}]" \
       logger.wandb.project="${WANDB_PROJECT}" \
-      logger.wandb.group="${SWEEP_TAG}" &
+      logger.wandb.group="${SWEEP_TAG}" \
+      +test=True &
 
     pids+=("$!")
     ((idx++))
