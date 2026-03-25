@@ -14,7 +14,7 @@ seed: 42
 trainer:
   max_steps: 10000
   gradient_clip_val: 0.5
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 2
   default_root_dir: ${paths.output_dir}
   precision: bf16-true
   devices: 1
