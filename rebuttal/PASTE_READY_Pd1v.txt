@@ -11,16 +11,20 @@ That said, the failure modes we target are observed beyond molecules:
 
 The failure modes (prefix collapse and termination drift) arise from the structure of the prefix tree and the SubTB objective, not from anything specific to SMILES. We will revise claims to make this structural argument more prominent.
 
-Additionally, we scale up to Llama-3.2-3B (3.2B parameters, 3x our original 1B model) on SMILES QED (mean ± std over 3 repeats):
+Additionally, we scale up to Llama-3.2-3B (3.2B parameters, 3x our original 1B model) on SMILES QED. We report the same metrics as Table 1 (mean over 3 repeats):
 
-| Method (3B) | Acc | QED | Diversity | FP Div | log p_term |
-|-------------|-----|-----|-----------|--------|-----------|
-| TB | 0.999±0.000 | 0.717±0.000 | 1.905±0.009 | 0.837±0.003 | +11.4 |
-| SubTB | 0.313±0.010 | 0.221±0.007 | 2.090±0.006 | 0.854±0.002 | -25.0 |
-| RapTB | 0.984±0.002 | 0.732±0.003 | 2.252±0.009 | 0.864±0.000 | +4.56 |
-| RapTB+SubM | 0.996±0.000 | 0.856±0.000 | 2.447±0.013 | **0.937±0.001** | -2.09 |
+| Method | Acc ↑ | Score ↑ | Entropy ↑ | FPDiv ↑ | Len |
+|--------|-------|---------|-----------|---------|-----|
+| TB (1B) | 0.998 | 0.717 | 2.503 | 0.807 | 3.065 |
+| TB (3B) | 0.999 | 0.717 | 1.905 | 0.837 | 2.743 |
+| SubTB (1B) | 0.328 | 0.755 | 2.127 | 0.836 | 8.354 |
+| SubTB (3B) | 0.313 | 0.221 | 2.090 | 0.854 | 8.481 |
+| RapTB (1B) | 0.996 | 0.740 | 2.448 | 0.860 | 6.142 |
+| RapTB (3B) | 0.984 | 0.732 | 2.252 | 0.864 | 6.856 |
+| RapTB+SubM (1B) | 0.988 | 0.844 | 2.726 | 0.898 | 7.435 |
+| RapTB+SubM (3B) | 0.996 | **0.856** | 2.447 | **0.937** | 7.964 |
 
-SubTB's termination drift is *amplified* at 3B scale (log p_term = -25.0, 64% of samples collapse to max length, Acc drops to 0.313). RapTB+SubM achieves the best overall performance (Acc=0.996, QED=0.856, FP Diversity=0.937) with balanced length distribution. This confirms the failure modes are structural and become more pronounced with increased model capacity.
+Key observations at 3B scale: (1) SubTB's termination drift is *amplified* — 64% of valid samples collapse to max length L=10, Acc drops to 0.313, and Score degrades to 0.221 (vs 0.755 at 1B). (2) RapTB+SubM achieves the best overall performance (Acc=0.996, Score=0.856, FPDiv=0.937). (3) TB at 3B concentrates even more heavily on short sequences (Len=2.743 vs 3.065 at 1B). These results confirm that the failure modes are structural and become more pronounced with increased model capacity.
 
 In the revision, we also add an explicit averaged-prefix TB baseline (see response to Reviewer QHmk) that further demonstrates the necessity of RapTB's specific design choices.
 
