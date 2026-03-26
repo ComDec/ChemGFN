@@ -18,7 +18,8 @@ Config: `mode="avgprefix"`, `k_min=0`, `detach_pterm_in_aux=false`, learnable $\
 |---|---|---|---|---|---|---|---|
 | **AvgPrefixTB (RP)** | 0.998 | 142 | 0.016 | 0.808 | 8.908 | 0.213 | -0.560 |
 | **AvgPrefixTB (PRT)** | 1.000 | 108 | 0.012 | 0.944 | 10.989 | 0.249 | -0.606 |
-| **AvgPrefixTB (SubM)** | 1.000 | 7 | 0.000 | 1.442 | 14.506 | 0.372 | -0.000 |
+| ~~AvgPrefixTB (SubM v1)~~ | 1.000 | 7 | 0.000 | 1.442 | 14.506 | 0.372 | -0.000 |
+| **AvgPrefixTB (SubM)** | 0.993 | 902 | 0.050 | 0.190 | 0.819 | 0.051 | -0.181 |
 | **AvgPrefixTB (Oracle)** | 0.922 | 3369 | **0.183** | **0.052** | **0.052** | **0.013** | -1.105 |
 
 ## SMILES (val metrics, training complete)
@@ -39,19 +40,15 @@ Config: `mode="avgprefix"`, `k_min=0`, `detach_pterm_in_aux=false`, learnable $\
 - **SubM works on SMILES** (diversity=2.37) — buffer filled to 200/200 with valid_frac=1.0. SMILES is easier to learn initially, so the buffer fills quickly.
 - SubM collapse is specific to **Expr24 + AvgPrefixTB** interaction, not a general SubM failure.
 
-### SubM Failure Analysis (Expr24)
+### SubM Tuning History (Expr24)
 
-| SubM Run | diversity_valid_only | diversity_valid_ratio | buffer_total | val/diversity | val/len |
-|---|---|---|---|---|---|
-| v1 (original) | true | 1.0 | 31/200 | 0.002 | 3.0 |
-| v2 (ratio fix) | false | 0.5 | 76/200 | -0.000 | 3.0 |
+| SubM Run | valid_ratio | buffer_size | weight_len | alpha_power | val/diversity | Unique |
+|---|---|---|---|---|---|---|
+| v1 (original) | 1.0 (valid only) | 200 | 1.0 | 1.0 | 0.002 | 7 |
+| v2 (ratio fix) | 0.5 | 200 | 1.0 | 1.0 | -0.000 | — |
+| **v3 (final)** | **0.3** | **500** | **5.0** | **2.0** | **1.595** | **902** |
 
-Both collapsed to length-3 expressions (simplest: "X+Y=24"). The buffer filled more in v2 (76 vs 31) but diversity did not improve because:
-- AvgPrefixTB's prefix-averaged loss over-penalizes longer sequences (more prefix residual terms)
-- This creates a bias toward shortest valid expressions
-- The SubM length function (weight_len=1.0, length_bin_size=2) was insufficient to counteract this
-
-**Ongoing fix:** Increase `weight_len` and adjust `diversity_valid_ratio`.
+v1/v2 collapsed to length-3 expressions. v3 fix: lower valid_ratio (0.3), larger buffer (500), stronger length incentive (weight_len=5, alpha_power=2). This allows the buffer to collect longer invalid candidates early, which the length function then promotes.
 
 ## Interpretation for Rebuttal
 
@@ -72,5 +69,5 @@ These results directly support the paper's claims:
 
 ## Pending
 
-- [ ] AvgPrefixTB SubM v3 (increased weight_len + adjusted ratio) — Expr24
-- [ ] SMILES eval (test metrics with eval_expr24_table3.py equivalent)
+- [x] ~~AvgPrefixTB SubM v3~~ — Done: NormCov=0.050, 902 unique (up from 7)
+- [ ] SMILES eval (test metrics)
