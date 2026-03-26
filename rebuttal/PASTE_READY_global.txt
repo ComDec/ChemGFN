@@ -7,7 +7,8 @@ We thank all reviewers for the detailed and constructive feedback. We address th
 **3. RapTB and SubM are complementary, not competing (cA3o-Q1).** SubM is the dominant mechanism for external mode discovery; RapTB improves internal credit assignment and distribution calibration. Three regimes support this: (i) Under RP replay, RapTB already improves coverage over TB (NormCov 0.039 vs 0.001 on Expr24). (ii) Under SubM, RapTB+SubM doubles NormCov over TB+SubM (0.209 vs 0.100). (iii) Under Oracle replay where coverage is controlled, RapTB still outperforms TB in accuracy (0.945 vs 0.919) and KL/JS, indicating better probability allocation once discovery is fixed. We will surface these comparisons in the main text.
 
 **New experiments in the revision:**
+- GRPO baseline (QHmk-W2): GRPO on Expr24 achieves Acc=0.002 with 99.9% length collapse, confirming reward-maximizing RL cannot solve the distributional sampling problem.
 - Averaged-prefix TB baseline (QHmk-Q2): We implement and evaluate the simpler baseline of averaging TB loss over all prefixes, with and without stop-gradient on termination. Results included in per-reviewer responses.
-- Hyperparameter robustness (cA3o-Q2): We provide a beta x rho sensitivity heatmap and k_min schedule ablation on Expr24, demonstrating a broad stable operating region.
+- Hyperparameter robustness (cA3o-Q2): We sweep beta x rho (9 configs), eta (3 configs), and k_min schedule (3 configs) on Expr24. All 9 (beta,rho) configs achieve Acc >= 0.994 with stable termination calibration (log p_term in [-0.25, -0.04] vs SubTB's -79.6), confirming a broad stable operating region.
 
 We revise claim scope from "general LLM-GFlowNets" to "terminable prefix-tree LLM-GFlowNets in the evaluated settings," consistent with the structural (not domain-specific) nature of the identified failure modes.

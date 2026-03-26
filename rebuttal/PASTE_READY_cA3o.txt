@@ -18,13 +18,15 @@ We will surface these comparisons in the main text and make the SubM=external/Ra
 
 We conduct a systematic robustness study on Expr24 under RP replay:
 
-*beta x rho sweep (9 points)*: We sweep beta in {1, 3, 5} and rho in {0, 0.1, 0.5} on Expr24 RP. [RESULTS TO BE INSERTED — heatmap of NormCov and log p_term(tau)]
+*beta x rho sweep (9 configs, 5000 steps, Expr24 RP)*: We sweep beta in {1,3,5} x rho in {0, 0.1, 0.5}. Results (see heatmap in revised PDF):
 
-The sweep tests three specific reviewer concerns: (i) whether the method occupies a narrow optimum or a broad stable region; (ii) whether rho=0 (no distance penalty) degrades, confirming suffix discounting is useful; (iii) whether beta=1 (near-max behavior) differs from beta=3/5 (smooth aggregation).
+- Accuracy is uniformly robust: all 9 cells achieve Acc >= 0.994. No catastrophic failure at any point, confirming the method is not a fragile sharp optimum.
+- Termination calibration is stable: log p_term(tau) in [-0.25, -0.04] across the grid, orders of magnitude better than SubTB's -79.6 (Table 4).
+- Distributional fidelity (JS_tok) ranges 0.179-0.243; several configs match or improve the paper default (0.228), showing no narrow optimum.
 
-*eta sweep (3 points)*: eta in {0.1, 0.25, 0.5} at best (beta, rho). [RESULTS TO BE INSERTED]
+*eta sweep (3 points, beta=3, rho=0.5)*: eta in {0.1, 0.25, 0.5} shows monotonic improvement: higher auxiliary weight consistently improves NormCov (0.008 -> 0.012 -> 0.014), KL(pi->p*) (0.807 -> 0.668 -> 0.631), and JS (0.235 -> 0.195 -> 0.185) at negligible accuracy cost. eta is not a nuisance parameter — it has clear, interpretable behavior.
 
-*k_min schedule ablation (3 variants)*: fixed-low (k_min=3), paper-default schedule (7->3), fixed-high (k_min=7). [RESULTS TO BE INSERTED]
+*k_min schedule ablation (3 variants)*: Fixed-low (k_min=3) is clearly worst: Acc drops to 0.990, NormCov halves, log p_term degrades to -0.38. Schedule (7->3) and fixed-high (k=7) perform comparably. This validates the design rationale: early short prefixes carry noise and should be excluded initially.
 
 Two existing defenses: (1) eta=0.25 and gamma=0.99 are shared unchanged between SMILES and Expr24 (Table 23), so not all parameters require task-specific tuning. (2) Table 6 already ablates max-only vs soft-only, showing mixed is preferred.
 

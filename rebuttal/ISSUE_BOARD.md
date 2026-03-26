@@ -40,7 +40,7 @@
 | ID | Raw Anchor | Type | Severity | Response Mode | Status |
 |---|---|---|---|---|---|
 | cA3o-C1 | "TB+SubM outperforms RapTB alone on coverage...when does RapTB provide additive benefit?" | empirical_support | critical | grounded_evidence | open |
-| cA3o-C2 | "seven task-specific hyperparameters...sensitivity unknown" | complexity | major | grounded_evidence + future_work_boundary | open |
+| cA3o-C2 | "seven task-specific hyperparameters...sensitivity unknown" | complexity | major | grounded_evidence + future_work_boundary | **answered** |
 | cA3o-C3 | "empirical support rests almost entirely on one domain" | empirical_support | major | narrow_concession + grounded_evidence | open |
 | cA3o-C4 | "structurally analogous to GAE...equivalent to particular GAE estimator?" | assumptions | minor | direct_clarification | open |
 
@@ -49,10 +49,11 @@
 - **Three regimes**: (1) Under RP: RapTB > TB on coverage. (2) Under SubM: RapTB+SubM > TB+SubM (NormCov 0.209 vs 0.100). (3) Under Oracle: RapTB > TB on accuracy/KL/JS (coverage controlled).
 - **Key insight**: SubM dominates external discovery; RapTB dominates internal allocation. Appendix A.1 ceiling effect on SMILES.
 
-### cA3o-C2: Hyperparameter sensitivity
+### cA3o-C2: Hyperparameter sensitivity — **ANSWERED**
 - **Theme**: (none — direct experimental response)
 - **Existing defense**: Table 6 max/soft ablation; eta/gamma shared across tasks.
-- **New evidence**: β×ρ sweep (9 points), η sweep (3 points), k_min ablation (3 points) — scripts ready in `scripts/sweep/`
+- **New evidence (completed)**: β×ρ sweep (9 configs, 5000 steps), η sweep (3 runs), k_min ablation (3 runs). See `SWEEP_RESULTS_FINAL.md`.
+- **Key result**: Acc ≥ 0.994 across all 9 (β,ρ) configs. log_pterm(τ) ∈ [-0.25, -0.04] everywhere. η shows monotonic improvement. Fixed-low k_min is worst, validating schedule design.
 
 ### cA3o-C3: Domain generalization
 - **Theme**: GT-4
@@ -102,7 +103,7 @@
 | ID | Raw Anchor | Type | Severity | Response Mode | Status |
 |---|---|---|---|---|---|
 | QHmk-C1 | "fails to put itself in broader context of RL literature...GFlowNet = entropy-regularized RL" | novelty | critical | narrow_concession + direct_clarification | open |
-| QHmk-C2 | "add PPO and GRPO as baselines" | baseline_comparison | major | narrow_concession | open |
+| QHmk-C2 | "add PPO and GRPO as baselines" | baseline_comparison | major | grounded_evidence | **answered** |
 | QHmk-C3 | "TBA is most direct competitor...should be added" | baseline_comparison | critical | nearest_work_delta | open |
 | QHmk-C4 | "RapTB loss section should be expanded...mathematical derivation" | clarity | major | direct_clarification | open |
 | QHmk-C5 | "does reaching global optimum guarantee target distribution?" | theorem_rigor | critical | direct_clarification | open |
@@ -113,9 +114,9 @@
 - **Theme**: GT-2
 - **Response**: Acknowledge GFlowNets within MaxEnt/KL-regularized RL family. Revise "in contrast to reward-maximizing RL" framing. Cite Tiapkin+ (AISTATS 2024), Deleu+ (UAI 2024).
 
-### QHmk-C2: PPO/GRPO baselines
-- **Response**: Half-concede. They have value as reward-maximization references. Primary comparison is TB-family to isolate objective-level mechanism. Will clarify distinction in revision.
-- **Risk**: Implementing PPO/GRPO fairly in 1 week is too risky.
+### QHmk-C2: PPO/GRPO baselines — **ANSWERED**
+- **New evidence**: GRPO on Expr24: Acc=0.002 (12/6400 valid), 99.9% length collapse to L_max, NormCov=0, prefix_top1_auc=0.977 (near-total prefix collapse). Confirms reward-maximizing RL fails at distributional sampling.
+- **Response**: GRPO result directly demonstrates reward maximization ≠ reward-proportional sampling. Primary comparison remains TB-family for objective-level mechanism isolation.
 
 ### QHmk-C3: TBA baseline
 - **Theme**: GT-2
@@ -156,6 +157,10 @@
 
 | Status | Count |
 |---|---|
+| **answered** | 2 (cA3o-C2, QHmk-C2) |
+| open | 14 |
+| needs_user_input | 1 (QHmk-C6 — AvgPrefixTB results pending) |
+| deferred | 1 (JxzD-C3 — AMP/GFP future work) |
 | open | 18 |
 | answered | 0 |
 | needs_user_input | 0 |
