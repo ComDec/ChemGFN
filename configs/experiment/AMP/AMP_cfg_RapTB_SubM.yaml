@@ -12,7 +12,7 @@ exp_name: "AMP_CFG_RapTB_SubM"
 seed: 42
 
 trainer:
-  max_steps: 10000
+  max_steps: 5000
   gradient_clip_val: 0.5
   accumulate_grad_batches: 2
   default_root_dir: ${paths.output_dir}
@@ -27,6 +27,9 @@ model:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 0.0001
+
+  training_mixed_config:
+    n_samples: 96
 
   ema_config:
     enabled: false
@@ -51,15 +54,15 @@ model:
 
   reward_buffer:
     _target_: chemgfn.utils.replay_buffer.ReplayBufferSubmodular
-    buffer_size: 200
-    weight_div: 1.0
+    buffer_size: 500
+    weight_div: 1.5
     weight_val: 1.0
     weight_rew: 1.0
     default_strategy: "standard"
     validator_key: "local_score"
     validator_type: "max"
 
-    stochastic_epsilon: 0.1
+    stochastic_epsilon: 0.05
     ltlg_epsilon: 0.1
 
     set_function_obj:
@@ -67,10 +70,10 @@ model:
     similarity_backend:
       _target_: chemgfn.utils.replay_buffer.ShingleJaccardBackend
 
-    length_bin_size: 1
+    length_bin_size: 5
     length_alpha_power: 1.0
     length_alpha_mode: "uniform"
-    weight_len: 1.0
+    weight_len: 2.0
 
   factor_schedulers:
     reward_temp:
@@ -78,43 +81,43 @@ model:
       schedule_type: "linear"
       start: 1
       end: 1
-      horizon: 10000
+      horizon: 5000
     replay_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.50
       end: 0.25
-      horizon: 10000
+      horizon: 5000
     dataset_buffer:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.75
       end: 0.25
-      horizon: 5000
+      horizon: 2500
     reference_logits_scale:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1
       end: 1.0
-      horizon: 10000
+      horizon: 5000
     pf_temp_low:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 0.8
       end: 1.0
-      horizon: 10000
+      horizon: 5000
     pf_temp_high:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 1.5
       end: 1.0
-      horizon: 10000
+      horizon: 5000
     scaling_factor:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
       start: 50
       end: 50
-      horizon: 2000
+      horizon: 1000
     alpha_reference:
       _target_: chemgfn.models.gfn.Scheduler
       schedule_type: "linear"
@@ -126,7 +129,7 @@ model:
       schedule_type: "linear"
       start: 25
       end: 10
-      horizon: 10000
+      horizon: 5000
 
 data:
   num_workers: 0
