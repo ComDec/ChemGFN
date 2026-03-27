@@ -3,7 +3,7 @@
 - **Paper**: RapTB: Rooted Absorbed Prefix Trajectory Balance with Submodular Replay for GFlowNet Training
 - **Venue**: ICML 2026
 - **Submission ID**: 13383
-- **Current Phase**: Phase 4 (Drafting — all experiments complete)
+- **Current Phase**: Phase 4→5 (Drafting complete, pending AMP results and safety validation)
 - **Response Mode**: TEXT_ONLY
 - **Character Limit**: 5000 per response, multiple submissions + revised PDF allowed
 
@@ -29,6 +29,7 @@
 | GRPO baseline (Expr24) | QHmk-C2 | **DONE** | Acc=0.002, length collapse |
 | AvgPrefixTB (Expr24 RP+SubM+Oracle, SMILES) | QHmk-C6 | **DONE** | `avgprefix_tb_results.md` |
 | 3B scale-up (SMILES, 4 methods) | Pd1v-C1, JxzD-Q3 | **DONE** | `ALL_EXPERIMENTS_STATUS.md` |
+| AMP task (4 methods, 10K steps) | JxzD-C3, cA3o-C3, Pd1v-C1 | **IN PROGRESS** | `amp_results.md` (RapTB+SubM ~50%) |
 
 ## Rebuttal Drafts
 
@@ -46,8 +47,9 @@
 - [x] Phase 1: Validate inputs, normalize reviews
 - [x] Phase 2: Atomize concerns → ISSUE_BOARD.md (18 issues)
 - [x] Phase 3: Strategy plan → STRATEGY_PLAN.md
-- [x] Phase 3.5: Evidence sprint — ALL experiments complete
-- [~] Phase 4: Draft rebuttal — drafts written, need final review
-- [ ] Phase 5: Safety validation
-- [ ] Phase 6: Stress test
-- [ ] Phase 7: Finalize
+- [x] Phase 3.5: Evidence sprint — core experiments complete, AMP in progress
+- [x] Phase 4: Draft rebuttal — all 5 drafts written with real data
+- [~] Phase 4.5: Comprehensive analysis — `REBUTTAL_ANALYSIS_CN.md` written
+- [ ] Phase 5: Safety validation (coverage, provenance, commitment, tone, consistency, limit)
+- [ ] Phase 6: Stress test (Codex MCP)
+- [ ] Phase 7: Finalize (two versions: PASTE_READY + rich draft)

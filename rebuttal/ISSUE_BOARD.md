@@ -84,7 +84,9 @@
 - **Definition**: Surv(k) = n_k / n_valid (Appendix B.3). Interpret jointly with PefEnt and Top1.
 
 ### JxzD-C3: Longer sequences (AMP/GFP)
-- **Honest response**: Current longest is SMILES L_max=15. AMP/GFP is natural next step but not available.
+- **Evidence**: L_max=15 stress test (Table 2) + 3B scale-up on SMILES.
+- **AMP experiment in progress**: 4 methods (TB/SubTB/RapTB/RapTB+SubM) on AMP generation (15-50 AA). TB/SubTB/RapTB complete; RapTB+SubM ~50%. Preliminary: SubTB length bias confirmed (49.9 AA mean), TB/RapTB similar performance.
+- **Response strategy**: Lead with 3B scale-up + L_max=15 as concrete evidence. AMP as supplementary if results are positive.
 
 ### JxzD-C4: Why LLM fine-tuning
 - **Response**: Problem formulation is LLM-GFlowNet post-training. Frozen reference LM prior is part of the setup, not incidental. Training from scratch answers a different question.
@@ -157,6 +159,9 @@
 
 | Status | Count |
 |---|---|
-| **answered** | 3 (cA3o-C2, QHmk-C2, QHmk-C6) |
-| open | 13 (text-only responses drafted, no experiments needed) |
-| deferred | 1 (JxzD-C3 — AMP/GFP future work) |
+| **answered (with data)** | 3 (cA3o-C2, QHmk-C2, QHmk-C6) |
+| **answered (text + paper data)** | 12 (all remaining except JxzD-C3) |
+| **in progress** | 1 (JxzD-C3 — AMP experiment running) |
+| **deferred** | 0 |
+
+**Note**: All 18 issues now have drafted responses. 3 have new experimental evidence, 12 rely on paper data + text clarifications, 1 (JxzD-C3) has partial new evidence (3B) + AMP in progress.
