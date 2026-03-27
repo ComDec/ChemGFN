@@ -107,7 +107,7 @@
 | QHmk-C3 | "TBA is most direct competitor...should be added" | baseline_comparison | critical | nearest_work_delta | open |
 | QHmk-C4 | "RapTB loss section should be expanded...mathematical derivation" | clarity | major | direct_clarification | open |
 | QHmk-C5 | "does reaching global optimum guarantee target distribution?" | theorem_rigor | critical | direct_clarification | open |
-| QHmk-C6 | "simpler baseline: averaging TB loss over all prefixes" | baseline_comparison | critical | grounded_evidence | open |
+| QHmk-C6 | "simpler baseline: averaging TB loss over all prefixes" | baseline_comparison | critical | grounded_evidence | **answered** |
 | QHmk-C7 | "terminology used before definition (termination drift)" | clarity | minor | direct_clarification | open |
 
 ### QHmk-C1: RL contextualization
@@ -129,10 +129,10 @@
 - **Theme**: GT-1
 - **Response**: No new exact guarantee claimed. Terminal TB = exact balance condition. Auxiliary = variance-reducing regularizer.
 
-### QHmk-C6: Averaged-prefix TB baseline
+### QHmk-C6: Averaged-prefix TB baseline — **ANSWERED**
 - **Theme**: (direct experimental response)
-- **Status**: AvgPrefixTBLoss ALREADY IMPLEMENTED in losses.py. Configs ready for Expr24 (RP + Oracle) and SMILES. Includes detach_pterm variant.
-- **Evidence needed**: Run experiments and report results.
+- **Evidence**: AvgPrefixTB on Expr24 RP: Acc=0.998, NormCov=0.016, JS=0.213, log_pterm=-0.560. On SMILES: Acc=1.000, QED=0.661, Diversity=0.665, Len=2.89 (severe short-sequence collapse). Does NOT match RapTB on any diversity/coverage metric.
+- **See**: `avgprefix_tb_results.md` for full results.
 
 ### QHmk-C7: Terminology timing
 - **Response**: Will define "termination drift" at first mention and forward-reference the formal analysis.
@@ -157,10 +157,6 @@
 
 | Status | Count |
 |---|---|
-| **answered** | 2 (cA3o-C2, QHmk-C2) |
-| open | 14 |
-| needs_user_input | 1 (QHmk-C6 — AvgPrefixTB results pending) |
+| **answered** | 3 (cA3o-C2, QHmk-C2, QHmk-C6) |
+| open | 13 (text-only responses drafted, no experiments needed) |
 | deferred | 1 (JxzD-C3 — AMP/GFP future work) |
-| open | 18 |
-| answered | 0 |
-| needs_user_input | 0 |

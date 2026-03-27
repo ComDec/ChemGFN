@@ -28,6 +28,8 @@ We conduct a systematic robustness study on Expr24 under RP replay:
 
 *k_min schedule ablation (3 variants)*: Fixed-low (k_min=3) is clearly worst: Acc drops to 0.990, NormCov halves, log p_term degrades to -0.38. Schedule (7->3) and fixed-high (k=7) perform comparably. This validates the design rationale: early short prefixes carry noise and should be excluded initially.
 
+*Cross-task validation (SMILES)*: We additionally sweep beta in {1,5,10} x rho in {0,0.1,0.5} on SMILES QED (7 configs). Consistent with Expr24, all configs maintain Acc >= 0.985, natural length distribution (mean 6.3-7.3, no collapse), and stable diversity. The robustness pattern generalizes across tasks.
+
 Two existing defenses: (1) eta=0.25 and gamma=0.99 are shared unchanged between SMILES and Expr24 (Table 23), so not all parameters require task-specific tuning. (2) Table 6 already ablates max-only vs soft-only, showing mixed is preferred.
 
 **Q3: Domain generalization.**
