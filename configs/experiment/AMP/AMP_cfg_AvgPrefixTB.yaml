@@ -1,0 +1,45 @@
+# @package _global_
+
+defaults:
+  - override /data: amp
+  - override /model: llama3_amp
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["ChemGFN", "AMP", "CFG", "AvgPrefixTB"]
+
+exp_name: "AMP_CFG_AvgPrefixTB"
+seed: 42
+
+trainer:
+  max_steps: 5000
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 2
+  default_root_dir: ${paths.output_dir}
+  precision: bf16-true
+  devices: 1
+  num_sanity_val_steps: 0
+  limit_train_batches: 500
+  limit_val_batches: 50
+
+model:
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0001
+
+  loss_fn:
+    _target_: chemgfn.models.losses.AvgPrefixTBLoss
+    mode: "avgprefix"
+    k_min: 0
+    subtb_lambda: 1.0
+    detach_pterm_in_aux: false
+    eps: 1e-8
+
+data:
+  num_workers: 0
+
+logger:
+  wandb:
+    project: "ChemGFN"
+    offline: False
