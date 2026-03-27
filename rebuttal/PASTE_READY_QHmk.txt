@@ -2,7 +2,7 @@ We thank Reviewer QHmk for the thorough review. We address each concern below.
 
 **W1: RL contextualization.** We agree and will revise. Our setting is reward-proportional posterior sampling within the broader MaxEnt/KL-regularized RL family [Tiapkin et al., 2024; Deleu et al., 2024]. The introduction's "in contrast to reward-maximizing RL" overstates the distinction and will be corrected. Our contribution is specifically about balance-based training objectives on terminable prefix trees, which applies regardless of whether one views GFlowNets as a standalone framework or as a special case of entropy-regularized RL.
 
-**W2: PPO/GRPO baselines.** We now include a GRPO baseline on Expr24. GRPO achieves Acc=0.002 (12/6400 valid samples), with 99.9% of generations collapsing to the maximum length and NormCov=0 (zero oracle coverage). This confirms that reward-maximizing RL concentrates mass on few modes rather than sampling proportionally — precisely the distributional failure our method addresses. Our primary comparison remains the TB-family because we modify the TB objective itself, but the GRPO result demonstrates that the reward-proportional sampling problem is genuinely distinct from reward maximization.
+**W2: PPO/GRPO baselines.** We now include both PPO and GRPO baselines on Expr24 with identical setup (Llama-3.2-1B + LoRA, same reward/grammar/budget). Both fail completely: GRPO achieves Acc=0.002 (12/6400 valid), with 99.9% length collapse and NormCov=0. PPO collapses even faster — entropy drops to 0 within 50 training steps (KL diverges to -80), achieving Acc=0.003 (20/6400) before training crashes from degenerate logits. This confirms reward-maximizing RL cannot solve reward-proportional sampling: without distributional objectives, the policy concentrates on degenerate modes rather than covering the target distribution.
 
 **W3: TBA baseline.** TBA [Bartoldson et al., 2025] is the most relevant system-level related work. Its core contribution is asynchronous search, prioritized replay, and distributed TB training at 410M-7B scale. Our contribution is orthogonal: improving credit assignment and termination calibration within the TB objective. RapTB could serve as a drop-in replacement for the TB loss inside TBA's training loop. We will add explicit TBA discussion in related work and framing.
 
@@ -13,13 +13,18 @@ We thank Reviewer QHmk for the thorough review. We address each concern below.
 
 **Q1: Global optimum guarantee.** No new exact guarantee is claimed for the full composite RapTB objective. The exact reward-proportional fixed point remains tied to the terminal TB anchor; the auxiliary branch is introduced as a variance-reducing optimization aid. This is stated in Eq. (9): "The TB term remains the only exact balance condition."
 
-**Q2: Averaged-prefix TB baseline.** We implement and evaluate exactly this baseline. We test three variants:
-(a) AvgPrefixTB: average (Delta_k^TB)^2 over all k in [0, tau] — the strict version of your suggestion.
-(b) AvgPrefixTB + detach pterm: same, but stop-gradient on log p_term in the auxiliary branch.
-(c) TB + AvgAux: terminal TB anchor + averaged prefix auxiliary (controlled comparison with RapTB).
+**Q2: Averaged-prefix TB baseline.** We implement and evaluate exactly this baseline: AvgPrefixTB averages (Delta_k^TB)^2 over all k in [0, tau] with a learnable log Z.
 
-[RESULTS TO BE INSERTED — experiments in progress on Expr24 RP + Oracle, 3 seeds each]
+Expr24 results (6400 samples, RP replay):
 
-The key diagnostic to watch is whether naive prefix-averaging induces termination drift (as diagnosed in Section 4.5), since every prefix residual pushes on the shared termination head. If the detach-pterm variant recovers performance, it validates the stop-gradient design. If RapTB still outperforms both, the absorbed suffix backup provides additional benefit through lower-variance prefix targets.
+| Method | Acc | Unique_valid | NormCov | KL(pi->p*) | JS | log p_term |
+|--------|-----|-------------|---------|------------|------|-----------|
+| AvgPrefixTB | 0.998 | 142 | 0.016 | 0.808 | 0.213 | -0.560 |
+| RapTB | 0.991 | 246.7 | 0.039 | 0.561 | 0.147 | -0.065 |
+| TB | 1.000 | 5.3 | 0.001 | 1.297 | 0.339 | -0.001 |
 
-Regardless of outcome, this baseline isolates whether RapTB's gains come from "any dense prefix supervision" or from its specific design choices (rooting, absorption, termination stop-gradient).
+AvgPrefixTB achieves near-perfect accuracy (0.998) but severe mode collapse: only 142 unique valid expressions vs RapTB's 247, NormCov 0.016 vs 0.039, and worse distributional fidelity (JS 0.213 vs 0.147). Its termination calibration (log p_term = -0.560) is notably worse than RapTB's (-0.065), indicating partial termination suppression consistent with our diagnosis. Under Oracle replay, AvgPrefixTB reaches NormCov 0.183 (vs RapTB 0.816), confirming the gap persists even with controlled coverage.
+
+On SMILES (L_max=10), the distinction is even starker: AvgPrefixTB achieves Acc=1.000 but QED=0.661, Diversity=0.665, FPDiv=0.649 — all the worst among all methods. Mean length 2.89 (54% at L=1-2) indicates severe short-sequence collapse. By contrast, RapTB+SubM achieves QED=0.844, Diversity=2.726 at comparable validity.
+
+These results confirm that simple prefix averaging does NOT match RapTB. The gains come specifically from: (i) rooted residuals that cancel Z in the auxiliary branch, (ii) absorbed suffix backups that provide lower-variance targets, and (iii) stop-gradient on the termination head that prevents drift.

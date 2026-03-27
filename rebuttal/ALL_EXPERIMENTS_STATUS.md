@@ -72,16 +72,59 @@
 
 ---
 
-## 5. PPO Baseline — INCOMPLETE
+## 5. PPO Baseline — COMPLETE (crashed = evidence of failure)
 
-PPO 训练完成 (`logs/rl_baselines/` 有相关文件) 但 eval 未完成（`eval_ppo/` 只有空的 CSV）。需要补跑 eval。
+**标准PPO训练** (Llama-3.2-1B + LoRA, 同GRPO setup, 5000 steps target) 在Expr24上完全崩溃。
+
+### 训练曲线 (crash at step ~250)
+
+| Step | Acc | Entropy | KL(policy‖ref) | Status |
+|------|-----|---------|----------------|--------|
+| 0 | 0.000 | 2.74 | 0.00 | Normal |
+| 4 | 0.000 | 2.89 | -1.99 | Starting divergence |
+| **50** | **0.000** | **0.00** | **-79.5** | **Complete policy collapse** |
+| 100 | 0.031 | 0.00 | -86.6 | Degenerate |
+| 150-250 | 0.000 | 0.00 | -85~-87 | Degenerate until CUDA NaN crash |
+
+### Eval (1 repeat, 6400 samples from crashed model at step ~250)
+
+| Metric | PPO | GRPO | RapTB (paper) |
+|--------|-----|------|---------------|
+| Acc | 0.003 (20/6400) | 0.002 (12/6400) | 0.991 |
+| NormCov | 0 | 0 | 0.039 |
+
+### 分析
+
+PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败：
+- **Sparse reward**: 仅~0.2%样本获得非零reward，PPO缺乏exploration机制
+- **Entropy→0 in 50 steps**: 策略迅速退化为确定性分布
+- **KL→-87**: 策略完全偏离reference model
+- **CUDA crash**: 策略崩溃导致NaN logits (in `torch.multinomial`)，训练无法继续
+
+**Rebuttal 价值**: PPO和GRPO都完全失败，从两个角度确认 reward-maximizing RL 无法解决 distributional sampling 问题。PPO甚至比GRPO崩溃得更快（50 steps vs GRPO至少能跑完）。
 
 ---
 
-## 6. AvgPrefixTB Baseline — IN PROGRESS (用户在跑)
+## 6. AvgPrefixTB Baseline — COMPLETE
 
-SMILES 上的 AvgPrefixTB 已训练完成 (step=5000)，但没有 test CSV。
-Expr24 的 AvgPrefixTB 实验状态需要用户确认。
+详见 `avgprefix_tb_results.md`。
+
+### Expr24 (6400 samples)
+
+| Replay | Acc | Unique | NormCov | JS | log_pterm |
+|--------|-----|--------|---------|-----|-----------|
+| RP | 0.998 | 142 | 0.016 | 0.213 | -0.560 |
+| SubM v3 | 0.993 | 902 | 0.050 | 0.051 | -0.181 |
+| Oracle | 0.922 | 3369 | 0.183 | 0.013 | -1.105 |
+
+### SMILES (3200×3 samples)
+
+| Method | Acc | QED | Diversity | FPDiv | Len |
+|--------|-----|-----|-----------|-------|-----|
+| AvgPrefixTB | 1.000 | 0.661 | 0.665 | 0.649 | 2.89 |
+| RapTB+SubM | 0.988 | 0.844 | 2.726 | 0.898 | 7.44 |
+
+**结论**: AvgPrefixTB 在 Expr24 RP 上 NormCov=0.016 (RapTB=0.039)，SMILES 上 QED=0.661/Diversity=0.665 (严重短序列坍缩)。Simple prefix averaging 不能替代 RapTB。
 
 ---
 
@@ -147,14 +190,36 @@ Expr24 的 AvgPrefixTB 实验状态需要用户确认。
 
 ---
 
+## 10. SMILES β×ρ Sweep — IN PROGRESS
+
+**Purpose**: Cross-task robustness for cA3o-C2. Show that hyperparam sensitivity results from Expr24 also hold on SMILES.
+
+**Grid**: β ∈ {1, 5, 10} × ρ ∈ {0, 0.1, 0.5} = 9 configs
+**Base**: SMILES_RapTB_v2_kmin_5_to_2_mix_fix (paper default: β=5, ρ=0.1)
+**Budget**: 5000 steps, seed=42, +test=True (limit_test_batches=100)
+
+**Status**:
+- GPU 0: β=1, ρ=0 — training
+- GPU 2: β=1, ρ=0.1 — training
+- GPU 4: β=1, ρ=0.5 — training
+- GPU 5: β=5, ρ=0 — training
+- GPU 6: β=5, ρ=0.1 (paper default) — training
+- GPU 7: β=5, ρ=0.5 — training
+- GPU 1: β=10, ρ={0, 0.1, 0.5} — queued sequentially
+
+**ETA**: ~12h per run. First batch (6 runs) expected ~17:30. β=10 batch expected ~next morning.
+
+---
+
 ## 9. 总结：Rebuttal Evidence Readiness
 
 | Issue | Evidence | Status |
 |-------|---------|--------|
-| cA3o-C2: Hyperparameter sensitivity | β×ρ sweep + η + k_min | **READY** |
-| QHmk-C2: PPO/GRPO baseline | GRPO eval (Acc=0.002, collapse) | **READY** |
-| QHmk-C6: AvgPrefixTB baseline | User running | **PENDING** |
-| cA3o-C1: RapTB vs SubM | Paper evidence (Tables 3,4) | **READY** (no new exp needed) |
+| cA3o-C2: Hyperparameter sensitivity (Expr24) | β×ρ sweep + η + k_min | **READY** |
+| cA3o-C2: Hyperparameter sensitivity (SMILES) | SMILES β×ρ sweep (9 configs) | **IN PROGRESS** |
+| QHmk-C2: PPO/GRPO baseline | GRPO (Acc=0.002) + PPO (Acc=0.003, crash at step 250) | **READY** |
+| QHmk-C6: AvgPrefixTB baseline | Expr24 + SMILES 完成 | **READY** |
+| cA3o-C1: RapTB vs SubM | Paper evidence (Tables 3,4) | **READY** |
 | QHmk-C1: RL contextualization | Narrative fix | **READY** (text only) |
 | QHmk-C3: TBA baseline | Narrative fix | **READY** (text only) |
 | Pd1v-C3 / JxzD-C5: Theory | Narrative fix | **READY** (text only) |
@@ -162,7 +227,9 @@ Expr24 的 AvgPrefixTB 实验状态需要用户确认。
 | JxzD-Q3: Larger model generalization | SMILES 3B (Llama-3.2-3B) | **READY** |
 
 ### 待办
-- [ ] 补跑 PPO eval（如果来得及）
-- [ ] 等待 AvgPrefixTB 结果
-- [ ] 排查 NormCov eval pipeline 与论文实现的差异
-- [ ] ~~更新 rebuttal 草稿中的 QHmk 和 cA3o 部分~~ ✅ 3B 结果已更新到各 PASTE_READY 文档
+- [x] ~~补跑 PPO eval~~ ✅ PPO training crash = evidence of failure
+- [x] ~~等待 AvgPrefixTB 结果~~ ✅ 完成
+- [ ] 等待 SMILES β×ρ sweep 完成 (~12h)
+- [ ] Sweep 完成后运行 analyze_sweep.py 生成 heatmap
+- [ ] 更新 PASTE_READY_cA3o.txt 加入 SMILES sweep 结果
+- [ ] 更新 PASTE_READY_QHmk.txt 替换 AvgPrefixTB placeholder

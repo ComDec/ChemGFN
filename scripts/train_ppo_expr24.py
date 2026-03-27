@@ -200,9 +200,14 @@ def autoregressive_generate(
         if all_neg_inf.any():
             constrained_logits[all_neg_inf, eos_token_id] = 0.0
 
+        # Clamp logits to avoid NaN/Inf in softmax (policy may collapse)
+        constrained_logits = constrained_logits.clamp(min=-1e4, max=1e4)
+        constrained_logits = torch.nan_to_num(constrained_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
         # Sample
         log_probs = F.log_softmax(constrained_logits, dim=-1)
         probs = log_probs.exp().clamp(min=1e-8)
+        probs = probs / probs.sum(dim=-1, keepdim=True)  # re-normalize
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [B]
 
         # For finished sequences, force EOS
