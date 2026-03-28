@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Re-run SMILES sweep with PAPER config (n_samples=32, accum=4, bsz=128)
+# Re-run SMILES sweep with PAPER config — H100 MACHINE (4×80GB)
 #
 # β×ρ grid: 9 runs, 5000 steps, seed=42
 # Paper default: β=5, ρ=0.1
 #
-# Memory: ~10GB per run (SMILES grammar + longer seqs) → 2 per 48GB GPU
-# Time: ~2h per run → ~4h total with 8 GPUs
+# Config: n_samples=32, accum=4 (experiment defaults, matching paper)
+# Memory: ~12GB/run → 3 per 80GB H100 → 12 slots on 4 GPUs
+# Time:   ~2h per run → all 9 fit in 1 batch
 # =============================================================================
 set -euo pipefail
 
@@ -14,14 +15,14 @@ PYTHON=/data1/xw3763/miniforge3/envs/torch/bin/python
 cd /data2/xw3763/gflow/ChemGFN
 
 # --------------- user config ------------------------------------------------
-GPUS=(0 1 2 3 4 5 6 7)
+GPUS=(0 1 2 3)         # 4×H100
+JOBS_PER_GPU=3         # 3 SMILES runs per 80GB H100
 SEED=42
 MAX_STEPS=5000
 WANDB_PROJECT="ChemGFN"
 SWEEP_TAG="rerun_smiles_paper"
 
 # Paper config: n_samples=32, accum=4 (already default in experiment yaml)
-# We do NOT override n_samples or accumulate_grad_batches — use experiment defaults
 SWEEP_BASE="SMILES_RapTB/SMILES_cfg_RapTB_v2_kmin_5_to_2_mix_fix"
 
 COMMON="trainer.max_steps=${MAX_STEPS} \
@@ -29,12 +30,13 @@ COMMON="trainer.max_steps=${MAX_STEPS} \
   +trainer.limit_test_batches=100 \
   +test=True"
 # limit_test_batches=100 × n_samples=32 = 3200 per test
-# (paper eval uses limit=100, test_repeats=3 for total 9600)
 
 # --------------- infrastructure ----------------------------------------------
 pids=()
 gpu_slots=()
-for g in "${GPUS[@]}"; do gpu_slots+=("$g" "$g"); done
+for g in "${GPUS[@]}"; do
+  for ((j=0; j<JOBS_PER_GPU; j++)); do gpu_slots+=("$g"); done
+done
 slot_count=${#gpu_slots[@]}
 idx=0
 failures=()
@@ -53,7 +55,7 @@ launch() {
   local extra="$*"
   local gpu=${gpu_slots[$((idx % slot_count))]}
 
-  echo "[Launch] GPU ${gpu} slot $((idx % slot_count)): ${name}"
+  echo "[Launch] GPU ${gpu} (slot $((idx+1))/${slot_count}): ${name}"
   CUDA_VISIBLE_DEVICES="${gpu}" ${PYTHON} chemgfn/train.py \
     experiment="${SWEEP_BASE}" \
     exp_name="${name}" \
@@ -67,14 +69,12 @@ launch() {
   idx=$((idx + 1))
 }
 
-# =============================================================================
-# β × ρ Sweep (9 runs)
-# =============================================================================
-echo ""
 echo "========================================"
-echo "SMILES β × ρ Sweep (9 runs, paper config)"
-echo "  Using experiment defaults: n_samples=32, accum=4"
-echo "  Steps: ${MAX_STEPS}"
+echo "SMILES Sweep Re-run (paper config)"
+echo "  GPUs: ${GPUS[*]}"
+echo "  Jobs/GPU: ${JOBS_PER_GPU} (total slots: ${slot_count})"
+echo "  Config: experiment defaults (n_samples=32, accum=4, bsz=128)"
+echo "  Steps: ${MAX_STEPS}, Eval: 100×32=3200 samples"
 echo "========================================"
 
 BETAS=(1 5 10)
@@ -89,20 +89,16 @@ for beta in "${BETAS[@]}"; do
   done
 done
 
-echo "[Waiting for all 9 runs...]"
+echo ""
+echo "All ${run_count} runs launched. Waiting..."
 wait_all
 
-# =============================================================================
 echo ""
 echo "========================================"
-echo "ALL SMILES SWEEP EXPERIMENTS DONE"
-echo "  Total: ${run_count} runs"
-echo "  Config: paper defaults (n_samples=32, accum=4, bsz=128)"
-echo "========================================"
-
+echo "DONE: ${run_count} runs"
 if (( ${#failures[@]} )); then
-  echo "WARNING: ${#failures[@]}/${run_count} failure(s)"
+  echo "FAILURES: ${#failures[@]}"
   exit 1
 else
-  echo "All ${run_count} runs completed."
+  echo "All succeeded."
 fi

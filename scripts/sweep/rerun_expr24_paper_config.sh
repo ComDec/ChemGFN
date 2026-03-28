@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Re-run Expr24 sweep with PAPER config (n_samples=32, accum=4, bsz=128)
+# Re-run Expr24 sweep with PAPER config — LOCAL MACHINE (8×48GB)
 #
 # Phase 1: β×ρ grid (9 runs)
 # Phase 2: η sweep (3 runs)
 # Phase 3: k_min ablation (3 runs)
 # Total: 15 runs, 5000 steps each, seed=42
 #
-# Memory: ~6GB per run (n_samples=32) → can fit 2 per 48GB GPU
-# Time: ~3.5h per run → 2 per GPU → ~7h per batch of 8 GPUs
+# Config: n_samples=32, accum=4 (effective bsz=128, matching paper)
+# Memory: ~8GB/run → 3 per 48GB GPU → 21 slots on 7 GPUs
+# Time:   ~3.5h per run → all 15 fit in 1 batch
 # =============================================================================
 set -euo pipefail
 
@@ -16,7 +17,8 @@ PYTHON=/data1/xw3763/miniforge3/envs/torch/bin/python
 cd /data2/xw3763/gflow/ChemGFN
 
 # --------------- user config ------------------------------------------------
-GPUS=(0 1 2 3 4 5 6 7)
+GPUS=(0 1 2 4 5 6 7)  # skip GPU 3 (stale process)
+JOBS_PER_GPU=3         # 3 Expr24 runs per 48GB GPU
 SEED=42
 MAX_STEPS=5000
 N_SAMPLES=32
@@ -32,12 +34,14 @@ COMMON="trainer.max_steps=${MAX_STEPS} \
   logger.wandb.project=${WANDB_PROJECT} \
   +trainer.limit_test_batches=200 \
   +test=True"
-# limit_test_batches=200 × n_samples=32 = 6400 (matches paper)
+# limit_test_batches=200 × n_samples=32 = 6400 (matches paper eval)
 
 # --------------- infrastructure ----------------------------------------------
 pids=()
-gpu_slots=()  # track 2 jobs per GPU
-for g in "${GPUS[@]}"; do gpu_slots+=("$g" "$g"); done
+gpu_slots=()
+for g in "${GPUS[@]}"; do
+  for ((j=0; j<JOBS_PER_GPU; j++)); do gpu_slots+=("$g"); done
+done
 slot_count=${#gpu_slots[@]}
 idx=0
 failures=()
@@ -56,7 +60,7 @@ launch() {
   local extra="$*"
   local gpu=${gpu_slots[$((idx % slot_count))]}
 
-  echo "[Launch] GPU ${gpu} slot $((idx % slot_count)): ${name}"
+  echo "[Launch] GPU ${gpu} (slot $((idx+1))/${slot_count}): ${name}"
   CUDA_VISIBLE_DEVICES="${gpu}" ${PYTHON} chemgfn/train.py \
     experiment="${SWEEP_BASE}" \
     exp_name="${name}" \
@@ -70,18 +74,17 @@ launch() {
   idx=$((idx + 1))
 }
 
-# =============================================================================
-# PHASE 1: β × ρ Sweep (9 runs) — 2 per GPU = 1 batch of ~16 slots
-# =============================================================================
-echo ""
 echo "========================================"
-echo "PHASE 1: β × ρ Sweep (9 runs, paper config)"
-echo "  n_samples=${N_SAMPLES}, accum=${GRAD_ACCUM}, steps=${MAX_STEPS}"
+echo "Expr24 Sweep Re-run (paper config)"
+echo "  GPUs: ${GPUS[*]}"
+echo "  Jobs/GPU: ${JOBS_PER_GPU} (total slots: ${slot_count})"
+echo "  Config: n_samples=${N_SAMPLES}, accum=${GRAD_ACCUM}, bsz=$((N_SAMPLES*GRAD_ACCUM))"
+echo "  Steps: ${MAX_STEPS}, Eval: 200×32=6400 samples"
 echo "========================================"
 
+# --- Phase 1: β × ρ (9 runs) ---
 BETAS=(1 3 5)
 RHOS=(0 0.1 0.5)
-
 for beta in "${BETAS[@]}"; do
   for rho in "${RHOS[@]}"; do
     launch "${SWEEP_TAG}_b${beta}_r${rho}" \
@@ -91,21 +94,8 @@ for beta in "${BETAS[@]}"; do
   done
 done
 
-# Wait for phase 1 (9 runs on 16 slots → all fit in 1 batch)
-echo "[Waiting for Phase 1 (9 runs)...]"
-wait_all
-echo "Phase 1 done."
-
-# =============================================================================
-# PHASE 2: η Sweep (3 runs) — β=3, ρ=0.5 (paper default)
-# =============================================================================
-echo ""
-echo "========================================"
-echo "PHASE 2: η Sweep (3 runs)"
-echo "========================================"
-
-ETAS=(0.1 0.25 0.5)
-for eta in "${ETAS[@]}"; do
+# --- Phase 2: η (3 runs, β=3 ρ=0.5) ---
+for eta in 0.1 0.25 0.5; do
   launch "${SWEEP_TAG}_eta${eta}" \
     "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 \
      model.loss_fn.aux_weight=${eta} \
@@ -113,55 +103,35 @@ for eta in "${ETAS[@]}"; do
      logger.wandb.group=${SWEEP_TAG}_eta"
 done
 
-# =============================================================================
-# PHASE 3: k_min Ablation (3 runs)
-# =============================================================================
-echo ""
-echo "========================================"
-echo "PHASE 3: k_min Ablation (3 runs)"
-echo "========================================"
-
-# Fixed low: k_min = 3
+# --- Phase 3: k_min (3 runs) ---
 launch "${SWEEP_TAG}_kmin_fixed3" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 \
-   model.loss_fn.aux_weight=0.25 \
+  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
    model.factor_schedulers.k_min.start=3 model.factor_schedulers.k_min.end=3 \
    model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${SWEEP_TAG},kmin_fixed3] \
-   logger.wandb.group=${SWEEP_TAG}_kmin"
+   tags=[${SWEEP_TAG},kmin_fixed3] logger.wandb.group=${SWEEP_TAG}_kmin"
 
-# Schedule: 7 -> 3
 launch "${SWEEP_TAG}_kmin_7to3" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 \
-   model.loss_fn.aux_weight=0.25 \
+  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
    model.factor_schedulers.k_min.start=7 model.factor_schedulers.k_min.end=3 \
    model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${SWEEP_TAG},kmin_7to3] \
-   logger.wandb.group=${SWEEP_TAG}_kmin"
+   tags=[${SWEEP_TAG},kmin_7to3] logger.wandb.group=${SWEEP_TAG}_kmin"
 
-# Fixed high: k_min = 7
 launch "${SWEEP_TAG}_kmin_fixed7" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 \
-   model.loss_fn.aux_weight=0.25 \
+  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
    model.factor_schedulers.k_min.start=7 model.factor_schedulers.k_min.end=7 \
    model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${SWEEP_TAG},kmin_fixed7] \
-   logger.wandb.group=${SWEEP_TAG}_kmin"
+   tags=[${SWEEP_TAG},kmin_fixed7] logger.wandb.group=${SWEEP_TAG}_kmin"
 
-echo "[Waiting for Phase 2+3 (6 runs)...]"
+echo ""
+echo "All ${run_count} runs launched. Waiting..."
 wait_all
 
-# =============================================================================
 echo ""
 echo "========================================"
-echo "ALL EXPR24 SWEEP EXPERIMENTS DONE"
-echo "  Total: ${run_count} runs"
-echo "  Config: n_samples=${N_SAMPLES}, accum=${GRAD_ACCUM} (bsz=${N_SAMPLES}×${GRAD_ACCUM}=$((N_SAMPLES*GRAD_ACCUM)))"
-echo "========================================"
-
+echo "DONE: ${run_count} runs"
 if (( ${#failures[@]} )); then
-  echo "WARNING: ${#failures[@]}/${run_count} failure(s)"
+  echo "FAILURES: ${#failures[@]}"
   exit 1
 else
-  echo "All ${run_count} runs completed."
+  echo "All succeeded."
 fi
