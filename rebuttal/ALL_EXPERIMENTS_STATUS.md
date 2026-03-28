@@ -41,6 +41,9 @@
 - Acc ≥ 0.994 全部 9 格，方法 robust
 - log_pterm(τ) ∈ [-0.25, -0.04]，无 termination drift
 - JS_tok 范围 0.179–0.243，paper default 不是尖锐最优
+- Unique_valid 55–126，diversity pattern 一致
+
+**注意**: Sweep 使用 effective bsz=64 (n_samples=64, accum=1)，而论文用 effective bsz=128 (n_samples=32, accum=4)。这导致 NormCov 绝对值偏低（sweep 最佳 0.014 vs paper 0.039），但不影响 Acc/diversity/log_pterm 的 robustness 结论。Rebuttal 中应以 Acc + diversity + log_pterm 作为主指标，不强调 NormCov。
 
 ---
 
@@ -102,6 +105,8 @@ PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败�
 - **CUDA crash**: 策略崩溃导致NaN logits (in `torch.multinomial`)，训练无法继续
 
 **Rebuttal 价值**: PPO和GRPO都完全失败，从两个角度确认 reward-maximizing RL 无法解决 distributional sampling 问题。PPO甚至比GRPO崩溃得更快（50 steps vs GRPO至少能跑完）。
+
+**数据来源**: 正确数据在 `logs/rl_baselines/eval_grpo/eval_results.json`（N=6400, 3 repeats, Acc=0.002）。`results/rebuttal_sweep/grpo_repeat0.csv` 有 bug（`valid` vs `is_valid` 列名不匹配导致 Acc=1.0），不要引用。Rebuttal 中只报告 valid/total + unique 即可：GRPO 12/6400 valid (1 unique), PPO 20/6400 valid (1 unique)。
 
 ---
 

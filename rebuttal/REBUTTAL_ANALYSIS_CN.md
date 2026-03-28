@@ -148,8 +148,8 @@
 | 2 | **β×ρ sweep (SMILES, 7/9 configs)** | cA3o-C2 | Acc≥0.985, Len 6.3-7.3, 跨任务一致 | ★★★★☆ |
 | 3 | **η sweep (3 points)** | cA3o-C2 | 单调改善，η 有清晰可解释行为 | ★★★★☆ |
 | 4 | **k_min ablation (3 points)** | cA3o-C2 | Fixed-low 最差，验证设计 | ★★★★☆ |
-| 5 | **GRPO baseline (Expr24)** | QHmk-C2 | Acc=0.002, 99.9% length collapse | ★★★★★ |
-| 6 | **PPO baseline (Expr24)** | QHmk-C2 | Crash at step 50, Acc=0.003 | ★★★★★ |
+| 5 | **GRPO baseline (Expr24)** | QHmk-C2 | 12/6400 valid, 1 unique, 99.9% at L=11 | ★★★★★ |
+| 6 | **PPO baseline (Expr24)** | QHmk-C2 | 20/6400 valid, 1 unique, crash at step 50 | ★★★★★ |
 | 7 | **AvgPrefixTB (Expr24, 4 replay)** | QHmk-C6 | RP: NormCov=0.016, SMILES: QED=0.661/Len=2.89 | ★★★★★ |
 | 8 | **AvgPrefixTB (SMILES)** | QHmk-C6 | 严重短序列坍缩，所有指标最差 | ★★★★★ |
 | 9 | **3B scale-up (SMILES, 4 methods)** | Pd1v-C1, JxzD-C3 | RapTB+SubM best; SubTB drift amplified at 3B | ★★★★★ |
@@ -354,9 +354,9 @@ AMP 目前显示 RapTB 与 TB 差距不大。如果 RapTB+SubM 也没有明显�
 **Rebuttal 准备度**：90%+。核心证据全部在手，关键草稿已写好。
 
 **最大杠杆点**：
-1. PPO/GRPO 的完全失败 → 直接证明 reward-maximizing RL 不行
+1. PPO/GRPO 各只找到 1 个 unique valid (12/6400, 20/6400) → reward-maximizing RL 完全无法 distributional sampling
 2. AvgPrefixTB 的短序列坍缩 → 证明 simple averaging 不够
-3. β×ρ sweep 全格 Acc≥0.994 → 方法 robust
+3. β×ρ sweep 全格 Acc≥0.994 + diversity 一致 → 方法 robust（NormCov 因 effective bsz 差异偏低，以 Acc+diversity+log_pterm 为主）
 4. 3B scale-up SubTB drift amplified → failure mode 是 structural 的
 
 **最大风险**：QHmk 不翻转。但即使如此，4/4/3 + strong evidence 仍有 borderline accept 可能。
