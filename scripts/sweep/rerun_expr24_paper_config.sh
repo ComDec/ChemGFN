@@ -87,29 +87,9 @@ done
 
 wait_all
 
-# --- Batch 2: k_min (3 runs) ---
-echo ""
-echo "--- Batch 2: k_min (3 runs) ---"
-
-launch "${TAG}_kmin_fixed3" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
-   model.factor_schedulers.k_min.start=3 model.factor_schedulers.k_min.end=3 \
-   model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${TAG},kmin_fixed3] logger.wandb.group=${TAG}_kmin"
-
-launch "${TAG}_kmin_7to3" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
-   model.factor_schedulers.k_min.start=7 model.factor_schedulers.k_min.end=3 \
-   model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${TAG},kmin_7to3] logger.wandb.group=${TAG}_kmin"
-
-launch "${TAG}_kmin_fixed7" \
-  "model.loss_fn.soft_beta=3 model.loss_fn.soft_rho=0.5 model.loss_fn.aux_weight=0.25 \
-   model.factor_schedulers.k_min.start=7 model.factor_schedulers.k_min.end=7 \
-   model.factor_schedulers.k_min.horizon=5000 \
-   tags=[${TAG},kmin_fixed7] logger.wandb.group=${TAG}_kmin"
-
-wait_all
+# NOTE: k_min runs handled separately:
+#   kmin_fixed3, kmin_7to3 → local GPU 6 (tmux sessions)
+#   kmin_fixed7 → H100 (rerun_h100_smiles_and_kmin.sh)
 
 echo ""
 echo "========================================"
