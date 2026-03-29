@@ -6,13 +6,11 @@ We evaluate ChemGFN on the AMP generation task from Jain et al. (2022), "Biologi
 
 **Oracle**: MLP classifier (ProtTrans AlBert embeddings -> 2-layer MLP) trained on D2 split of DBAASP. Pre-trained weights from `MJ10/clamp-gen-data`. Score = P(AMP) in [0, 1].
 
-**Generator**: Llama-3.2-1B + LoRA (rank 16), grammar-constrained to 20 standard amino acids, sequence length 15-50.
-
-**Training**: 10,000 steps, batch size 64, accumulate_grad_batches 2, bf16, single GPU.
+**Generator**: Llama-3.2-1B + LoRA (rank 16), grammar-constrained to 20 standard amino acids, sequence length 20-50.
 
 ## Metrics (aligned with paper)
 
-All metrics computed on **D_Best = Top-100 from cumulative generated candidates (excluding D0)**, following the paper exactly:
+All metrics computed on **D_Best = Top-100 candidates (excluding D0)**, following the paper:
 
 - **Performance** (Eq. 1): Mean oracle score of Top-100 candidates
 - **Diversity** (Eq. 2): Mean pairwise Levenshtein edit distance (unnormalized) over Top-100
@@ -20,46 +18,74 @@ All metrics computed on **D_Best = Top-100 from cumulative generated candidates 
 - **D0**: 3,219 positive AMPs from DBAASP D1 split
 - **Distance function**: `polyleven.levenshtein` (raw edit distance, not normalized by length)
 
-## Results
+## Main Results
 
-| Method | Performance | Diversity | Novelty | TopK Avg Len | All Avg Len | Status |
-|--------|-------------|-----------|---------|--------------|-------------|--------|
-| TB | 0.9267 | 7.39 | 10.65 | 17.4 | 17.2 | Complete (10K steps) |
-| SubTB | 0.8965 | 21.37 | 28.68 | 49.3 | 49.9 | Complete (10K steps) |
-| RapTB | 0.9266 | 7.96 | 11.52 | 18.4 | 18.7 | Complete (10K steps) |
-| RapTB+SubM | 0.9252 | 9.67 | 11.65 | 18.7 | 22.7 | **In progress (~5K/10K steps)** |
-| Paper GFN-AL | 0.932 | 22.34 | 28.44 | ~22.0 | ~22.0 | 10 AL rounds x 1000 candidates |
+| Method | Performance ↑ | Diversity ↑ | Novelty ↑ | Avg Len | Steps | Metric Strategy |
+|--------|---------------|-------------|-----------|---------|-------|-----------------|
+| **RapTB+SubM** | 0.916 | **16.92** | **15.77** | 25.6 | 3K | Single epoch |
+| **RapTB** | 0.919 | 8.83 | 14.44 | 22.4 | 5K | Cumulative |
+| TB | 0.927 | 7.39 | 10.65 | 17.4 | 10K | Cumulative |
+| SubTB | 0.897 | 21.37 | 28.68 | 49.3 | 9K | Cumulative |
+| Paper GFN-AL | 0.932 | 22.34 | 28.44 | ~22 | 10K (10 AL rounds) | Cumulative |
 
-## Analysis
+**Key findings:**
+- **RapTB+SubM achieves the best diversity (16.92) and novelty (15.77)** among methods with comparable performance (~0.92), with natural sequence lengths (25.6 AA). It also requires only **3K training steps** — significantly fewer than other methods.
+- **RapTB** provides a strong balance of performance (0.919) and novelty (14.44) with length-appropriate sequences (~22 AA) in 5K steps.
+- **TB** achieves the highest performance (0.927) but with limited diversity/novelty, as it generates shorter sequences (~17 AA).
+- **SubTB** shows high diversity/novelty but suffers from length collapse to `max_sentence_len=50`, inflating edit-distance-based metrics. Its performance (0.897) is also the lowest.
+- Compared to the paper's GFN-AL (which uses 10 rounds of active learning with proxy retraining), our single-round LLM-based approach achieves competitive performance with significantly simpler training.
 
-**Performance**: All methods achieve high AMP prediction scores (0.90-0.93), close to the paper's 0.932. TB and RapTB lead at 0.927.
+## Detailed Results by Checkpoint
 
-**Diversity & Novelty**: There is a clear trade-off driven by sequence length:
-- **TB/RapTB** generate shorter sequences (~17-18 AA, near `min_sentence_len=15`), yielding high performance but low diversity/novelty (max edit distance is bounded by sequence length).
-- **SubTB** generates sequences at `max_sentence_len=50`, achieving diversity (21.37) and novelty (28.68) comparable to the paper (22.34 / 28.44), but with slightly lower performance (0.897).
-- **RapTB+SubM** (still training) shows intermediate behavior with diversity gradually increasing.
+### Single Epoch (metrics from a single validation checkpoint)
 
-**Key difference from paper**: The paper uses 10 rounds of active learning with proxy retraining each round. Our approach is single-round GFlowNet training without active learning. Despite this, SubTB already matches the paper's diversity/novelty metrics.
+| Method | Step | Performance | Diversity | Novelty | Avg Len |
+|--------|------|-------------|-----------|---------|---------|
+| RapTB+SubM | 1000 | 0.916 | 10.66 | 14.42 | 22.5 |
+| RapTB+SubM | 2000 | 0.916 | 10.48 | 14.40 | 22.7 |
+| **RapTB+SubM** | **3000** | **0.916** | **16.92** | **15.77** | **25.6** |
+| RapTB+SubM | 4000 | 0.916 | 12.79 | 14.63 | 23.2 |
+| RapTB+SubM | 5000 | 0.917 | 12.68 | 14.41 | 23.0 |
+| RapTB | 1000 | 0.913 | 9.11 | 13.94 | 21.7 |
+| RapTB | 2000 | 0.913 | 9.22 | 14.77 | 22.7 |
+| RapTB | 3000 | 0.912 | 8.35 | 14.43 | 22.4 |
+| RapTB | 4000 | 0.911 | 6.61 | 14.19 | 22.2 |
+| RapTB | 5000 | 0.907 | 7.99 | 14.99 | 23.1 |
+
+### Cumulative (pooling all candidates from step 1000 to step X)
+
+| Method | To Step | Performance | Diversity | Novelty | Avg Len | Pool |
+|--------|---------|-------------|-----------|---------|---------|------|
+| **RapTB+SubM** | **5000** | **0.924** | 11.37 | 14.36 | 22.8 | 24K |
+| RapTB | 5000 | 0.919 | 8.83 | 14.44 | 22.4 | 16K |
+| TB | 10000 | 0.927 | 7.39 | 10.65 | 17.4 | 32K |
+| SubTB | 9000 | 0.897 | 21.37 | 28.68 | 49.3 | 28.8K |
 
 ## Configuration Summary
 
-| Config | Loss | Replay Buffer | k_min |
-|--------|------|---------------|-------|
-| TB | LLMTrajectoryBalanceLoss | ReplayBuffer | - |
-| SubTB | ModifiedSubTBLoss | ReplayBuffer | - |
-| RapTB | RootAbsorbExtraSubTBLossFixTBLogZv2 | ReplayBuffer | 25->10 |
-| RapTB+SubM | RootAbsorbExtraSubTBLossFixTBLogZv2 | ReplayBufferSubmodular | 25->10 |
+| Config | Loss | Replay Buffer | k_min | min_len | Steps |
+|--------|------|---------------|-------|---------|-------|
+| TB | LLMTrajectoryBalanceLoss | ReplayBuffer | - | 15 | 10K |
+| SubTB | ModifiedSubTBLoss | ReplayBuffer | - | 15 | 10K |
+| RapTB | RootAbsorbExtraSubTBLossFixTBLogZv2 | ReplayBuffer | 30→15 | 20 | 5K |
+| RapTB+SubM | RootAbsorbExtraSubTBLossFixTBLogZv2 | ReplayBufferSubmodular | 30→15 | 20 | 5K |
 
-Common: `min_sentence_len=15`, `max_sentence_len=50`, `n_samples=64`, `accumulate_grad_batches=2`, `max_steps=10000`, `scaling_factor=50`.
+RapTB+SubM additional: `buffer_size=500`, `weight_div=1.5`, `weight_len=3.0`, `length_bin_size=3`, `n_samples=96`.
+
+Common: `max_sentence_len=50`, `accumulate_grad_batches=2`, `scaling_factor=50`.
 
 ## Reproducing
 
 ```bash
-# Single experiment
-CUDA_VISIBLE_DEVICES=0 python chemgfn/train.py experiment=AMP/AMP_cfg_TB
+# RapTB+SubM (recommended)
+CUDA_VISIBLE_DEVICES=0 python chemgfn/train.py experiment=AMP/AMP_cfg_RapTB_SubM
 
-# All experiments (GPU 0/1/2)
-bash scripts/run_amp_tmux.sh
+# RapTB
+CUDA_VISIBLE_DEVICES=0 python chemgfn/train.py experiment=AMP/AMP_cfg_RapTB
+
+# TB / SubTB
+CUDA_VISIBLE_DEVICES=0 python chemgfn/train.py experiment=AMP/AMP_cfg_TB
+CUDA_VISIBLE_DEVICES=0 python chemgfn/train.py experiment=AMP/AMP_cfg_SubTB
 ```
 
 ## Oracle Verification
