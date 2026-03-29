@@ -23,10 +23,45 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig
 from transformers import AutoTokenizer
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from trl import GRPOConfig, GRPOTrainer
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+class SoftVocabPenaltyProcessor(LogitsProcessor):
+    """Soft penalty on non-task tokens (following gfn-lm-tuning approach).
+    Adds a large negative value to logits of tokens not in the legal set."""
+
+    def __init__(self, legal_token_ids: set, penalty: float = -50.0, vocab_size: int = 128256):
+        self.penalty = penalty
+        self.mask = torch.ones(vocab_size)
+        for tid in legal_token_ids:
+            if tid < vocab_size:
+                self.mask[tid] = 0.0
+
+    def __call__(self, input_ids, scores):
+        penalty = self.mask.to(scores.device) * self.penalty
+        if penalty.shape[0] < scores.shape[1]:
+            penalty = torch.nn.functional.pad(penalty, (0, scores.shape[1] - penalty.shape[0]))
+        elif penalty.shape[0] > scores.shape[1]:
+            penalty = penalty[: scores.shape[1]]
+        return scores + penalty.unsqueeze(0)
+
+
+def build_soft_vocab_processor(tokenizer, legal_tokens_path, penalty=-50.0):
+    with open(legal_tokens_path) as f:
+        legal_tokens = [line.strip() for line in f if line.strip()]
+    legal_ids = set()
+    for tok in legal_tokens:
+        ids = tokenizer.encode(tok, add_special_tokens=False)
+        if len(ids) == 1:
+            legal_ids.add(ids[0])
+    legal_ids.add(tokenizer.eos_token_id)
+    vocab_size = max(tokenizer.vocab_size, max(tokenizer.get_vocab().values()) + 1)
+    print(f"Soft vocab processor: {len(legal_ids)} legal tokens, penalty={penalty}")
+    return SoftVocabPenaltyProcessor(legal_ids, penalty, vocab_size)
 
 
 def parse_args():
@@ -46,6 +81,7 @@ def parse_args():
     p.add_argument("--wandb_project", type=str, default="ChemGFN")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--max_grad_norm", type=float, default=0.5)
+    p.add_argument("--vocab_penalty", type=float, default=-50.0)
     return p.parse_args()
 
 
@@ -181,13 +217,93 @@ def main():
     if not args.no_wandb:
         os.environ["WANDB_PROJECT"] = args.wandb_project
 
-    # Vanilla GRPOTrainer — no grammar override needed
-    trainer = GRPOTrainer(
+    # Build soft vocab processor for task tokens
+    if args.task == "smiles":
+        legal_path = (
+            PROJECT_ROOT / "assets" / "token_list" / "SMILES" / "allowed_llama3.2_1B_allowed_token"
+        )
+    else:
+        legal_path = PROJECT_ROOT / "assets" / "token_list" / "24_points" / "general"
+    vocab_processor = build_soft_vocab_processor(tokenizer, legal_path, args.vocab_penalty)
+
+    # Custom trainer to inject soft vocab penalty during generation
+    class SoftVocabGRPOTrainer(GRPOTrainer):
+        def __init__(self, *a, soft_processor=None, **kw):
+            super().__init__(*a, **kw)
+            self.soft_processor = soft_processor
+
+        def _generate_single_turn(self, prompt_ids, images, multimodal_fields):
+            if self.soft_processor is None or self.use_vllm or self.use_transformers_paged:
+                return super()._generate_single_turn(prompt_ids, images, multimodal_fields)
+            from contextlib import nullcontext
+
+            import numpy as np
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from trl.trainer.grpo_trainer import (
+                pad,
+                profiling_context,
+                unwrap_model_for_generation,
+            )
+
+            device = self.accelerator.device
+            prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
+            padded_ids = pad(prompt_tensors, padding_value=self.pad_token_id, padding_side="left")
+            attention_mask = pad(
+                [torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left"
+            )
+            generate_inputs = {"input_ids": padded_ids, "attention_mask": attention_mask}
+            for k, v in multimodal_fields.items():
+                if isinstance(v, torch.Tensor):
+                    generate_inputs[k] = v
+                elif isinstance(v, list) and v and isinstance(v[0], list):
+                    generate_inputs[k] = pad(
+                        [torch.tensor(x) for x in v], padding_value=0, padding_side="left"
+                    )
+                else:
+                    generate_inputs[k] = torch.tensor(np.array(v))
+            generate_inputs = super(GRPOTrainer, self)._prepare_inputs(generate_inputs)
+
+            lp = LogitsProcessorList([self.soft_processor])
+            with (
+                profiling_context(self, "transformers.generate"),
+                unwrap_model_for_generation(
+                    self.model_wrapped,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                    generation_kwargs=self.generation_kwargs,
+                ) as unwrapped_model,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False)
+                if self.is_fsdp_enabled
+                else nullcontext(),
+            ):
+                out = unwrapped_model.generate(
+                    **generate_inputs,
+                    generation_config=self.generation_config,
+                    logits_processor=lp,
+                    disable_compile=True,
+                )
+            prompt_length = generate_inputs["input_ids"].size(1)
+            completion_ids = out[:, prompt_length:]
+            is_eos = completion_ids == self.eos_token_id
+            eos_idx = torch.full(
+                (is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device
+            )
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            seq_idx = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+            cmask = (seq_idx <= eos_idx.unsqueeze(1)).int()
+            completion_ids = [
+                c[m].tolist() for c, m in zip(completion_ids, cmask.bool(), strict=True)
+            ]
+            return completion_ids, None, {}
+
+    trainer = SoftVocabGRPOTrainer(
         model=args.model_name,
         reward_funcs=reward_func,
         args=grpo_config,
         train_dataset=dataset,
         peft_config=peft_config,
+        soft_processor=vocab_processor,
     )
 
     print(

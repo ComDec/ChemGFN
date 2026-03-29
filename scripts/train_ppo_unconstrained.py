@@ -198,10 +198,27 @@ def autoregressive_generate(
     return current_ids, torch.stack(gen_token_ids, 1), torch.stack(gen_token_lps, 1)
 
 
-def compute_log_probs(model, full_ids, generated, prompt_len):
+def compute_log_probs(
+    model,
+    full_ids,
+    generated,
+    prompt_len,
+    vocab_penalty_mask=None,
+    vocab_penalty=-50.0,
+):
     logits = model(full_ids).logits
     gen_len = generated.shape[1]
     relevant = logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]
+    # Apply same soft vocab penalty as generation (critical for correct ratio)
+    if vocab_penalty_mask is not None:
+        penalty = (
+            (vocab_penalty_mask.to(relevant.device) * vocab_penalty).unsqueeze(0).unsqueeze(0)
+        )
+        if penalty.shape[-1] < relevant.shape[-1]:
+            penalty = F.pad(penalty, (0, relevant.shape[-1] - penalty.shape[-1]))
+        elif penalty.shape[-1] > relevant.shape[-1]:
+            penalty = penalty[..., : relevant.shape[-1]]
+        relevant = relevant + penalty
     all_lp = F.log_softmax(relevant, dim=-1)
     tok_lp = all_lp.gather(2, generated.unsqueeze(-1)).squeeze(-1)
     return tok_lp, all_lp
@@ -338,7 +355,9 @@ def main():
         mask = build_token_mask(gen_ids, tokenizer.eos_token_id)
 
         with torch.no_grad():
-            ref_lps, _ = compute_log_probs(ref_model, all_ids, gen_ids, prompt_len)
+            ref_lps, _ = compute_log_probs(
+                ref_model, all_ids, gen_ids, prompt_len, vocab_mask, args.vocab_penalty
+            )
 
         old_lps = old_lps.detach()
         with torch.no_grad():
@@ -353,7 +372,9 @@ def main():
         acc_loss = acc_kl = acc_ent = 0.0
 
         for _ in range(args.ppo_epochs):
-            new_lps, new_all_lps = compute_log_probs(model, all_ids, gen_ids, prompt_len)
+            new_lps, new_all_lps = compute_log_probs(
+                model, all_ids, gen_ids, prompt_len, vocab_mask, args.vocab_penalty
+            )
             ratio = (new_lps - old_lps).exp()
             s1 = ratio * adv_tok
             s2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * adv_tok
