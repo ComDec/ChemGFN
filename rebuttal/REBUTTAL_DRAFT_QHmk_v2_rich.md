@@ -1,85 +1,72 @@
-# Rebuttal to Reviewer QHmk — Rich Version (v2)
+# Rebuttal to Reviewer QHmk — Rich Version (v2.1)
 
-We sincerely thank Reviewer QHmk for the thorough review and the important references. We address each concern below.
+We thank the reviewer for the careful and constructive feedback. We agree that our original framing under-contextualized the broader RL literature.
 
 ---
 
 ## W1: RL Contextualization
 
-We fully agree with the reviewer and will revise. The connection between GFlowNet training and entropy-regularized RL is well-established [Tiapkin et al., AISTATS 2024; Deleu et al., UAI 2024]. Our introduction's statement "in contrast to reward-maximizing reinforcement learning" overstates the distinction and will be corrected.
+The target distribution in our setting can indeed be written in the KL-regularized / MaxEnt RL form, and LLM post-training with GFlowNet objectives should be positioned within that view rather than as "in contrast to RL" [Tiapkin et al., AISTATS 2024; Deleu et al., UAI 2024]. TBA further demonstrates this by starting from the KL-regularized RL objective and using TB to learn the corresponding posterior; Hu et al. frame LLM+GFlowNet as amortized posterior sampling.
 
-**Revised framing**: Sampling from the reward-proportional posterior p*(x) ∝ P_ref(x)·exp(r(x)/β) is equivalent to solving a KL-regularized RL problem (e.g., Eq. 1-2 in Bartoldson et al., 2025). GFlowNet objectives such as TB, SubTB, and our RapTB are specific algorithmic instantiations for approximately solving this distributional RL problem. Our contribution operates within this broader framework: we improve the **training objective design** within the TB loss family, specifically addressing high-variance credit assignment and termination drift on terminable prefix trees. These are optimization-level improvements that apply regardless of whether one views the problem through the GFlowNet or entropy-regularized RL lens.
+Our contribution is therefore narrower: **within off-policy TB-family training for this posterior, we study how to improve prefix-level credit assignment on terminable prefix trees.** This is an objective-design contribution that applies regardless of whether one views the problem through the GFlowNet or entropy-regularized RL lens.
 
-**Why GFlowNet-style objectives matter despite the RL equivalence**: The theoretical equivalence does not imply that standard RL algorithms (PPO, GRPO) and GFlowNet balance objectives perform identically in practice. The key practical difference is the **optimization target**: reward-maximizing RL objectives (even with KL regularization) optimize expected return, while TB-family objectives directly enforce flow consistency across the full trajectory, providing a structurally different inductive bias toward distributional coverage. As demonstrated in our new experiments (W2 below) and consistent with prior work [Hu et al., 2024; Shen et al., 2023], this difference manifests as substantially better mode coverage in practice.
+We will revise the introduction to remove the "in contrast to RL" framing and properly contextualize our work within the broader KL-regularized RL / MaxEnt framework.
 
 ---
 
 ## W2: PPO/GRPO Baselines
 
-We add PPO and GRPO experiments on both tasks with identical model/LoRA/training budget (Llama-3.2-1B, LoRA rank-16, 5000 steps, unconstrained generation with soft vocab masking following standard RL molecular generation practice [REINVENT]).
+We added PPO and GRPO reference baselines on Expr24 under the same model/LoRA/training budget.
 
-**SMILES QED (dense reward)**:
+**Expr24 (6400 samples, verified results)**:
 
-| Method | QED↑ | Entropy↑ | Notes |
-|--------|------|----------|-------|
-| GRPO | 0.661 | 0.98 | Learns QED but entropy=36% of GFlowNet |
-| PPO | 0.604 | 0.00 | Complete mode collapse to single molecule |
-| TB | 0.717 | 2.503 | — |
-| RapTB+SubM | **0.844** | **2.726** | Best on both reward and diversity |
+| Method | Acc | Valid/6400 | Unique | Length pattern |
+|--------|-----|-----------|--------|---------------|
+| GRPO | 0.002 | 12.3±1.2 | 1 | 99.9% at L_max |
+| PPO | 0.003 | ~20 | 1 | collapsed; CUDA crash at step 250 |
+| TB (paper) | 1.000 | 6400 | 5.3 | concentrated at L=9 |
+| RapTB (paper) | 0.991 | 6343 | 246.7 | diverse |
 
-**Expr24 (sparse reward)**:
+GRPO yields only 12/6400 valid samples (Acc ≈ 0.002) with near-complete length collapse to L_max, producing a single unique valid expression. PPO collapses even faster — entropy reaches 0 within 50 steps, KL diverges to -87, and training crashes with CUDA NaN at step ~250.
 
-| Method | Acc↑ | Entropy↑ | Notes |
-|--------|------|----------|-------|
-| GRPO | 0.872 | 0.89 | Learns reward but diversity=74% of GFlowNet |
-| PPO | 0.000 | — | Never finds a valid expression in 5000 steps |
-| TB | 1.000 | — | High acc but severe mode collapse (5.3 unique) |
-| RapTB | 0.991 | 1.208 | Best acc-diversity trade-off |
+We report these cautiously as **reference baselines** rather than fully tuned head-to-head competitors. The main apples-to-apples comparison in this paper remains within the TB family, because the goal is to isolate **objective-level mechanisms** rather than compare entire post-training stacks. These results are consistent with Hu et al. (2024), who also show that reward-maximizing RL produces valid-but-skewed or spurious behavior compared to GFlowNet objectives on distributional tasks.
 
-**Key observations**:
-1. GRPO achieves reasonable reward on both tasks but suffers severe mode collapse (entropy 0.98 vs 2.726 on SMILES — only 36% of the distributional coverage).
-2. PPO collapses entirely on SMILES (entropy=0, generating a single molecule) and fails completely on Expr24.
-3. Critically, **the diversity gap persists even on SMILES (dense continuous reward)**, confirming this is a fundamental difference between reward-maximizing and distributional objectives, not a reward sparsity artifact.
-4. These results are consistent with the findings in Hu et al. (2024, Table 3), where GFlowNet objectives significantly outperform reward-maximizing RL on distributional metrics.
-
-We present these as reference comparisons under identical conditions, not fully-optimized baselines: same model, same LoRA, same budget. The goal is to demonstrate the inherent advantage of distributional objectives for reward-proportional sampling, which is our problem setting.
+[OPTIONAL — if SMILES PPO/GRPO logs are confirmed, add:]
+On SMILES (dense QED reward), GRPO achieves QED=0.661 but entropy=0.98 (vs RapTB+SubM's 2.726 — only 36% diversity); PPO collapses to entropy=0.00. The diversity gap persists even on dense reward, confirming the issue is objective design, not reward sparsity.
 
 ---
 
 ## W3: TBA Baseline
 
-TBA [Bartoldson et al., NeurIPS 2025] is the most directly relevant system-level work and we will add explicit discussion. After careful reading:
+We agree that TBA [Bartoldson et al., NeurIPS 2025] is important related work and that our discussion was insufficient.
 
-**TBA's loss**: TBA uses TB-VarGrad (their Eq. 5) — a trajectory-level balance objective where log Z is batch-estimated rather than learned. This is fundamentally the same trajectory-level objective as our TB anchor. TBA does **not** use SubTB, intermediate flow functions, or any form of prefix-level credit assignment.
+TBA is a **highly relevant system-level neighbor** — it uses sequence-level VarGrad TB inside an asynchronous distributed system with global replay, reward/recency sampling, and optional IS / reference-reset variants. Its key contribution is scalability (410M-7B, 4-50× speedup over PPO/DPO).
 
-**TBA's contribution is orthogonal to ours**: TBA solves the **scalability** problem — how to efficiently scale TB training with asynchronous exploration and distributed infrastructure (410M-7B models, 4-50× speedup over PPO/DPO). Our contribution solves the **credit assignment** problem — how to reduce variance and prevent termination drift within the TB objective. Notably, TBA explicitly acknowledges TB's gradient variance as a limitation and suggests "learning partial energy functions" as future work — RapTB's absorbed suffix backups directly address this.
+RapTB is orthogonal: it changes the **objective inside the learner** by adding rooted absorbed prefix supervision and detaching the auxiliary termination gradients. It does not replace TBA's surrounding system. We will revise the paper to:
+1. Discuss TBA explicitly in related work
+2. Position RapTB as a drop-in objective for TBA-style pipelines
+3. Note that TBA explicitly acknowledges TB's gradient variance as a limitation and suggests "learning partial energy functions" as future work — RapTB's absorbed suffix backups address exactly this gap
 
-**RapTB is a drop-in replacement**: RapTB's auxiliary loss (Eq. 9) can replace the TB-VarGrad loss inside TBA's training loop. The two contributions are complementary: TBA provides the infrastructure, RapTB provides a better objective.
-
-We did not run TBA experiments because: (1) TBA requires multi-node distributed infrastructure that is orthogonal to our single-GPU experimental setup; (2) the loss function comparison is already covered by our TB baseline, since TBA uses the same TB objective.
+We do not want to claim an apples-to-apples TBA experiment without a clean reimplementation in our constrained prefix-tree setting. This is a limitation we acknowledge.
 
 ---
 
 ## W4/W5: Mathematical Explanation and Terminology
 
-We expand the design rationale for the RapTB loss:
-
 **RapTB = TB + auxiliary regularizer** (Eq. 9):
 
-$$\mathcal{L}_{\text{RapTB}} = \mathbb{E}_{\xi \sim P_F^\theta}\left[\underbrace{\Delta^{\text{TB}}(\xi)^2}_{\text{TB anchor}} + \eta \underbrace{\mathcal{L}_{\text{aux}}(\xi)}_{\text{prefix credit}}\right]$$
+$$\mathcal{L}_{\text{RapTB}} = \mathbb{E}_{\xi \sim P_F^\theta}\left[\underbrace{\Delta^{\text{TB}}(\xi)^2}_{\text{TB anchor (retains } Z\text{)}} + \eta \underbrace{\mathcal{L}_{\text{aux}}(\xi)}_{\text{prefix credit}}\right]$$
 
-The TB term is the sole exact balance condition whose global optimum guarantees reward-proportional sampling. The auxiliary term is a variance-reducing regularizer that enhances internal credit assignment.
+**Design rationale**:
 
-**Design of the auxiliary term**:
+1. **The learnable Z is NOT removed.** It remains in the terminal TB anchor. The rooted residual (Eq. 4) cancels the shared Z **only in the auxiliary branch**, so that every prefix update is not forced to redundantly reoptimize the same global scalar.
 
-1. **Rooted residuals** (Eq. 4): $\bar{\Delta}_k = \Delta_k^{\text{TB}} - \Delta_0^{\text{TB}}$. By subtracting the root residual, log Z cancels in the auxiliary branch. This creates a local consistency signal anchored at s_0 without introducing O(N) redundant copies of the global Z optimization. The global Z is still learned through the TB anchor — we do not remove it from the overall objective.
+2. **Absorbed suffix targets are conservative hindsight backups over observed suffix task-only signals** — not formal lower bounds on state flow. Specifically:
+   - u_k^max: best observed downstream task-only outcome (conservative backup)
+   - u_k^soft: smooth aggregation of multiple suffix signals with distance-discounted log-sum-exp
+   - u_k^tgt = α·u_max + (1-α)·u_soft: empirical bias-variance trade-off (Table 6 confirms neither endpoint alone is optimal)
 
-2. **Absorbed suffix backups** (Eqs. 5-7): For early prefixes, the terminal reward provides a high-variance target because the same prefix can lead to very different terminal outcomes. The absorbed target $u_k^{tgt}$ aggregates suffix reward evidence:
-   - $u_k^{max}$: lower bound on prefix credit (best downstream outcome)
-   - $u_k^{soft}$: smooth aggregation via distance-discounted log-sum-exp
-   - $u_k^{tgt} = \alpha \cdot u_k^{max} + (1-\alpha) \cdot u_k^{soft}$: interpolation (Table 6 confirms neither endpoint alone is optimal)
-
-3. **Stop-gradient on termination head** (Eq. 27): In the auxiliary branch only, we stop gradients through log q_θ(⊤|s_{0:k}). This directly prevents the termination drift diagnosed in Appendix C.6 — without it, overlapping prefix constraints can be minimized by globally shifting termination logits rather than improving token-level transitions.
+3. **Stop-gradient on the termination head** in the auxiliary branch (Eq. 27) directly prevents the termination drift diagnosed in Appendix C.6. The mechanism: in terminable prefix trees, arbitrary-start windows (as in SubTB) impose **heterogeneous boundary conditions** on the shared termination head. The model can reduce many window residuals simultaneously by **globally shifting stop logits** rather than improving token-level transitions. This is exactly the drift we observe in Table 4 (SubTB log p_term = -79.638) and Table 5 (SubTB Δ log p_term = -28.32).
 
 **Terminology**: We will define "termination drift" at first mention in Section 1 and forward-reference Appendix C.6 for the formal analysis.
 
@@ -87,15 +74,13 @@ The TB term is the sole exact balance condition whose global optimum guarantees 
 
 ## Q1: Global Optimum Guarantee
 
-We are transparent about this: **no new exact guarantee is claimed for the full RapTB composite objective**. The exact reward-proportional fixed point is tied to the TB anchor alone (Eq. 9, first term). The auxiliary term introduces a bias — it encourages internal credit assignment but does not have the same fixed-point property.
+**No**: minimizing the full composite RapTB objective with finite auxiliary weight η does not by itself guarantee exact sampling from the target distribution. The exact reward-proportional fixed point remains tied to the terminal TB term alone. The auxiliary term is a **variance-reducing regularizer** that can bias the optimum while improving optimization in practice.
 
-However, several factors mitigate this:
-1. The auxiliary term has weight η, which can be set small. In the limit η→0, RapTB recovers exact TB.
-2. At the fixed point of TB (where Δ^TB = 0 for all trajectories), the rooted residuals $\bar{\Delta}_k$ also vanish, so the auxiliary loss is zero. The TB fixed point is also a fixed point of the auxiliary term.
-3. The bias operates as a **regularization** effect during optimization, not as a distortion of the converged solution. Empirically, RapTB achieves better distributional fidelity than TB (Table 3: JS 0.147 vs 0.339 under RP; 0.048 vs 0.049 under SubM).
+We will revise the wording to remove any implication that RapTB itself introduces a new exact fixed-point theorem.
 
-[OPTIONAL — cut if over limit]
-In principle, one could anneal η→0 during training to ensure asymptotic convergence to the exact TB solution. We did not test this schedule, but note it as a theoretically grounded option for practitioners who require strict guarantees.
+In principle, annealing η→0 would recover pure TB, but **we do not claim or verify this here**.
+
+Empirically, the regularization is beneficial: RapTB achieves better distributional fidelity than TB on all metrics (Table 3: JS 0.147 vs 0.339 under RP; 0.048 vs 0.049 under SubM).
 
 ---
 
@@ -110,7 +95,7 @@ We implement exactly the baseline the reviewer suggests: averaging (Δ_k^TB)² o
 | TB | 0.998 | 0.717 | 2.503 | 0.807 | 3.06 |
 | AvgPrefixTB | 1.000 | 0.661 | 0.665 | 0.649 | 2.89 |
 | RapTB | 0.996 | 0.740 | 2.448 | 0.860 | 6.14 |
-| RapTB+SubM | 0.988 | 0.844 | 2.726 | 0.898 | 7.44 |
+| RapTB+SubM | 0.988 | **0.844** | **2.726** | **0.898** | 7.44 |
 
 **Expr24 (RP replay, 6400 samples)**:
 
@@ -123,13 +108,24 @@ We implement exactly the baseline the reviewer suggests: averaging (Δ_k^TB)² o
 
 **Analysis**:
 
-On SMILES, AvgPrefixTB achieves the **worst** QED (0.661), diversity (0.665), and FPDiv (0.649) among all methods — worse even than vanilla TB. Avg Len 2.89 with 54% of samples at L=1-2 indicates severe short-sequence collapse. The model finds a "shortcut": short sequences are easier to satisfy all prefix constraints simultaneously, so the optimizer converges to trivially short, low-quality solutions.
+AvgPrefixTB is **viable and stronger than plain TB** on Expr24 diversity (142 vs 5.3 unique), but it remains **materially different from RapTB**.
 
-On Expr24, AvgPrefixTB shows the same short-sequence collapse pattern: Avg Len 5.74 vs TB's 8.98 and RapTB's 8.99. While it improves over TB on diversity (142 vs 5.3 unique), it remains far below RapTB (246.7 unique, NormCov 0.039 vs 0.016). Its termination calibration (log p_term = -0.560) is substantially worse than RapTB's (-0.065), indicating partial termination suppression — consistent with our diagnosis that averaging TB residuals over all prefixes creates conflicting termination gradients similar to SubTB. Both tasks confirm that AvgPrefixTB systematically favors short sequences as a path of least resistance.
+On SMILES, AvgPrefixTB achieves the **worst** QED (0.661), diversity (0.665), and FPDiv (0.649) among all methods — worse even than vanilla TB. Avg Len 2.89 with 54% of samples at L=1-2: the model finds a shortcut where short sequences trivially satisfy all prefix constraints.
 
-**Why AvgPrefixTB fails where RapTB succeeds**:
-1. **Rooted residuals cancel Z in the auxiliary branch**: AvgPrefixTB applies O(τ) copies of the learnable Z across all prefix residuals, creating redundant optimization pressure on a single scalar. RapTB eliminates this in the auxiliary branch.
-2. **Absorbed suffix backups provide lower-variance targets**: AvgPrefixTB uses the terminal reward for each prefix, which has high variance for early prefixes. RapTB's absorbed targets aggregate suffix evidence, reducing this variance.
-3. **Stop-gradient prevents termination drift**: AvgPrefixTB allows termination gradients from all prefix residuals, creating the same conflicting signal as SubTB. RapTB stops these gradients in the auxiliary branch.
+On Expr24, AvgPrefixTB shows the same short-sequence collapse: Avg Len 5.74 vs TB's 8.98 and RapTB's 8.99. Its termination calibration (log p_term = -0.560) is notably worse than RapTB's (-0.065), consistent with partial termination suppression from conflicting prefix constraints.
 
-These results confirm that RapTB's three design choices (rooted residuals, absorbed backups, stop-gradient) are **not cosmetic** — each addresses a specific failure mode that simple prefix averaging does not solve.
+**The gain is not merely "more prefix supervision"** but specifically:
+1. **Rooted Z-cancellation** in the auxiliary branch (removes O(τ) redundant Z optimization pressure)
+2. **Suffix-absorbed targets** that reduce early-prefix conditional variance
+3. **Stop-gradient on the auxiliary termination head** that prevents drift
+
+These results support our claim that each of RapTB's design choices addresses a specific failure mode that simple prefix averaging does not solve.
+
+---
+
+## Presentation
+
+We agree about terminology. We will:
+- Define "termination drift" at first mention (Section 1)
+- Move the RapTB derivation intuition earlier in the main text
+- Expand the mathematical motivation in the body
