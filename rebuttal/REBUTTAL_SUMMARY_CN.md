@@ -71,17 +71,42 @@
 
 † SubTB 所有序列拉到 max length，diversity/novelty 被长度放大
 
-### 2.5 PPO/GRPO (Expr24)
+### 2.5 PPO/GRPO Baselines
 
-回答 QHmk-C2。**Reward-maximizing RL 完全失败**。
+回答 QHmk-C2。**Reward-maximizing RL 能学到 reward 但 diversity 远不如 GFlowNet**。
 
-| 方法 | Valid/6400 | Unique | 状态 |
-|------|-----------|--------|------|
-| GRPO | 12 | **1** ("3+4*5-6+7/1") | 99.9% 在 L=11 |
-| PPO | 20 | **1** | Entropy→0 in 50 steps, crash |
-| RapTB (论文) | 6346 | 246.7 | 正常 |
+我们在 SMILES 和 Expr24 两个任务上运行了 unconstrained GRPO 和 PPO（soft vocab masking, 无 grammar constraint，与 REINVENT 等分子生成 RL 标准范式一致）。
 
-**实现验证**：已确认 GRPO/PPO 使用与 GFlowNet 完全相同的 grammar constraint (`transformers_cfg`) 和 reward (`hit24_dense`)。GRPO 生成的表达式语法正确（如 `3+4*5-6+7/8`），但 99.8% 不等于 24。唯一找到的有效表达式 `3+4*5-6+7/1=24` 在所有 37 个 valid 样本中完全相同。这是标准 RL 在 sparse reward 下的 mode collapse，非实现 bug。
+**SMILES QED 对比**
+
+| 方法 | QED (reward) | Entropy (diversity) | 备注 |
+|------|-------------|--------------------|----|
+| **GRPO** | 0.661 | 0.98 | 学到 QED 但 diversity 仅为 GFlowNet 的 36% |
+| **PPO** | 0.604 | 0.00 | 完全 mode collapse, valid=100% 但只生成 1 种分子 |
+| TB (论文) | 0.717 | 2.503 | — |
+| RapTB (论文) | 0.740 | 2.448 | — |
+| **RapTB+SubM (论文)** | **0.844** | **2.726** | QED 和 diversity 均最佳 |
+
+**Expr24 对比**
+
+| 方法 | Reward (Acc) | Entropy (diversity) | 备注 |
+|------|-------------|--------------------|----|
+| **GRPO** | 0.872 | 0.89 | 学到 24 点但 diversity 仅为 GFlowNet 的 74% |
+| **PPO** | 0.000 | 2.56 | 5000 步内从未找到有效表达式 |
+| TB (论文) | 1.000 | — | Acc 高但 coverage 极低 |
+| **RapTB (论文)** | **0.991** | **1.208** | Acc 和 diversity 均优 |
+
+**关键结论**：
+1. GRPO 在 dense reward (SMILES QED) 上能学到不错的 reward (0.661)，但 entropy 仅 0.98（GFlowNet 2.726 的 36%）— 严重 mode collapse
+2. GRPO 在 sparse reward (Expr24) 上也能学到 (0.872)，但 diversity 同样大幅低于 GFlowNet
+3. PPO 在 SMILES 上 entropy=0（完全坍缩到单一分子），在 Expr24 上完全失败
+4. **这不是 "sparse reward 才崩溃"** — SMILES 是 dense continuous reward，GRPO/PPO 仍然严重 mode collapse
+5. 我们将这些结果作为 reference comparison 而非 fully optimized baselines：相同的 model/LoRA/training budget，展示 reward-maximizing 和 distributional 目标的本质差异
+
+**实现说明**：
+- 使用与文献一致的 unconstrained generation + soft vocab masking（penalty=-50，参考 gfn-lm-tuning）
+- 无 grammar constraint — 对 RL 更公平（不需要学习语法合规性）
+- 同一 base model (Llama-3.2-1B)、同一 LoRA config (rank-16)、同一训练 budget (5000 steps)
 
 ### 2.6 AvgPrefixTB
 
