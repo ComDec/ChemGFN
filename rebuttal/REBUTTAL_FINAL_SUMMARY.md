@@ -29,6 +29,7 @@
 | 6 | GRPO baseline | QHmk-C2 | 12/6400 valid, 1 unique, 99.9% at L=11 |
 | 7 | AvgPrefixTB (Expr24+SMILES) | QHmk-C6 | NormCov=0.016 (vs RapTB 0.039), SMILES Len=2.89 collapse |
 | 8 | 3B scale-up (4 methods) | Pd1v-C1, JxzD-C3 | SubTB drift amplified; RapTB+SubM best (QED=0.856) |
+| 9 | AMP biological sequence (4 methods) | JxzD-C3, cA3o-C3, Pd1v-C1 | SubTB length collapse (49.3 AA); RapTB+SubM best diversity (16.92) |
 
 ---
 
@@ -110,7 +111,8 @@
 2. **AvgPrefixTB collapse** (SMILES Len=2.89) — proves simple prefix averaging ≠ RapTB
 3. **18-config cross-task sweep** — QED/FPDiv match paper perfectly on SMILES
 4. **3B scale-up** — SubTB drift amplified at 3B confirms structural nature
-5. **Full RL contextualization** — complete concession + reframe, not defense
+5. **AMP biological sequences** — failure modes generalize beyond chemistry to biological design
+6. **Full RL contextualization** — complete concession + reframe, not defense
 
 ---
 

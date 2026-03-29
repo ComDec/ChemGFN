@@ -28,6 +28,7 @@
 | GRPO baseline (Expr24) | QHmk-C2 | **DONE** | 12/6400 valid, 1 unique |
 | AvgPrefixTB (Expr24 + SMILES) | QHmk-C6 | **DONE** | Collapse on both tasks |
 | 3B scale-up (SMILES, 4 methods) | Pd1v-C1, JxzD-C3 | **DONE** | RapTB+SubM best |
+| AMP biological sequence (4 methods) | JxzD-C3, cA3o-C3, Pd1v-C1 | **DONE** | RapTB+SubM best diversity (16.92), SubTB length collapse |
 
 ## Final Drafts
 

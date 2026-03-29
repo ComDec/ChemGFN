@@ -77,7 +77,7 @@
 |---|---|---|---|---|---|
 | JxzD-C1 | "Why termination probabilities in each subtrajectory? Tested with state flow values?" | assumptions | major | direct_clarification | open |
 | JxzD-C2 | "explain prefix survival metric" | clarity | minor | direct_clarification | open |
-| JxzD-C3 | "longer sequence tasks (AMP/GFP)?" | empirical_support | major | future_work_boundary | open |
+| JxzD-C3 | "longer sequence tasks (AMP/GFP)?" | empirical_support | major | grounded_evidence | **answered** |
 | JxzD-C4 | "why finetune LLM, not train small model from scratch?" | assumptions | minor | direct_clarification | open |
 | JxzD-C5 | "lack of convergence/global optimal analysis" | theorem_rigor | major | direct_clarification | open |
 | JxzD-C6 | "absorbed suffix backups need clearer motivation" | clarity | major | direct_clarification | open |
@@ -89,10 +89,10 @@
 ### JxzD-C2: Prefix survival
 - **Definition**: Surv(k) = n_k / n_valid (Appendix B.3). Interpret jointly with PefEnt and Top1.
 
-### JxzD-C3: Longer sequences (AMP/GFP)
-- **Evidence**: L_max=15 stress test (Table 2) + 3B scale-up on SMILES.
-- **AMP experiment in progress**: 4 methods (TB/SubTB/RapTB/RapTB+SubM) on AMP generation (15-50 AA). TB/SubTB/RapTB complete; RapTB+SubM ~50%. Preliminary: SubTB length bias confirmed (49.9 AA mean), TB/RapTB similar performance.
-- **Response strategy**: Lead with 3B scale-up + L_max=15 as concrete evidence. AMP as supplementary if results are positive.
+### JxzD-C3: Longer sequences (AMP/GFP) — **ANSWERED**
+- **Evidence**: L_max=15 stress test (Table 2) + 3B scale-up + AMP biological sequence generation.
+- **AMP results**: SubTB length collapse confirmed (Avg Len=49.3 at max). RapTB+SubM achieves best diversity (16.92) and novelty (15.77) among natural-length methods in only 3K steps. See `amp_results.md`.
+- **Response**: Three lines of evidence — L_max=15, 3B scale-up, AMP generation. No longer future work.
 
 ### JxzD-C4: Why LLM fine-tuning
 - **Response**: Problem formulation is LLM-GFlowNet post-training. Frozen reference LM prior is part of the setup, not incidental. Training from scratch answers a different question.
@@ -165,9 +165,8 @@
 
 | Status | Count |
 |---|---|
-| **answered (with data)** | 3 (cA3o-C2, QHmk-C2, QHmk-C6) |
-| **answered (text + paper data)** | 12 (all remaining except JxzD-C3) |
-| **in progress** | 1 (JxzD-C3 — AMP experiment running) |
+| **answered (with data)** | 4 (cA3o-C2, QHmk-C2, QHmk-C6, JxzD-C3) |
+| **answered (text + paper data)** | 14 (all remaining) |
 | **deferred** | 0 |
 
-**Note**: All 18 issues now have drafted responses. 3 have new experimental evidence, 12 rely on paper data + text clarifications, 1 (JxzD-C3) has partial new evidence (3B) + AMP in progress.
+**Note**: All 18 issues answered. 4 with new experimental evidence (sweep, PPO/GRPO, AvgPrefixTB, AMP), 14 with paper data + text clarifications.
