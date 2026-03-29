@@ -14,13 +14,13 @@ Config: `mode="avgprefix"`, `k_min=0`, `detach_pterm_in_aux=false`, learnable $\
 
 ## Table 3: VarExpr24 (N=6400 samples)
 
-| Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ |
-|---|---|---|---|---|---|---|---|
-| **AvgPrefixTB (RP)** | 0.998 | 142 | 0.016 | 0.808 | 8.908 | 0.213 | -0.560 |
-| **AvgPrefixTB (PRT)** | 1.000 | 108 | 0.012 | 0.944 | 10.989 | 0.249 | -0.606 |
-| ~~AvgPrefixTB (SubM v1)~~ | 1.000 | 7 | 0.000 | 1.442 | 14.506 | 0.372 | -0.000 |
-| **AvgPrefixTB (SubM)** | 0.993 | 902 | 0.050 | 0.190 | 0.819 | 0.051 | -0.181 |
-| **AvgPrefixTB (Oracle)** | 0.922 | 3369 | **0.183** | **0.052** | **0.052** | **0.013** | -1.105 |
+| Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ | Avg Len |
+|---|---|---|---|---|---|---|---|---|
+| **AvgPrefixTB (RP)** | 0.998 | 142 | 0.016 | 0.808 | 8.908 | 0.213 | -0.560 | 5.74 |
+| **AvgPrefixTB (PRT)** | 1.000 | 108 | 0.012 | 0.944 | 10.989 | 0.249 | -0.606 | 5.42 |
+| ~~AvgPrefixTB (SubM v1)~~ | 1.000 | 7 | 0.000 | 1.442 | 14.506 | 0.372 | -0.000 | 3.02 |
+| **AvgPrefixTB (SubM)** | 0.993 | 902 | 0.050 | 0.190 | 0.819 | 0.051 | -0.181 | 7.60 |
+| **AvgPrefixTB (Oracle)** | 0.922 | 3369 | **0.183** | **0.052** | **0.052** | **0.013** | -1.105 | 6.79 |
 
 ## Table 2: SMILES (L=10, N=3200 samples × 3 repeats)
 

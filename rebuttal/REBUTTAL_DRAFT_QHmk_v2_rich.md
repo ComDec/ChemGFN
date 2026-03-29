@@ -103,28 +103,29 @@ In principle, one could anneal η→0 during training to ensure asymptotic conve
 
 We implement exactly the baseline the reviewer suggests: averaging (Δ_k^TB)² over all k ∈ {0,...,τ} with a learnable log Z.
 
-**Expr24 (RP replay, 6400 samples)**:
-
-| Method | Acc | Unique↑ | NormCov↑ | JS↓ | log p_term |
-|--------|-----|---------|----------|-----|------------|
-| TB | 1.000 | 5.3 | 0.001 | 0.339 | -0.001 |
-| AvgPrefixTB | 0.998 | 142 | 0.016 | 0.213 | -0.560 |
-| RapTB | 0.991 | 246.7 | 0.039 | 0.147 | -0.065 |
-
 **SMILES (L_max=10, 3200×3 samples)**:
 
-| Method | Acc | QED↑ | Entropy↑ | FPDiv↑ | Len |
-|--------|-----|------|----------|--------|-----|
+| Method | Acc | QED↑ | Entropy↑ | FPDiv↑ | Avg Len |
+|--------|-----|------|----------|--------|---------|
 | TB | 0.998 | 0.717 | 2.503 | 0.807 | 3.06 |
 | AvgPrefixTB | 1.000 | 0.661 | 0.665 | 0.649 | 2.89 |
 | RapTB | 0.996 | 0.740 | 2.448 | 0.860 | 6.14 |
 | RapTB+SubM | 0.988 | 0.844 | 2.726 | 0.898 | 7.44 |
 
+**Expr24 (RP replay, 6400 samples)**:
+
+| Method | Acc | Unique↑ | NormCov↑ | JS↓ | log p_term | Avg Len |
+|--------|-----|---------|----------|-----|------------|---------|
+| TB | 1.000 | 5.3 | 0.001 | 0.339 | -0.001 | 8.98 |
+| SubTB | 0.229 | 324.7 | 0.051 | 0.109 | -79.638 | 8.09 |
+| AvgPrefixTB | 0.998 | 142 | 0.016 | 0.213 | -0.560 | 5.74 |
+| RapTB | 0.991 | 246.7 | 0.039 | 0.147 | -0.065 | 8.99 |
+
 **Analysis**:
 
-On Expr24, AvgPrefixTB improves over TB on diversity (142 vs 5.3 unique) but remains far below RapTB (246.7 unique, NormCov 0.039 vs 0.016). Its termination calibration (log p_term = -0.560) is substantially worse than RapTB's (-0.065), indicating partial termination suppression — consistent with our diagnosis that averaging TB residuals over all prefixes creates conflicting termination gradients similar to SubTB.
+On SMILES, AvgPrefixTB achieves the **worst** QED (0.661), diversity (0.665), and FPDiv (0.649) among all methods — worse even than vanilla TB. Avg Len 2.89 with 54% of samples at L=1-2 indicates severe short-sequence collapse. The model finds a "shortcut": short sequences are easier to satisfy all prefix constraints simultaneously, so the optimizer converges to trivially short, low-quality solutions.
 
-On SMILES, the distinction is starker: AvgPrefixTB achieves the **worst** QED (0.661), diversity (0.665), and FPDiv (0.649) among all methods — worse even than vanilla TB. Mean length 2.89 with 54% of samples at L=1-2 indicates severe short-sequence collapse. The model finds a "shortcut": short sequences are easier to satisfy all prefix constraints simultaneously, so the optimizer converges to trivially short, low-quality solutions.
+On Expr24, AvgPrefixTB shows the same short-sequence collapse pattern: Avg Len 5.74 vs TB's 8.98 and RapTB's 8.99. While it improves over TB on diversity (142 vs 5.3 unique), it remains far below RapTB (246.7 unique, NormCov 0.039 vs 0.016). Its termination calibration (log p_term = -0.560) is substantially worse than RapTB's (-0.065), indicating partial termination suppression — consistent with our diagnosis that averaging TB residuals over all prefixes creates conflicting termination gradients similar to SubTB. Both tasks confirm that AvgPrefixTB systematically favors short sequences as a path of least resistance.
 
 **Why AvgPrefixTB fails where RapTB succeeds**:
 1. **Rooted residuals cancel Z in the auxiliary branch**: AvgPrefixTB applies O(τ) copies of the learnable Z across all prefix residuals, creating redundant optimization pressure on a single scalar. RapTB eliminates this in the auxiliary branch.
