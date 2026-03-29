@@ -20,19 +20,21 @@ All metrics computed on **D_Best = Top-100 candidates (excluding D0)**, followin
 
 ## Main Results
 
-| Method | Performance ↑ | Diversity ↑ | Novelty ↑ | Avg Len | Steps | Metric Strategy |
-|--------|---------------|-------------|-----------|---------|-------|-----------------|
-| **RapTB+SubM** | 0.916 | **16.92** | **15.77** | 25.6 | 3K | Single epoch |
-| **RapTB** | 0.919 | 8.83 | 14.44 | 22.4 | 5K | Cumulative |
-| TB | 0.927 | 7.39 | 10.65 | 17.4 | 10K | Cumulative |
-| SubTB | 0.897 | 21.37 | 28.68 | 49.3 | 9K | Cumulative |
-| Paper GFN-AL | 0.932 | 22.34 | 28.44 | ~22 | 10K (10 AL rounds) | Cumulative |
+| Method | Performance ↑ | Diversity ↑ | Novelty ↑ | Avg Len | Steps |
+|--------|---------------|-------------|-----------|---------|-------|
+| **RapTB+SubM** | 0.916 | **16.92** | **15.77** | **25.6** | **3K** |
+| **RapTB** | 0.919 | 8.83 | 14.44 | **22.4** | 5K |
+| TB | 0.927 | 7.39 | 10.65 | 17.4 | 10K |
+| SubTB † | 0.897 | 21.37 | 28.68 | 49.3 † | 9K |
+| Paper GFN-AL | 0.932 | 22.34 | 28.44 | ~22 | 10K (10 AL rounds) |
+
+† SubTB suffers from **length collapse**: all generated sequences hit `max_sentence_len=50` (Avg Len=49.3), far exceeding natural AMP lengths (D0 mean=22.3 AA). Since diversity/novelty are measured by raw Levenshtein edit distance (not normalized by length), this artificially inflates SubTB's diversity/novelty. Its results are **not directly comparable** to methods generating natural-length sequences.
 
 **Key findings:**
-- **RapTB+SubM achieves the best diversity (16.92) and novelty (15.77)** among methods with comparable performance (~0.92), with natural sequence lengths (25.6 AA). It also requires only **3K training steps** — significantly fewer than other methods.
-- **RapTB** provides a strong balance of performance (0.919) and novelty (14.44) with length-appropriate sequences (~22 AA) in 5K steps.
-- **TB** achieves the highest performance (0.927) but with limited diversity/novelty, as it generates shorter sequences (~17 AA).
-- **SubTB** shows high diversity/novelty but suffers from length collapse to `max_sentence_len=50`, inflating edit-distance-based metrics. Its performance (0.897) is also the lowest.
+- **RapTB+SubM achieves the best diversity (16.92) and novelty (15.77)** among methods generating natural-length sequences (Avg Len=25.6 AA, D0 mean=22.3 AA). It also requires only **3K training steps** — the fewest among all methods.
+- **RapTB** provides a strong balance of performance (0.919) and novelty (14.44) with appropriate sequence lengths (~22 AA) in 5K steps.
+- **TB** achieves the highest performance (0.927) but generates shorter sequences (~17 AA), limiting diversity and novelty.
+- **SubTB** shows nominally high diversity/novelty, but this is an artifact of generating maximally long sequences (49.3 AA) — not genuine compositional diversity. Its performance (0.897) is also the lowest.
 - Compared to the paper's GFN-AL (which uses 10 rounds of active learning with proxy retraining), our single-round LLM-based approach achieves competitive performance with significantly simpler training.
 
 ## Detailed Results by Checkpoint
