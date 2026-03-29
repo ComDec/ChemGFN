@@ -21,9 +21,9 @@
 | Experiment | Answers | Status | Results |
 |---|---|---|---|
 | β×ρ sweep Expr24 (9 configs, 5000 steps) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_FINAL.md` |
-| β×ρ sweep SMILES (7/9 configs, ~2500 steps) | cA3o-C2 | **DONE** | `SMILES_SWEEP_RESULTS.md` |
+| β×ρ sweep SMILES (9/9 configs, 5000 steps, test eval) | cA3o-C2 | **DONE** | `SMILES_SWEEP_RESULTS.md` |
 | η sweep (3 runs, 1750 steps) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_FINAL.md` |
-| k_min ablation (3 runs, 1750 steps) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_FINAL.md` |
+| k_min ablation (3 runs + kmin_fixed7 H100 rerun) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_COMPLETE.md` |
 | Paper-exact anchor (3 seeds, 5000 steps) | Sweep calibration | **DONE** | `ALL_EXPERIMENTS_STATUS.md` |
 | PPO baseline (Expr24) | QHmk-C2 | **DONE** | Crash at step 50, Acc=0.003 |
 | GRPO baseline (Expr24) | QHmk-C2 | **DONE** | Acc=0.002, length collapse |

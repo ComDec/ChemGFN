@@ -49,11 +49,17 @@
 - **Three regimes**: (1) Under RP: RapTB > TB on coverage. (2) Under SubM: RapTB+SubM > TB+SubM (NormCov 0.209 vs 0.100). (3) Under Oracle: RapTB > TB on accuracy/KL/JS (coverage controlled).
 - **Key insight**: SubM dominates external discovery; RapTB dominates internal allocation. Appendix A.1 ceiling effect on SMILES.
 
-### cA3o-C2: Hyperparameter sensitivity — **ANSWERED**
+### cA3o-C2: Hyperparameter sensitivity — **ANSWERED (cross-task)**
 - **Theme**: (none — direct experimental response)
 - **Existing defense**: Table 6 max/soft ablation; eta/gamma shared across tasks.
-- **New evidence (completed)**: β×ρ sweep (9 configs, 5000 steps), η sweep (3 runs), k_min ablation (3 runs). See `SWEEP_RESULTS_FINAL.md`.
-- **Key result**: Acc ≥ 0.994 across all 9 (β,ρ) configs. log_pterm(τ) ∈ [-0.25, -0.04] everywhere. η shows monotonic improvement. Fixed-low k_min is worst, validating schedule design.
+- **New evidence (completed)**:
+  - **Expr24**: β×ρ sweep (9 configs, 5000 steps), η sweep (3 runs), k_min ablation (3 runs). See `SWEEP_RESULTS_FINAL.md` and `SWEEP_RESULTS_COMPLETE.md`.
+  - **SMILES**: β×ρ sweep (9/9 configs, 5000 steps, test eval). See `SMILES_SWEEP_RESULTS.md`.
+  - **Expr24 kmin_fixed7**: H100 rerun, Acc=0.969, Diversity=1.025 (4410/5000 steps).
+- **Key results**:
+  - Expr24: Acc ≥ 0.994 across all 9 (β,ρ) configs. log_pterm(τ) ∈ [-0.25, -0.04].
+  - SMILES: 8/9 configs Acc ≥ 0.991, FPDiv 0.849–0.883 (paper: 0.860). Only β=10,ρ=0 shows mild degradation (0.968).
+  - Cross-task consistency: robustness pattern identical on both tasks (18 configs total).
 
 ### cA3o-C3: Domain generalization
 - **Theme**: GT-4

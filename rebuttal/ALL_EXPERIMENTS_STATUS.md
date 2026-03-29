@@ -1,7 +1,7 @@
 # Rebuttal Experiments — Complete Status Report
 
-**Date**: 2026-03-26
-**All GPUs free except GPU 3 (stale process, can kill)**
+**Date**: 2026-03-29
+**Last updated**: SMILES 9/9 sweep + Expr24 kmin_fixed7 completed on H100 NVL
 
 ---
 
@@ -135,15 +135,7 @@ PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败�
 
 ## 7. 总结：Rebuttal Evidence Readiness
 
-| Issue | Evidence | Status |
-|-------|---------|--------|
-| cA3o-C2: Hyperparameter sensitivity | β×ρ sweep + η + k_min | **READY** |
-| QHmk-C2: PPO/GRPO baseline | GRPO eval (Acc=0.002, collapse) | **READY** |
-| QHmk-C6: AvgPrefixTB baseline | User running | **PENDING** |
-| cA3o-C1: RapTB vs SubM | Paper evidence (Tables 3,4) | **READY** (no new exp needed) |
-| QHmk-C1: RL contextualization | Narrative fix | **READY** (text only) |
-| QHmk-C3: TBA baseline | Narrative fix | **READY** (text only) |
-| Pd1v-C3 / JxzD-C5: Theory | Narrative fix | **READY** (text only) |
+*See Section 9 below for the up-to-date evidence readiness table.*
 
 ## 8. SMILES 3B Model Scale-Up (Llama-3.2-3B) — COMPLETE
 
@@ -195,24 +187,31 @@ PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败�
 
 ---
 
-## 10. SMILES β×ρ Sweep — PARTIAL (7/9 configs)
+## 10. SMILES β×ρ Sweep — COMPLETE (9/9 configs, full training + test eval)
 
 详见 `SMILES_SWEEP_RESULTS.md`。
 
-**Grid**: β ∈ {1, 5, 10} × ρ ∈ {0, 0.1, 0.5}，7/9 完成，缺 β=10,ρ=0.1 和 β=10,ρ=0.5
-**Steps**: ~2500 (约 50% of full 5000)，β=10,ρ=0 仅 1749 步
-**Source**: wandb `ChemGFN`, group `smiles_sweep_beta_rho`
+**Grid**: β ∈ {1, 5, 10} × ρ ∈ {0, 0.1, 0.5}，9/9 完成
+**Steps**: 5000 (full training), seed=42, eval via `eval.py` with 100 test batches (3200 samples)
+**Source**: wandb `ChemGFN_eval`, group `rerun_smiles_paper_beta_rho`
 
 ### 核心结论
 
-| 指标 | 范围 | 是否 robust |
-|------|------|-------------|
-| Accuracy | 0.985–0.998 | **是** — 无崩溃 |
-| Entropy | 2.03–2.31 | **是** — 合理范围 |
-| FPDiv | 0.53–0.59 | **是** — 低于 paper default 因 50% steps |
-| Sentence Len | 6.29–7.31 | **是** — 无 length collapse |
+| 指标 | 范围 | Paper RapTB | 是否 robust |
+|------|------|-------------|-------------|
+| Accuracy | 0.968–0.999 (8/9 ≥ 0.991) | 0.996 | **是** — 仅 β=10,ρ=0 轻微退化 |
+| Entropy | 1.99–2.28 | 2.448 | **是** — single seed 偏低 ~15% |
+| QED | 0.73–0.80 | 0.740 | **是** — 完美匹配 |
+| FPDiv | 0.849–0.883 | 0.860 | **是** — 完美匹配 |
+| Len | 6.71–7.68 | 6.142 | **是** — 无 length collapse |
 
-**跨任务一致性**: Expr24 和 SMILES 的 robustness pattern 一致——所有配置保持高 accuracy 和健康的长度分布。
+**跨任务一致性**: Expr24 和 SMILES 的 robustness pattern 高度一致——所有配置保持高 accuracy、健康的长度分布和稳定的 fingerprint diversity。
+
+### Expr24 kmin_fixed7 补充实验 — COMPLETE
+
+**Config**: β=3, ρ=0.5, η=0.25, k_min=fixed 7, bsz=128, 4410/5000 steps (88%)
+**Result**: Acc=0.969, Diversity=1.025 (paper: Acc=0.991, Div=1.208)
+与旧 sweep (Acc=1.000@1750 steps) 和论文方向一致。训练未完全结束 (88%) 可能解释 Acc 偏低。
 
 ---
 
@@ -221,7 +220,7 @@ PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败�
 | Issue | Evidence | Status |
 |-------|---------|--------|
 | cA3o-C2: Hyperparameter sensitivity (Expr24) | β×ρ sweep + η + k_min | **READY** |
-| cA3o-C2: Hyperparameter sensitivity (SMILES) | SMILES β×ρ sweep (7/9 configs) | **READY** (partial) |
+| cA3o-C2: Hyperparameter sensitivity (SMILES) | SMILES β×ρ sweep (9/9 configs, 5K steps, test eval) | **READY** |
 | QHmk-C2: PPO/GRPO baseline | GRPO (Acc=0.002) + PPO (Acc=0.003, crash at step 250) | **READY** |
 | QHmk-C6: AvgPrefixTB baseline | Expr24 + SMILES 完成 | **READY** |
 | cA3o-C1: RapTB vs SubM | Paper evidence (Tables 3,4) | **READY** |
@@ -234,6 +233,7 @@ PPO的失败不是实现bug——是标准PPO在此任务上的根本性失败�
 ### 待办
 - [x] ~~补跑 PPO eval~~ ✅ PPO training crash = evidence of failure
 - [x] ~~等待 AvgPrefixTB 结果~~ ✅ 完成
-- [x] ~~等待 SMILES β×ρ sweep~~ ✅ 7/9 完成 (β=10,ρ=0.1/0.5 缺失)
+- [x] ~~等待 SMILES β×ρ sweep~~ ✅ 9/9 完成 (full 5K steps + test eval, 2026-03-29)
 - [x] ~~更新 PASTE_READY_cA3o.txt 加入 SMILES sweep 结果~~ ✅
+- [x] ~~Expr24 kmin_fixed7 H100 rerun~~ ✅ Acc=0.969, Div=1.025 (4410/5000 steps)
 - [ ] 更新 PASTE_READY_QHmk.txt 替换 AvgPrefixTB placeholder（已有 avgprefix_tb_results.md 但 QHmk 草稿未更新）

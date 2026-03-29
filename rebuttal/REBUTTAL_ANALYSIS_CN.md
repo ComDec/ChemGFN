@@ -145,7 +145,7 @@
 | # | 实验 | 回答哪个 concern | 关键数字 | 说服力 |
 |---|------|-----------------|---------|--------|
 | 1 | **β×ρ sweep (Expr24, 9 configs)** | cA3o-C2 | Acc≥0.994 全部 9 格, log_pterm∈[-0.25,-0.04] | ★★★★★ |
-| 2 | **β×ρ sweep (SMILES, 7/9 configs)** | cA3o-C2 | Acc≥0.985, Len 6.3-7.3, 跨任务一致 | ★★★★☆ |
+| 2 | **β×ρ sweep (SMILES, 9/9 configs, 5K steps)** | cA3o-C2 | 8/9 Acc≥0.991, FPDiv 0.849-0.883, 跨任务一致 | ★★★★★ |
 | 3 | **η sweep (3 points)** | cA3o-C2 | 单调改善，η 有清晰可解释行为 | ★★★★☆ |
 | 4 | **k_min ablation (3 points)** | cA3o-C2 | Fixed-low 最差，验证设计 | ★★★★☆ |
 | 5 | **GRPO baseline (Expr24)** | QHmk-C2 | 12/6400 valid, 1 unique, 99.9% at L=11 | ★★★★★ |
@@ -183,7 +183,7 @@ AMP 当前结果：
 | 缺口 | 重要性 | 是否阻塞 | 处理方式 |
 |------|--------|---------|---------|
 | AMP RapTB+SubM 未完成 | 中 | 否 | 等训练完成；用已有 3 个方法的结果作为 placeholder |
-| SMILES sweep 只有 7/9 configs | 低 | 否 | 7 个已足够说明 cross-task robustness |
+| ~~SMILES sweep 只有 7/9 configs~~ | ~~低~~ | ~~否~~ | ✅ 已完成 9/9 configs (5K steps + test eval) |
 | Sweep 单 seed 无 CI | 中 | 否 | 以 Acc/log_pterm robustness 为主，NormCov 不强调 |
 | NormCov 在 sweep 中偏低 | 中 | 否 | 用 KL/JS（更可靠）替代 NormCov 作为主指标 |
 
@@ -307,7 +307,7 @@ ICML 2026 允许：
 
 ### 可选
 
-- [ ] SMILES sweep 补完剩余 2/9 configs (β=10, ρ=0.1/0.5)
+- [x] ~~SMILES sweep 补完剩余 2/9 configs (β=10, ρ=0.1/0.5)~~ ✅ 9/9 完成 (5K steps + test eval)
 - [ ] 更多 seed 的 sweep 验证（如果时间允许）
 
 ---

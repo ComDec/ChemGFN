@@ -136,11 +136,11 @@ Run paper default (β=5,ρ=0.1 for SMILES) at 1750 steps with the new config to 
 
 ---
 
-## Summary: What to run next
+## Summary: All recommended experiments completed
 
-| Priority | Experiment | Purpose | Time |
-|----------|-----------|---------|------|
-| **P0** | Paper default (β=3,ρ=0.5) × 3 seeds × 5000 steps | Anchor point for sweep calibration | ~3h |
-| **P0** | β=5,ρ=0.5 at 5000 steps (match round 1) | Complete the grid fairly | ~1h |
-| P1 | AvgPrefixTB (in progress) | QHmk-C6 | already running |
-| P2 | One SMILES point | Cross-task consistency | ~1h |
+| Priority | Experiment | Status |
+|----------|-----------|--------|
+| **P0** | Paper default (β=3,ρ=0.5) × 3 seeds × 5000 steps | ✅ DONE (ALL_EXPERIMENTS_STATUS.md §1) |
+| **P0** | β=5,ρ=0.5 at 5000 steps | ✅ DONE (part of Expr24 sweep) |
+| P1 | AvgPrefixTB | ✅ DONE (avgprefix_tb_results.md) |
+| P2 | SMILES β×ρ sweep | ✅ DONE (9/9 configs, 5K steps, SMILES_SWEEP_RESULTS.md) |

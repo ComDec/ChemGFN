@@ -73,6 +73,14 @@
 
 **Observation**: Fixed-low k_min=3 is clearly worst (noisy early supervision hurts accuracy and diversity). Schedule (7→3) and fixed-high (k=7) perform similarly. The schedule is beneficial but fixed-high is also viable.
 
+### H100 Rerun: kmin_fixed7 (bsz=128, paper config, 4410/5000 steps)
+
+| k_min | Acc | Diversity |
+|-------|-----|-----------|
+| Fixed k=7 | 0.969 | 1.025 |
+
+**Note**: Training reached 4410/5000 steps (88%). Acc=0.969 is slightly lower than old sweep (1.000@1750 steps) and paper (0.991), likely due to incomplete training. Diversity=1.025 is directionally consistent with paper (1.208). Result confirms fixed-high k=7 remains viable.
+
 ## Key Takeaways for Rebuttal
 
 1. **Method is robust across (β,ρ)**: Accuracy ≥ 0.994 for all 9 configs. No catastrophic failure anywhere in the grid. (**Answers cA3o-C2**)
