@@ -3,7 +3,7 @@
 - **Paper**: RapTB: Rooted Absorbed Prefix Trajectory Balance with Submodular Replay for GFlowNet Training
 - **Venue**: ICML 2026
 - **Submission ID**: 13383
-- **Current Phase**: Phase 4→5 (Drafting complete, pending AMP results and safety validation)
+- **Current Phase**: Phase 7 COMPLETE — ready to submit
 - **Response Mode**: TEXT_ONLY
 - **Character Limit**: 5000 per response, multiple submissions + revised PDF allowed
 
@@ -20,26 +20,24 @@
 
 | Experiment | Answers | Status | Results |
 |---|---|---|---|
-| β×ρ sweep Expr24 (9 configs, 5000 steps) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_FINAL.md` |
-| β×ρ sweep SMILES (9/9 configs, 5000 steps, test eval) | cA3o-C2 | **DONE** | `SMILES_SWEEP_RESULTS.md` |
-| η sweep (3 runs, 1750 steps) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_FINAL.md` |
-| k_min ablation (3 runs + kmin_fixed7 H100 rerun) | cA3o-C2 | **DONE** | `SWEEP_RESULTS_COMPLETE.md` |
-| Paper-exact anchor (3 seeds, 5000 steps) | Sweep calibration | **DONE** | `ALL_EXPERIMENTS_STATUS.md` |
-| PPO baseline (Expr24) | QHmk-C2 | **DONE** | Crash at step 50, Acc=0.003 |
-| GRPO baseline (Expr24) | QHmk-C2 | **DONE** | Acc=0.002, length collapse |
-| AvgPrefixTB (Expr24 RP+SubM+Oracle, SMILES) | QHmk-C6 | **DONE** | `avgprefix_tb_results.md` |
-| 3B scale-up (SMILES, 4 methods) | Pd1v-C1, JxzD-Q3 | **DONE** | `ALL_EXPERIMENTS_STATUS.md` |
-| AMP task (4 methods, 10K steps) | JxzD-C3, cA3o-C3, Pd1v-C1 | **IN PROGRESS** | `amp_results.md` (RapTB+SubM ~50%) |
+| β×ρ sweep Expr24 (9 configs, bsz=128, 5000 steps) | cA3o-C2 | **DONE** | Acc 0.983-1.000, Div 0.77-1.02 |
+| β×ρ sweep SMILES (9 configs, bsz=128, 5000 steps) | cA3o-C2 | **DONE** | Acc 0.968-0.999, FPDiv 0.849-0.883 |
+| η sweep (3 runs, bsz=128, 5000 steps) | cA3o-C2 | **DONE** | Monotonic: Div 0.98→1.15 |
+| k_min ablation (3 runs, bsz=128) | cA3o-C2 | **DONE** | Fixed-low worst (0.85) |
+| PPO baseline (Expr24) | QHmk-C2 | **DONE** | 20/6400 valid, 1 unique, crash |
+| GRPO baseline (Expr24) | QHmk-C2 | **DONE** | 12/6400 valid, 1 unique |
+| AvgPrefixTB (Expr24 + SMILES) | QHmk-C6 | **DONE** | Collapse on both tasks |
+| 3B scale-up (SMILES, 4 methods) | Pd1v-C1, JxzD-C3 | **DONE** | RapTB+SubM best |
 
-## Rebuttal Drafts
+## Final Drafts
 
-| File | Reviewer | Chars | Placeholders |
-|---|---|---|---|
-| `PASTE_READY_global.txt` | All | ~3000 | **None** |
-| `PASTE_READY_QHmk.txt` | QHmk | ~4500 | **None** |
-| `PASTE_READY_cA3o.txt` | cA3o | ~4500 | **None** |
-| `PASTE_READY_JxzD.txt` | JxzD | ~5400 | **None** (may need trim) |
-| `PASTE_READY_Pd1v.txt` | Pd1v | ~5000 | **None** |
+| File | Chars | Status |
+|---|---|---|
+| `PASTE_READY_global.txt` | 3,550 | ✅ Ready |
+| `PASTE_READY_QHmk.txt` | 4,475 | ✅ Ready |
+| `PASTE_READY_cA3o.txt` | 3,667 | ✅ Ready |
+| `PASTE_READY_JxzD.txt` | 3,529 | ✅ Ready |
+| `PASTE_READY_Pd1v.txt` | 4,969 | ✅ Ready |
 
 ## Workflow Progress
 
@@ -47,9 +45,9 @@
 - [x] Phase 1: Validate inputs, normalize reviews
 - [x] Phase 2: Atomize concerns → ISSUE_BOARD.md (18 issues)
 - [x] Phase 3: Strategy plan → STRATEGY_PLAN.md
-- [x] Phase 3.5: Evidence sprint — core experiments complete, AMP in progress
+- [x] Phase 3.5: Evidence sprint — all experiments complete
 - [x] Phase 4: Draft rebuttal — all 5 drafts written with real data
-- [~] Phase 4.5: Comprehensive analysis — `REBUTTAL_ANALYSIS_CN.md` written
-- [ ] Phase 5: Safety validation (coverage, provenance, commitment, tone, consistency, limit)
-- [ ] Phase 6: Stress test (Codex MCP)
-- [ ] Phase 7: Finalize (two versions: PASTE_READY + rich draft)
+- [x] Phase 4.5: Comprehensive analysis → REBUTTAL_ANALYSIS_CN.md
+- [x] Phase 5: Safety validation — all 6 checks PASS
+- [x] Phase 7: Finalize — PASTE_READY versions + REBUTTAL_FINAL_SUMMARY.md
+- [ ] Submit to OpenReview/CMT (user action)

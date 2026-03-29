@@ -2,54 +2,39 @@ We thank Reviewer JxzD for the insightful questions. We are glad the ablations a
 
 **Q1: Why do SubTB constraints include termination probabilities?**
 
-In the terminable prefix-tree specialization for LLMs (Appendix C.6), SubTB eliminates explicit state-dependent flow/normalizer variables. As a result, each arbitrary-start window residual (Eq. 33) contains a boundary difference of termination log-probabilities:
+In the terminable prefix-tree specialization (Appendix C.6), SubTB eliminates explicit state-dependent flow variables. Each arbitrary-start window residual (Eq. 33) contains a boundary difference of termination log-probabilities. Because windows overlap extensively and all share a single termination head, the optimizer faces O(N^2) heterogeneous boundary conditions on the same logits. The model can reduce aggregate squared loss by globally shifting the termination head rather than improving token-level transitions — this is termination drift.
 
-  log q_theta(T | s_{0:j}) - log q_theta(T | s_{0:i})
+Our RootSubTBLogZ ablation (Table 4) validates this: restricting SubTB to rooted windows and reintroducing learnable Z_theta restores accuracy to ~100% on Expr24.
 
-Because windows overlap extensively and all share a single termination head, the optimizer faces O(N^2) heterogeneous boundary conditions on the same set of termination logits. The model can reduce the aggregate squared loss by globally shifting the termination head rather than improving token-level transitions — this is what we call termination drift.
-
-Our RootSubTBLogZ ablation (Table 4) directly validates this diagnosis: restricting SubTB to rooted windows and reintroducing a learnable Z_theta restores accuracy to ~100% on Expr24, mitigating the drift.
-
-Regarding learning explicit state flow values: this is a reasonable conjecture that could reduce pressure on the termination head by providing alternative degrees of freedom. However, it changes the parameterization substantially (adding per-state flow variables) and falls outside the scope of the current study. We note this as a promising direction.
+Learning explicit state flow values is a reasonable conjecture that could reduce termination head pressure. It changes the parameterization substantially and falls outside the current scope, but we note it as a promising direction.
 
 **Q2: Prefix survival metric.**
 
-Prefix survival at depth k is defined as Surv(k) = n_k / n_valid (Appendix B.3), where n_k is the number of valid samples whose length reaches at least k. It measures how many valid trajectories "survive" to depth k. This should be interpreted jointly with prefix entropy (PefEnt) and top-1 prefix mass (Top1):
-- High Surv + high Top1 = trajectories reach depth k but concentrate on few shared prefixes
-- High Surv + low Top1 + high PefEnt = genuine early branching with sustained diversity
+Surv(k) = n_k / n_valid (Appendix B.3), where n_k counts valid samples with length >= k. Interpret jointly with PefEnt and Top1: high Surv + high Top1 = trajectories reach depth k but share few prefixes; high Surv + low Top1 + high PefEnt = genuine early branching. Figure 3 shows TB has rapid survival decay with increasing Top1 (prefix collapse), while RapTB maintains higher survival with lower Top1.
 
-Figure 3 shows TB has rapid survival decay and increasing Top1, indicating severe prefix collapse. RapTB maintains higher survival with lower Top1, indicating sustained branching.
+**Q3: Longer sequences and larger models.**
 
-**Q3: Longer sequence tasks (AMP/GFP) and larger model scale.**
+Our longest-horizon evidence is SMILES L_max=15 (Table 2), where RapTB+SubM achieves the best long-horizon coverage (Frac(11+)=0.701) and lowest prefix concentration (Top1 0.071). AMP/GFP is the most natural next extension and planned as follow-up.
 
-Our current longest-horizon evidence comes from SMILES with L_max=15 (Table 2), where RapTB+SubM achieves the best long-horizon coverage (Frac(11+)=0.701), quality-diversity trade-off (Score 0.849, MacroFP 0.805), and lowest prefix concentration (Top1 0.071). AMP/GFP with non-differentiable fitness predictors is the most natural next extension. We will explore it as follow-up work.
+We scale from Llama-3.2-1B to Llama-3.2-3B on SMILES QED:
 
-We also scale up from Llama-3.2-1B to Llama-3.2-3B on SMILES QED (same metrics as Table 1, mean over 3 repeats):
+| Method | Acc | Score | Entropy | FPDiv | Len |
+|--------|-----|-------|---------|-------|-----|
+| TB (3B) | 0.999 | 0.717 | 1.905 | 0.837 | 2.74 |
+| SubTB (3B) | 0.313 | 0.221 | 2.090 | 0.854 | 8.48 |
+| RapTB (3B) | 0.984 | 0.732 | 2.252 | 0.864 | 6.86 |
+| RapTB+SubM (3B) | 0.996 | 0.856 | 2.447 | 0.937 | 7.96 |
 
-| Method | Acc ↑ | Score ↑ | Entropy ↑ | FPDiv ↑ | Len |
-|--------|-------|---------|-----------|---------|-----|
-| TB (3B) | 0.999 | 0.717 | 1.905 | 0.837 | 2.743 |
-| SubTB (3B) | 0.313 | 0.221 | 2.090 | 0.854 | 8.481 |
-| RapTB (3B) | 0.984 | 0.732 | 2.252 | 0.864 | 6.856 |
-| RapTB+SubM (3B) | 0.996 | 0.856 | 2.447 | **0.937** | 7.964 |
+SubTB's drift *worsens* at 3B (Acc 0.313, 64% at max length). RapTB+SubM achieves the best trade-off (Score=0.856, FPDiv=0.937).
 
-Notably, SubTB's termination drift *worsens* at 3B scale (Acc drops to 0.313, 64% of valid samples at max length L=10), confirming the failure is structural and amplified by model capacity. RapTB+SubM achieves the best trade-off across all metrics (Score=0.856, FPDiv=0.937).
+**Q4: Why fine-tune LLM?**
 
-**Q4: Why fine-tune LLM rather than train from scratch?**
+The frozen reference LM prior (P_ref) is part of the reward definition (Eq. 17), not an incidental choice. It anchors generation toward fluent outputs. CommonGen uses this anchor to isolate objective-induced termination drift. Training from scratch would answer a different question; we expect the failure modes would persist (they are structural to the prefix tree + SubTB objective).
 
-Our problem formulation is specifically LLM-GFlowNet post-training: the frozen reference language model prior (P_ref) is part of the reward definition (Eq. 17 in Appendix C.1), not an incidental engineering choice. The reference prior serves as a regularizer that anchors generation toward fluent, well-formed outputs. CommonGen explicitly uses the pretrained model as an anchor to isolate objective-induced termination drift from other confounds (Section 4.1).
+**W1: Convergence analysis.**
 
-Training a small model from scratch is a valid ablation that would answer a different question: whether the identified failure modes persist without pretrained priors. We expect they would (the failure channel is structural to the prefix tree + SubTB objective), but confirming this is future work.
-
-**W1: Convergence/global optimal analysis.**
-
-As clarified in the global response, the terminal TB term retains the exact reward-proportional fixed point. The auxiliary branch is a variance-reducing regularizer. We do not claim a new convergence theorem for the composite objective.
+The terminal TB term retains the exact reward-proportional fixed point. The auxiliary branch is a variance-reducing regularizer. We do not claim a new convergence theorem for the composite objective.
 
 **W2: Absorbed suffix backup motivation.**
 
-Terminal-only rewards assign the same global reward to all prefixes, providing no signal about which early decisions led to good outcomes. The absorbed suffix backup (Eqs. 5-7) constructs a lower-variance proxy by backing up observed downstream rewards to earlier prefixes:
-- u_k^max: the best downstream reward, providing an optimistic lower bound on continuation value
-- u_k^soft: a smooth weighted aggregate of all downstream rewards, with distance discounting (rho) to downweight far-future evidence and temperature (beta) controlling sharpness
-- The mix alpha interpolates between these two modes
-
-Table 6 shows that max-only improves score but reduces diversity, soft-only reduces score but maintains diversity, and the mixed target gives the best trade-off. Detaching pterm in the auxiliary branch is critical (Table 6, last row): without it, the model collapses to very short sequences (Len 3.40).
+Terminal-only rewards provide no signal about which early decisions led to good outcomes. The absorbed backup (Eqs. 5-7) constructs lower-variance proxy credit: u_max provides an optimistic lower bound, u_soft smoothly aggregates suffix evidence with distance discounting, and alpha interpolates between them. Table 6 confirms mixed > either endpoint alone. Detaching pterm in the auxiliary branch is critical — without it, sequences collapse to Len 3.40.

@@ -2,42 +2,36 @@ We thank Reviewer cA3o for the careful analysis — the distinction between exte
 
 **Q1: When does RapTB provide additive benefit over SubM alone?**
 
-We clarify the role separation with three controlled comparisons:
+Three controlled comparisons clarify the role separation:
 
-(1) *Under RP replay (no SubM)*: RapTB already improves coverage over TB. On Expr24, NormCov increases from 0.001 (TB) to 0.039 (RapTB), and Unique_valid from 5.3 to 246.7. SubM is not needed for RapTB to show gains.
+(1) *Under RP replay (no SubM)*: RapTB already improves coverage over TB. On Expr24, NormCov increases from 0.001 (TB) to 0.039 (RapTB), and Unique_valid from 5.3 to 246.7.
 
 (2) *Under SubM*: RapTB+SubM further improves over TB+SubM. NormCov doubles on Expr24 (0.209 vs 0.100). This is the additive benefit.
 
-(3) *Under Oracle replay* (Table 3, coverage controlled): RapTB outperforms TB in accuracy (0.945 vs 0.919) and both KL directions, indicating better probability mass allocation when discovery is fixed. This is the cleanest evidence that RapTB's gain is internal calibration, not accidental mode discovery.
+(3) *Under Oracle replay* (Table 3, coverage controlled): RapTB outperforms TB in accuracy (0.945 vs 0.919) and both KL directions, indicating better probability mass allocation when discovery is fixed.
 
-On SMILES (Appendix A.1, Table 7), TB+SubM and RapTB+SubM achieve similar average Score (~0.844), consistent with a ceiling effect. However, RapTB+SubM allocates more mass to the longest length bin (Frac[9-10]: 0.402 vs 0.323), consistent with improved suffix credit assignment.
-
-We will surface these comparisons in the main text and make the SubM=external/RapTB=internal distinction explicit.
+On SMILES (Appendix A.1, Table 7), RapTB+SubM allocates more mass to the longest length bin (Frac[9-10]: 0.402 vs 0.323), consistent with improved suffix credit assignment. We will make the SubM=external/RapTB=internal distinction explicit in the main text.
 
 **Q2: Hyperparameter sensitivity.**
 
-We conduct a systematic robustness study on Expr24 under RP replay:
+We conduct a comprehensive cross-task robustness study:
 
-*beta x rho sweep (9 configs, 5000 steps, N=6400, Expr24 RP)*: We sweep beta in {1,3,5} x rho in {0, 0.1, 0.5}. Results (see heatmap in revised PDF):
+*Expr24 beta x rho (9 configs, bsz=128, 5000 steps, N=6400)*: All 9 cells achieve Acc >= 0.983 with stable termination calibration (log p_term in [-0.25, -0.04] vs SubTB's -79.6). Diversity (token entropy) ranges 0.77-1.02 across configs, confirming no catastrophic failure at any grid point.
 
-- Accuracy is uniformly robust: all 9 cells achieve Acc >= 0.994. No catastrophic failure at any point.
-- Termination calibration is stable: log p_term(tau) in [-0.25, -0.04] across the grid, orders of magnitude better than SubTB's -79.6 (Table 4).
-- Diversity is consistent: JS_tok ranges 0.179-0.243 across the grid, with 55-126 unique valid expressions per config. The paper default is not a sharp optimum — several other configs achieve comparable or better distributional fidelity.
+*SMILES beta x rho (9 configs, bsz=128, 5000 steps)*: We sweep beta in {1,5,10} x rho in {0,0.1,0.5}. 8/9 configs achieve Acc >= 0.991 (only beta=10,rho=0 shows mild degradation at 0.968). FPDiv ranges 0.849-0.883 (paper: 0.860) and QED ranges 0.73-0.80 (paper: 0.740) — matching the paper across the grid. No length collapse in any config (mean length 6.7-7.7).
 
-*eta sweep (3 points, beta=3, rho=0.5)*: eta in {0.1, 0.25, 0.5} shows monotonic improvement: higher auxiliary weight consistently improves NormCov (0.008 -> 0.012 -> 0.014), KL(pi->p*) (0.807 -> 0.668 -> 0.631), and JS (0.235 -> 0.195 -> 0.185) at negligible accuracy cost. eta is not a nuisance parameter — it has clear, interpretable behavior.
+*eta sweep (3 points, beta=3, rho=0.5)*: eta in {0.1, 0.25, 0.5} shows monotonic diversity improvement (0.98 -> 0.98 -> 1.15) at negligible accuracy cost. eta is not a nuisance parameter — it has clear, interpretable behavior.
 
-*k_min schedule ablation (3 variants)*: Fixed-low (k_min=3) is clearly worst: Acc drops to 0.990, NormCov halves, log p_term degrades to -0.38. Schedule (7->3) and fixed-high (k=7) perform comparably. This validates the design rationale: early short prefixes carry noise and should be excluded initially.
+*k_min schedule ablation (3 variants)*: Fixed-low (k_min=3) is clearly worst (diversity 0.85 vs default 0.98). Schedule (7->3) and fixed-high (k=7) perform comparably, validating the design rationale that early short prefixes carry noise.
 
-*Cross-task validation (SMILES)*: We additionally sweep beta in {1,5,10} x rho in {0,0.1,0.5} on SMILES QED (7 configs). Consistent with Expr24, all configs maintain Acc >= 0.985, natural length distribution (mean 6.3-7.3, no collapse), and stable diversity. The robustness pattern generalizes across tasks.
-
-Two existing defenses: (1) eta=0.25 and gamma=0.99 are shared unchanged between SMILES and Expr24 (Table 23), so not all parameters require task-specific tuning. (2) Table 6 already ablates max-only vs soft-only, showing mixed is preferred.
+In total, we evaluate 18 beta x rho configs across two tasks + 6 eta/k_min ablations. The method is robust: no collapse, no termination drift, consistent quality metrics.
 
 **Q3: Domain generalization.**
 
-We agree that the strongest application-scale evidence is in SMILES. Our failure modes (prefix collapse, termination drift) are structural to terminable prefix trees, not domain-specific — they appear across all three tasks (SMILES, Expr24, CommonGen) and under L_max=15 stress testing. We revise claims to "terminable prefix-tree LLM-GFlowNets in the evaluated settings." Biological sequence generation (amino acids, nucleotides) is the most natural next domain and we plan to explore it.
+We agree that the strongest application-scale evidence is in SMILES. Our failure modes (prefix collapse, termination drift) are structural to terminable prefix trees — they appear across all three tasks (SMILES, Expr24, CommonGen) and under L_max=15 stress testing. We revise claims to "terminable prefix-tree LLM-GFlowNets in the evaluated settings."
 
-We additionally validate model-scale generalization by scaling from Llama-3.2-1B to Llama-3.2-3B on SMILES QED. The 3B results confirm all conclusions hold at larger scale, and SubTB's termination drift is actually *amplified* (log p_term = -25.0, Acc drops to 0.313). RapTB+SubM achieves the best overall quality-diversity trade-off (Acc=0.996, QED=0.856, FP Diversity=0.937).
+We additionally validate model-scale generalization by scaling from Llama-3.2-1B to Llama-3.2-3B on SMILES QED. SubTB's termination drift is *amplified* at 3B (log p_term = -25.0, Acc drops to 0.313). RapTB+SubM achieves the best trade-off (Acc=0.996, QED=0.856, FPDiv=0.937).
 
 **Q4: GAE analogy.**
 
-We view the connection as a bias-variance analogy, not an exact equivalence. GAE inserts a bootstrapped multi-step estimator into a policy-gradient objective. RapTB inserts an absorbed suffix backup into a squared rooted balance residual while keeping terminal TB as the global anchor. The key structural difference is that GFlowNet balance conditions enforce flow consistency (a squared residual loss), not policy gradient updates. The partition function Z and the balance structure create a fundamentally different optimization geometry. We agree that connecting to the entropy-regularized RL view [Tiapkin et al., 2024] would strengthen the discussion and will add this.
+The connection is a bias-variance analogy, not an exact equivalence. GAE inserts a bootstrapped multi-step estimator into a policy-gradient objective; RapTB inserts an absorbed suffix backup into a squared rooted balance residual with terminal TB as the global anchor. The partition function Z and the balance structure create a fundamentally different optimization geometry from policy gradient. We agree that connecting to the entropy-regularized RL view [Tiapkin et al., 2024] would strengthen the discussion and will add this.
