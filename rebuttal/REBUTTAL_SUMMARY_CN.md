@@ -87,21 +87,21 @@
 | RapTB (论文) | 0.740 | 2.448 | — |
 | **RapTB+SubM (论文)** | **0.844** | **2.726** | QED 和 diversity 均最佳 |
 
-**Expr24 对比**
+**Expr24 对比（独立 eval, 6400 samples × 3 repeats）**
 
-| 方法 | Reward (Acc) | Entropy (diversity) | 备注 |
-|------|-------------|--------------------|----|
-| **GRPO** | 0.872 | 0.89 | 学到 24 点但 diversity 仅为 GFlowNet 的 74% |
-| **PPO** | 0.000 | 2.56 | 5000 步内从未找到有效表达式 |
-| TB (论文) | 1.000 | — | Acc 高但 coverage 极低 |
-| **RapTB (论文)** | **0.991** | **1.208** | Acc 和 diversity 均优 |
+| 方法 | Acc (eval) | Valid/6400 | Unique | Avg Len | 备注 |
+|------|-----------|-----------|--------|---------|------|
+| **GRPO** | **0.002** | 12.3±1.2 | 1 | ~11 | 训练 reward=0.872 但 eval 仅 0.2% valid |
+| **PPO** | 0.003 | ~20 | 1 | collapsed | step 250 CUDA crash |
+| TB (论文) | 1.000 | 6400 | 5.3 | 8.98 | Acc 高但 coverage 极低 |
+| **RapTB (论文)** | **0.991** | 6343 | **246.7** | 8.99 | Acc 和 diversity 均优 |
 
 **关键结论**：
-1. GRPO 在 dense reward (SMILES QED) 上能学到不错的 reward (0.661)，但 entropy 仅 0.98（GFlowNet 2.726 的 36%）— 严重 mode collapse
-2. GRPO 在 sparse reward (Expr24) 上也能学到 (0.872)，但 diversity 同样大幅低于 GFlowNet
-3. PPO 在 SMILES 上 entropy=0（完全坍缩到单一分子），在 Expr24 上完全失败
-4. **这不是 "sparse reward 才崩溃"** — SMILES 是 dense continuous reward，GRPO/PPO 仍然严重 mode collapse
-5. 我们将这些结果作为 reference comparison 而非 fully optimized baselines：相同的 model/LoRA/training budget，展示 reward-maximizing 和 distributional 目标的本质差异
+1. GRPO 在 SMILES (dense reward) 上 QED=0.661，但 entropy 仅 0.98（GFlowNet 2.726 的 36%）— 严重 mode collapse
+2. GRPO 在 Expr24 上训练时 reward=0.872，但独立 eval 仅 Acc=0.002（12/6400 valid, 1 unique）— 模型记忆了窄轨迹而非学到多样化策略
+3. PPO 在 SMILES 上 entropy=0（完全坍缩），在 Expr24 上 step 250 崩溃
+4. **这不是 "sparse reward 才崩溃"** — SMILES 是 dense continuous reward，GRPO 仍然严重 mode collapse
+5. 我们将这些结果作为 reference baselines 而非 fully optimized baselines
 
 **实现说明**：
 - 使用与文献一致的 unconstrained generation + soft vocab masking（penalty=-50，参考 gfn-lm-tuning）

@@ -16,23 +16,34 @@ We will revise the introduction to remove the "in contrast to RL" framing and pr
 
 ## W2: PPO/GRPO Baselines
 
-We added PPO and GRPO reference baselines on Expr24 under the same model/LoRA/training budget.
+We added PPO and GRPO reference baselines under the same model/LoRA/training budget (unconstrained generation, soft vocab masking).
 
-**Expr24 (6400 samples, verified results)**:
+**Expr24 (independent eval, 6400 samples × 3 repeats)**:
 
-| Method | Acc | Valid/6400 | Unique | Length pattern |
-|--------|-----|-----------|--------|---------------|
-| GRPO | 0.002 | 12.3±1.2 | 1 | 99.9% at L_max |
+| Method | Acc | Valid/6400 | Unique | Avg Len |
+|--------|-----|-----------|--------|---------|
+| GRPO | 0.002 | 12.3±1.2 | 1 | ~11 (99.9% at L_max) |
 | PPO | 0.003 | ~20 | 1 | collapsed; CUDA crash at step 250 |
-| TB (paper) | 1.000 | 6400 | 5.3 | concentrated at L=9 |
-| RapTB (paper) | 0.991 | 6343 | 246.7 | diverse |
+| TB (paper) | 1.000 | 6400 | 5.3 | 8.98 |
+| RapTB (paper) | 0.991 | 6343 | 246.7 | 8.99 |
 
-GRPO yields only 12/6400 valid samples (Acc ≈ 0.002) with near-complete length collapse to L_max, producing a single unique valid expression. PPO collapses even faster — entropy reaches 0 within 50 steps, KL diverges to -87, and training crashes with CUDA NaN at step ~250.
+**SMILES QED (training-time metrics at convergence, step 5000; source: trainer_state.json)**:
 
-We report these cautiously as **reference baselines** rather than fully tuned head-to-head competitors. The main apples-to-apples comparison in this paper remains within the TB family, because the goal is to isolate **objective-level mechanisms** rather than compare entire post-training stacks. These results are consistent with Hu et al. (2024), who also show that reward-maximizing RL produces valid-but-skewed or spurious behavior compared to GFlowNet objectives on distributional tasks.
+| Method | QED↑ | Entropy↑ | Avg Len | KL(policy‖ref) |
+|--------|------|----------|---------|----------------|
+| GRPO | 0.661 | 0.98 | 10.0 (all clipped) | 1.53 |
+| TB (paper) | 0.717 | 2.503 | 3.06 | — |
+| RapTB+SubM (paper) | **0.844** | **2.726** | 7.44 | — |
 
-[OPTIONAL — if SMILES PPO/GRPO logs are confirmed, add:]
-On SMILES (dense QED reward), GRPO achieves QED=0.661 but entropy=0.98 (vs RapTB+SubM's 2.726 — only 36% diversity); PPO collapses to entropy=0.00. The diversity gap persists even on dense reward, confirming the issue is objective design, not reward sparsity.
+**Analysis**:
+
+On Expr24, GRPO reports training reward=0.872 at step 5000 but independent eval yields only Acc=0.002 (12/6400 valid). This discrepancy reveals extreme mode collapse: the model memorizes a narrow set of correct trajectories during on-policy training but the learned policy produces only **1 unique valid expression** when broadly sampled. This is arguably more damning than simple failure — GRPO can find solutions but fails to learn a diverse, generalizable policy for distributional sampling.
+
+PPO collapses even faster — entropy reaches 0 within 50 steps, KL diverges to -87, and training crashes with CUDA NaN at step ~250.
+
+On SMILES (dense QED reward), GRPO achieves decent reward (QED=0.661) but entropy=0.98 — only 36% of RapTB+SubM's diversity (2.726). All completions are clipped at max length (Avg Len=10.0). The diversity gap persists on dense reward, confirming this reflects a fundamental objective-design difference, not reward sparsity.
+
+We report these cautiously as **reference baselines** rather than fully tuned head-to-head competitors. The main apples-to-apples comparison remains within the TB family, because the goal is to isolate **objective-level mechanisms** rather than compare entire post-training stacks. Consistent with Hu et al. (2024), who also show reward-maximizing RL produces valid-but-skewed behavior on distributional tasks.
 
 ---
 
