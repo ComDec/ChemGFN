@@ -1,16 +1,62 @@
-We thank all reviewers for the detailed and constructive feedback. We address three overarching points before responding individually.
+We thank all reviewers for their careful and constructive feedback. Before responding individually, we address three overarching themes and summarize new experiments conducted during the rebuttal period.
 
-**1. Theoretical scope of RapTB (Pd1v-W3, JxzD-W1, QHmk-Q1).** We clarify that RapTB does not claim a new exact fixed-point theorem. As stated in Eq. (9), the terminal TB term remains the only exact balance condition whose global optimum matches the reward-proportional target. The rooted absorbed auxiliary branch is a variance-reducing regularizer that improves optimization dynamics without altering the fixed point. We will revise the text to make this distinction explicit throughout.
+**1. RapTB preserves the reward-proportional optimum (Pd1v-W3, JxzD-W1, QHmk-Q1).**
 
-**2. RL contextualization and TBA (QHmk-W1/W3, Pd1v-W2).** We acknowledge that GFlowNets can be reformulated as entropy-regularized RL [Tiapkin et al., AISTATS 2024; Deleu et al., UAI 2024], and that the KL-regularized reward-proportional setting studied here fits within this broader framework. We will revise the introduction accordingly. Regarding TBA [Bartoldson et al., NeurIPS 2025]: TBA is a system-level pipeline for asynchronous TB-based LLM post-training with replay, while our contribution is orthogonal — improving within-trajectory credit assignment and termination calibration at the objective level. RapTB can in principle be used inside TBA's training loop. We will add explicit discussion of TBA and the RL reformulation in the revision.
+We provide a two-angle analysis showing that the auxiliary term does not move the optimum away from the reward-proportional solution.
 
-**3. RapTB and SubM are complementary, not competing (cA3o-Q1).** SubM is the dominant mechanism for external mode discovery; RapTB improves internal credit assignment and distribution calibration. Three regimes support this: (i) Under RP replay, RapTB already improves coverage over TB (NormCov 0.039 vs 0.001 on Expr24). (ii) Under SubM, RapTB+SubM doubles NormCov over TB+SubM (0.209 vs 0.100). (iii) Under Oracle replay where coverage is controlled, RapTB still outperforms TB in accuracy (0.945 vs 0.919) and KL/JS, indicating better probability allocation once discovery is fixed. We will surface these comparisons in the main text.
+*Angle 1 (structure).* RapTB decomposes as TB + weighted auxiliary regularizer (Eq. 9). The TB fixed point, established by Malkin et al. [1, Theorem 1] and shown equivalent to the MaxEnt RL optimal policy by Tiapkin et al. [2, Theorem 1], is the sole exact balance condition. The auxiliary is controlled by η and does not introduce a new fixed point, structurally paralleling how FL-GFN [8] and LED-GFN [9] add reparameterizations/regularizers while preserving the TB fixed point.
 
-**New experiments in the revision:**
-- PPO/GRPO baselines (QHmk-W2): We evaluate unconstrained GRPO and PPO on both tasks. On SMILES, GRPO learns QED=0.661 but entropy drops to 0.98 (vs GFlowNet's 2.726); PPO collapses to entropy=0. On Expr24, GRPO achieves reward=0.87 with reduced diversity; PPO never learns. The diversity gap persists on dense-reward tasks, confirming the issue is objective design, not reward sparsity.
-- Averaged-prefix TB baseline (QHmk-Q2): AvgPrefixTB achieves high accuracy but severe mode collapse on both Expr24 (NormCov 0.016 vs RapTB's 0.039) and SMILES (QED 0.661, Diversity 0.665 vs RapTB+SubM's 0.844/2.726). Simple prefix averaging does not match RapTB's specific design choices.
-- Hyperparameter robustness (cA3o-Q2): We sweep beta x rho (9 configs each) on both Expr24 and SMILES (18 total), plus eta (3) and k_min (3) ablations on Expr24. On Expr24, all 9 configs achieve Acc >= 0.983 with stable termination calibration. On SMILES, 8/9 achieve Acc >= 0.991 with FPDiv 0.849-0.883 matching the paper (0.860). eta shows monotonic improvement; fixed-low k_min is clearly worst.
-- Model scale-up (Pd1v-W1, JxzD-Q3): We scale from Llama-3.2-1B to Llama-3.2-3B on SMILES QED. SubTB's termination drift is amplified at 3B (log p_term = -25.0, Acc = 0.313), while RapTB+SubM achieves Acc=0.996, QED=0.856, FP Diversity=0.937 — the best across all methods.
-- AMP biological sequence generation (JxzD-Q3, cA3o-Q3): We evaluate on antimicrobial peptide generation (20-50 amino acids, non-differentiable fitness predictor). SubTB again exhibits length collapse (Avg Len=49.3, all at max). Among methods generating natural-length sequences, RapTB+SubM achieves the best diversity (16.92) and novelty (15.77) in only 3K steps. This confirms the structural failure modes generalize to biological sequence design.
+*Angle 2 (zero-at-optimum).* In the terminable prefix tree, the TB residual at prefix k is:
 
-We revise claim scope from "general LLM-GFlowNets" to "terminable prefix-tree LLM-GFlowNets in the evaluated settings," consistent with the structural (not domain-specific) nature of the identified failure modes.
+  Δ_k^TB(ξ) = log Z_θ + Σ_{t<k} log P_F(s_{t+1}|s_{0:t}) + log P_F(⊤|s_{0:k}) − log R(s_{0:k}^⊤)
+
+When the TB condition holds for all termination points (Δ_k^TB = 0 for all k), the rooted residuals cancel: Δ̄_k = Δ_k^TB − Δ_0^TB = 0. The auxiliary loss then vanishes:
+
+  L_aux(ξ) = Σ_k w_k · (Δ̄_k + u_k − u_k^tgt)² / Σ_k w_k = 0
+
+Therefore L_RapTB = (Δ^TB)² + η · L_aux = 0 + 0 = 0 at the reward-proportional solution. Both terms share the same global minimum. This parallels SubTB's same-fixed-point property via telescoping [6]. We emphasize this is algebraic consistency — the two loss terms are jointly minimized at the same point — not a convergence theorem.
+
+**2. RL contextualization and TBA (QHmk-W1/W3, Pd1v-W2).**
+
+We agree that GFlowNets can be reformulated as entropy-regularized RL [2, 3], with SubTB equivalent to Path Consistency Learning [5]. Our contribution is narrower: within off-policy TB-family training on terminable prefix trees, we improve prefix-level credit assignment. This applies regardless of whether one views the problem through the GFlowNet or the entropy-regularized RL lens.
+
+Regarding TBA [7]: TBA is a system-level pipeline for asynchronous TB-based LLM post-training. TBA explicitly acknowledges TB's gradient variance as a limitation and suggests "learning partial energy functions to balance bias and variance" as future work. RapTB's absorbed suffix backups address this gap as a non-parametric realization of partial energy functions without auxiliary networks (cf. FL-GFN [8], which requires intermediate energy evaluable at every state, and LED-GFN [9], which requires a separate potential network). RapTB can serve as a drop-in objective for TBA's training loop. We will revise the introduction to properly contextualize within the RL literature.
+
+**3. RapTB + SubM complementarity (cA3o-Q1, Pd1v-W2).**
+
+SubM drives external mode discovery; RapTB improves internal credit allocation. The two operate on orthogonal axes and combine additively. Three regimes demonstrate this:
+
+| Regime | Key Comparison | Result |
+|--------|---------------|--------|
+| RP replay | RapTB vs TB | RapTB improves coverage (NormCov 0.039 vs 0.001; JS 0.147 vs 0.339) |
+| SubM replay | RapTB+SubM vs TB+SubM | RapTB+SubM doubles NormCov (0.209 vs 0.100) |
+| Oracle replay | RapTB vs TB (controlled coverage) | RapTB improves Acc (0.945 vs 0.919) and both KL directions |
+
+Under controlled exploration (Oracle), the objective-level improvement is isolated from the replay effect, confirming that RapTB's credit assignment contributes independently.
+
+**4. New experiments summary.**
+
+| Experiment | Setup | Key Result |
+|------------|-------|------------|
+| PPO/GRPO baselines | Same model/LoRA/budget, Expr24 + SMILES | GRPO Expr24: Acc=0.002 (12/6400 valid, 1 unique); GRPO SMILES: entropy=0.98 (36% of GFlowNet's 2.726). PPO: crash at step 250, entropy→0. |
+| AvgPrefixTB | Average (Δ_k^TB)² over all k with learnable Z | SMILES: Diversity=0.665, Len=2.89 (collapse); Expr24: NormCov=0.016 vs RapTB's 0.039 |
+| β×ρ sweep (18 configs) | 9 Expr24 + 9 SMILES, full 5K-step training | Expr24: all 9 Acc≥0.983, log p_term∈[−0.25,−0.04]; SMILES: 8/9 Acc≥0.991, FPDiv 0.849–0.883 |
+| 3B scale-up | Llama-3.2-3B LoRA on SMILES | SubTB Acc=0.313 (drift worsens); RapTB+SubM: Acc=0.996, QED=0.856, FPDiv=0.937 |
+| AMP biological sequences | 20-aa vocab, non-differentiable fitness, 3K steps | SubTB length collapse (Len=49.3); RapTB+SubM best diversity (16.92) / novelty (15.77) among natural-length methods |
+
+The AvgPrefixTB result is informative: simple dense prefix supervision collapses to short sequences on both tasks. The gain from RapTB is not "more prefix objectives" but specifically: (1) rooted Z-cancellation that decouples prefix updates from the global partition function, (2) suffix-absorbed targets that provide non-parametric partial energy signals, and (3) stop-gradient on the auxiliary termination head that prevents the drift diagnosed in Appendix C.6.
+
+**Claim scope revision.** In light of these discussions, we narrow the claim from "general LLM-GFlowNet training" to "terminable prefix-tree LLM-GFlowNets in the evaluated settings." We now cover molecules (SMILES), arithmetic (Expr24), natural language (CommonGen), and biological sequences (AMP), at both 1B and 3B scale, but do not yet establish results on code or mathematical reasoning tasks.
+
+**References**
+
+[1] Malkin et al. "Trajectory Balance: Improved Credit Assignment in GFlowNets." NeurIPS 2022.
+[2] Tiapkin et al. "Generative Flow Networks as Entropy-Regularized RL." AISTATS 2024.
+[3] Deleu et al. "Discrete Probabilistic Inference as Control in Multi-path Environments." UAI 2024.
+[4] Deleu et al. "Bayesian Structure Learning with Generative Flow Networks." UAI 2022.
+[5] Hu et al. "Amortizing Intractable Inference in Large Language Models." ICLR 2024.
+[6] Madan et al. "Learning GFlowNets from Partial Episodes for Improved Convergence and Stability." ICML 2023.
+[7] Bartoldson et al. "Trajectory Balance with Asynchrony: Decoupling Exploration and Learning for Fast, Scalable LLM Post-Training." NeurIPS 2025.
+[8] Pan et al. "Better Training of GFlowNets with Local Credit and Incomplete Trajectories." ICML 2023.
+[9] Jang et al. "Learning Energy Decompositions for Partial Inference in GFlowNets." ICLR 2024.
+[10] Schulman et al. "High-Dimensional Continuous Control Using Generalized Advantage Estimation." ICLR 2016.

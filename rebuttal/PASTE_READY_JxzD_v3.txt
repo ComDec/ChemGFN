@@ -1,0 +1,77 @@
+We thank the reviewer for the thoughtful questions and for highlighting the value of the ablations and the replay design.
+
+**On convergence / global optimality (W1).** We provide a two-angle analysis. (1) Structurally, RapTB = TB + η·L_aux (Eq. 9). The TB fixed point (Malkin et al. 2022, Theorem 1) is equivalent to the MaxEnt RL optimal policy (Tiapkin et al. 2024, Theorem 1). (2) Algebraically, in a terminable prefix tree where every prefix can stop, when TB holds for all termination points (Δ_k^TB = 0 for all k), the rooted residuals Δ̄_k = Δ_k^TB − Δ_0^TB = 0, absorbed corrections vanish, and L_aux = 0. Both terms share the same global minimum — the reward-proportional distribution. This parallels SubTB's same-fixed-point property (Madan et al. ICML 2023, via telescoping). We emphasize this is algebraic consistency, not a convergence theorem. Empirically, the JS divergence gap (Table 3: 0.147 vs. 0.339) confirms RapTB better approximates the target distribution in practice.
+
+**SubTB termination mechanism and absorbed suffix targets (W2 + Q1).** The reviewer's question about termination probabilities in SubTB windows is central to our motivation. In the original SubTB (Madan et al. 2023), a separate learned network F(s; θ) serves as state flow estimate. In the LLM-GFlowNet formulation (Hu et al. ICLR 2024), the prefix tree has P_B = 1 (Malkin et al. 2022), and since every prefix is terminable, the substitution F(s) = R(s^⊤)/P_F(⊤|s) from Deleu et al. (UAI 2022) eliminates explicit state flows. However, this couples the termination head to all SubTB boundary conditions. The derivation chain:
+
+Original SubTB:  Δ_{i→j} = log F(s_i;θ) + Σ log P_F − log F(s_j;θ)
+
+After F(s) = R(s^⊤)/P_F(⊤|s) substitution:
+
+Δ_{i→j} = Σ_{k=i}^{j-1} log P_F(s_{k+1}|s_{0:k})
+         + [log q(⊤|s_{0:j}) − log q(⊤|s_{0:i})]   ← boundary terms from substitution
+         + [log R(s_{0:i}^⊤) − log R(s_{0:j}^⊤)]
+
+The key issue: in original SubTB, the learned F(s; θ) absorbed a "baseline" role via a separate network head. In the LLM setting, the termination probability is forced to serve double duty — both (a) the actual stopping decision and (b) a surrogate for the missing state flow. All O(N²) windows exert gradient pressure on the same shared parameters. Under sparse rewards, the optimizer finds a shortcut: globally shifting stop logits reduces many residuals simultaneously — this is the "termination drift" we diagnose (SubTB log p_term = −79.638 vs RapTB's −0.065, Table 4). We have not run a separate explicit-state-flow parameterization; it is a plausible alternative worth studying.
+
+This motivates our absorbed suffix targets. u_max is NOT a formal lower bound on F(s_{0:k}); rather, it is a conservative hindsight target — the best observed task-only signal along a sampled suffix. In sparse-reward settings where u_k ≈ 0 for most prefixes, u_max provides a non-trivial regression target where u_k alone would be uninformative:
+
+| Target | Definition | Role |
+|---|---|---|
+| u_k^max | max_{j∈[k,h]} u_j | Conservative: best observed downstream signal |
+| u_k^soft | (1/β) log Σ exp(β·u_j − β·ρ·(j−k)) | Smoothed: distance-discounted log-sum-exp |
+| u_k^tgt | α·u_k^max + (1−α)·u_k^soft | Interpolated: Table 6 confirms mix outperforms either endpoint |
+
+u_soft is structurally analogous to GAE's γλ discount (Schulman et al. 2015) but over raw rewards, not TD errors with a learned V(s). The closest GFlowNet analogues are FL-GFN (Pan et al. ICML 2023), which requires intermediate energy E(s) evaluable at every state (Assumption 4.1 — fails under sparse rewards), and LED-GFN (Jang et al. ICLR 2024), which requires an auxiliary network. TBA (Bartoldson et al. NeurIPS 2025) explicitly calls for "learning partial energy functions" as future work; our absorbed targets are a non-parametric realization requiring no auxiliary model.
+
+**Hyperparameters / robustness (W3).** We swept (β, ρ, η, k_min) on both tasks (18 configs total); γ and K were kept fixed/shared. Summary:
+
+| Task | Configs | Acc range | Key metric range | Paper default |
+|---|---|---|---|---|
+| Expr24 | 9 (β×ρ) | 0.983–1.000 | log p_term: [−0.25, −0.04] | 0.991 |
+| SMILES | 9 (β×ρ) | 0.968–0.999 | FPDiv: 0.849–0.883 | 0.860 |
+
+Performance varies as a quality/diversity tradeoff, not catastrophic failure. The η sweep shows monotonic diversity improvement; fixed-low k_min is clearly worst. We acknowledge γ and K are not fully swept.
+
+**Prefix survival (Q2).** Surv(k) = n_k / n_valid, where n_k counts sequences that survive to position k. Joint interpretation with entropy and top-1 probability: low survival = premature stopping; high survival + high top-1 = long but identical sequences; high survival + low top-1 = healthy early branching. Figure 3 visualizes this: TB exhibits collapse (survival drops sharply, top-1 dominates), while RapTB achieves genuine branching across the prefix tree.
+
+**Longer sequence tasks (Q3).** We provide three lines of evidence:
+
+(i) AMP biological sequences (20–50 amino acids, non-differentiable fitness):
+
+| Method | Perf↑ | Div↑ | Nov↑ | Avg Len | Steps |
+|---|---|---|---|---|---|
+| TB | 0.927 | 7.39 | 10.65 | 17.4 | 10K |
+| SubTB† | 0.897 | 21.37 | 28.68 | 49.3 | 9K |
+| RapTB | 0.919 | 8.83 | 14.44 | 22.4 | 5K |
+| RapTB+SubM | **0.916** | **16.92** | **15.77** | **25.6** | **3K** |
+
+† SubTB collapses to max length; diversity/novelty inflated by raw edit distance. RapTB+SubM achieves the best diversity/novelty among natural-length methods in only 3K steps, surpassing Jain et al.'s (ICML 2022) non-AL GFlowNet baseline on all metrics.
+
+(ii) 3B parameter scale-up on SMILES:
+
+| Method (3B) | Acc | Score | FPDiv |
+|---|---|---|---|
+| TB | 0.999 | 0.717 | 0.837 |
+| SubTB | 0.313 | 0.221 | 0.854 |
+| RapTB | 0.984 | 0.732 | 0.864 |
+| RapTB+SubM | **0.996** | **0.856** | **0.937** |
+
+The SubTB failure worsens at scale, confirming the pathology is structural rather than capacity-limited.
+
+(iii) L_max = 15 stress test (Table 2 in paper): RapTB+SubM achieves the best long-horizon coverage (Frac(11+) = 0.701, lowest Top1 = 0.071).
+
+**Why fine-tune an LLM rather than train from scratch? (Q4).** Our setting is specifically LLM-GFlowNet post-training (Hu et al. ICLR 2024), where the frozen reference LM prior is an integral part of the reward (KL regularization term κ log P_ref). The failure modes we diagnose — termination drift, prefix collapse — are structural to the terminable prefix tree formulation used in LLM-GFlowNets, not to model capacity. The 3B scale-up above confirms these pathologies worsen with scale, motivating targeted algorithmic fixes over architecture changes.
+
+**References.**
+[1] Malkin et al. "Trajectory Balance: Improved Credit Assignment in GFlowNets." NeurIPS 2022.
+[2] Tiapkin et al. "Generative Flow Networks as Entropy-Regularized RL." AISTATS 2024.
+[3] Madan et al. "Learning GFlowNets from Partial Episodes for Improved Convergence and Stability." ICML 2023.
+[4] Deleu et al. "Bayesian Structure Learning with Generative Flow Networks." UAI 2022.
+[5] Hu et al. "Amortizing Intractable Inference in Large Language Models." ICLR 2024.
+[6] Pan et al. "Better Training of GFlowNets with Local Credit and Incomplete Trajectories." ICML 2023.
+[7] Jang et al. "Learning Energy Decompositions for Partial Inference of GFlowNets." ICLR 2024.
+[8] Bartoldson et al. "Trajectory Balance with Asynchrony." NeurIPS 2025.
+[9] Schulman et al. "High-Dimensional Continuous Control Using Generalized Advantage Estimation." ICLR 2016.
+[10] Jain et al. "Biological Sequence Design with GFlowNets." ICML 2022.
+[11] Deleu et al. "Discrete Probabilistic Inference as Control in Multi-Agent Systems." UAI 2024.

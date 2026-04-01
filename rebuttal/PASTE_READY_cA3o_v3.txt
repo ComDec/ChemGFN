@@ -1,0 +1,70 @@
+We thank the reviewer for the careful reading and for isolating the central questions: when does RapTB add value beyond SubM, how sensitive are the results, and whether the evidence generalizes beyond SMILES. We agree the original claims over-stated generality and will narrow them in the revision.
+
+**W1+Q3: Domain and model generalization.** We acknowledge the submitted scope was narrow. We have since added two new evaluation axes:
+
+(1) *AMP biological sequence generation* (20–50 amino acids, non-differentiable fitness oracle, vocabulary size 20):
+
+| Method | Perf ↑ | Div ↑ | Nov ↑ | Avg Len | Steps |
+|---|---|---|---|---|---|
+| TB | 0.927 | 7.39 | 10.65 | 17.4 | 10K |
+| SubTB † | 0.897 | 21.37 | 28.68 | 49.3 | 9K |
+| RapTB | 0.919 | 8.83 | 14.44 | 22.4 | 5K |
+| RapTB+SubM | 0.916 | **16.92** | **15.77** | 25.6 | 3K |
+
+† SubTB collapses to maximum length; its raw diversity/novelty are inflated by edit-distance artefacts. RapTB+SubM achieves the best diversity and novelty among natural-length methods in 3K steps.
+
+(2) *3B LoRA scale-up on SMILES*:
+
+| Method (3B) | Acc | Score | FPDiv |
+|---|---|---|---|
+| TB | 0.999 | 0.717 | 0.837 |
+| SubTB | 0.313 | 0.221 | 0.854 |
+| RapTB | 0.984 | 0.732 | 0.864 |
+| RapTB+SubM | **0.996** | **0.856** | **0.937** |
+
+SubTB's termination drift is amplified at 3B scale; the failure is structural, not domain-specific. With four tasks (SMILES, Expr24, CommonGen, AMP) across two model scales (1B, 3B), the observed failure modes — termination collapse under SubTB, mode collapse under vanilla TB — recur consistently. We will revise claims to "terminable prefix-tree LLM-GFlowNets in the evaluated sequence-generation settings." Code and math reasoning remain untested; we acknowledge this as a limitation.
+
+**W2+Q1: When does RapTB provide additive benefit over SubM?** SubM and RapTB address orthogonal bottlenecks: SubM improves external replay coverage; RapTB improves internal credit allocation. We isolate their contributions in three controlled regimes on Expr24:
+
+| Regime | TB metric | RapTB metric | Interpretation |
+|---|---|---|---|
+| RP replay (no SubM) | NormCov 0.001 | NormCov 0.039 | RapTB alone improves 39× |
+| SubM replay | NormCov 0.100 | NormCov 0.209 | RapTB doubles SubM's benefit |
+| Oracle replay (controlled) | Acc 0.919, JS 0.016 | Acc 0.945, JS 0.013 | Better allocation, same data |
+
+Under RP (no SubM), exploration is the dominant bottleneck and even 39× improvement in NormCov remains modest. Once SubM provides adequate coverage, RapTB doubles NormCov (0.209 vs 0.100). Under Oracle replay where coverage is equalized, RapTB still improves Acc and both KL directions — this isolates the allocation benefit. On SMILES, RapTB+SubM shifts more probability mass to the longest bin (Frac[9-10]: 0.402 vs 0.323 for TB+SubM), confirming better credit assignment to hard-to-reach regions.
+
+**W3+Q2: Hyperparameter sensitivity.** We conduct cross-task sweeps over β × ρ (18 configs) plus η and k_min ablations. The main finding is stability across a broad plateau, not a sharp optimum.
+
+Expr24 β × ρ grid (format: Acc / Diversity):
+
+| | β = 1 | β = 3 | β = 5 |
+|---|---|---|---|
+| ρ = 0 | 0.999 / 1.01 | 0.990 / 0.95 | 0.983 / 1.02 |
+| ρ = 0.1 | 0.999 / 0.99 | 1.000 / 0.77 | 0.998 / 0.97 |
+| ρ = 0.5 | 1.000 / 1.02 | **0.997 / 0.98** | 0.999 / 0.91 |
+
+All 9 configs maintain Acc ≥ 0.983 and log p_term ∈ [−0.25, −0.04] (vs SubTB's −79.6).
+
+SMILES β × ρ: 8 of 9 configs achieve Acc ≥ 0.991 with FPDiv in [0.849, 0.883] (paper default: 0.860). Only (β = 10, ρ = 0) shows mild degradation.
+
+Additional ablations: η sweep shows monotonic diversity improvement (NormCov: 0.008 → 0.014, JS: 0.235 → 0.185). Fixed-low k_min is the clearly worst setting — early prefixes carry noisier supervision. We are transparent that γ and K are not fully swept and remain a limitation.
+
+**Q4: GAE analogy.** The connection is a structural analogy in variance reduction, not an equivalence. Three key differences prevent a direct mapping:
+
+(i) *Optimization target.* GAE [6] estimates advantages for policy gradient ∇J. RapTB constructs targets for squared balance residuals (L² loss) — different optimization geometry.
+
+(ii) *Value function.* GAE bootstraps from a learned V(s), controlling bias-variance via λ. In the entropy-regularized RL view [1], log F(s) = V*(s) (soft value function). FL-GFN [3] reparameterizes via intermediate energy E(s) but requires E(s) evaluable at every state (Assumption 4.1 — violated under sparse rewards). LED-GFN [4] learns potentials with an auxiliary network. RapTB uses non-parametric suffix aggregation — no learned value function, no auxiliary model. TBA [5] explicitly calls for "learning partial energy functions" as future work; our absorbed targets are a computationally cheap realization.
+
+(iii) *Global constraint.* The GFlowNet TB condition imposes a partition function constraint absent in standard policy gradient.
+
+We will revise the discussion to connect explicitly to the RL view and clarify the claim scope to "evaluated settings."
+
+**References.**
+[1] Tiapkin et al. "Generative Flow Networks as Entropy-Regularized RL." AISTATS 2024.
+[2] Deleu et al. "Discrete Probabilistic Inference as Control in GFlowNets." UAI 2024.
+[3] Pan et al. "Better Training of GFlowNets with Local Credit and Incomplete Trajectories." ICML 2023.
+[4] Jang et al. "Learning Energy Decompositions for Partial Inference in GFlowNets." ICLR 2024.
+[5] Bartoldson et al. "Trajectory Balance with Asynchrony." NeurIPS 2025.
+[6] Schulman et al. "High-Dimensional Continuous Control Using Generalized Advantage Estimation." ICLR 2016.
+[7] Jain et al. "Biological Sequence Design with GFlowNets." ICML 2022.

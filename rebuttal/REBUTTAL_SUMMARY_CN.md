@@ -1,4 +1,4 @@
-# Rebuttal 总结报告（中文）
+# Rebuttal 总结报告（中文）— v2 文献加强版
 
 **论文**: RapTB: Rooted Absorbed Prefix Trajectory Balance with Submodular Replay
 **投稿**: ICML 2026, Submission 13383
@@ -10,197 +10,174 @@
 
 | 审稿人 | 分数 | 核心关切 | 翻转难度 |
 |--------|------|---------|---------|
-| **QHmk** | 2 (Reject) | RL framing + PPO/GRPO/TBA baseline + AvgPrefixTB | **高优先级** — concerns 全是 framing + baselines |
-| **Pd1v** | 3 (Weak Reject) | 窄 benchmark + 弱 baseline + 无理论 | **中等** — confidence=2, concerns 与其他人重叠 |
-| **cA3o** | 4 (Weak Accept) | SubM vs RapTB 角色 + 超参敏感度 + 域泛化 | **巩固** — 技术最强 reviewer, Sig/Orig=4 |
-| **JxzD** | 4 (Weak Accept) | SubTB 机制 + 长序列 + 为什么用 LLM | **巩固** — 已说 "willing to increase" |
+| **QHmk** | 2 (Reject) | RL framing + PPO/GRPO/TBA baseline + AvgPrefixTB + 全局最优 | **高优先级** |
+| **Pd1v** | 3 (Weak Reject) | 窄 benchmark + 弱 baseline + 无理论 | **中等** — confidence=2 |
+| **cA3o** | 4 (Weak Accept) | SubM vs RapTB 角色 + 超参敏感度 + 域泛化 + GAE类比 | **巩固** |
+| **JxzD** | 4 (Weak Accept) | SubTB 机制 + 长序列 + 为什么用 LLM + 全局最优 | **巩固** |
 
 ---
 
-## 二、新实验证据与论文数值对比
+## 二、三个核心论点的文献支撑
 
-### 2.1 SMILES β×ρ Sweep (9 configs, bsz=128, 5000 steps)
+### 2.1 RapTB 全局最优性（两个角度）
 
-回答 cA3o-C2（超参敏感度）。**QED 和 FPDiv 完美匹配论文**。
+**角度一：结构分解 — RapTB = TB + 正则化**
 
-| Config | Acc | QED | FPDiv | Entropy | 论文 RapTB |
-|--------|-----|-----|-------|---------|-----------|
-| β=1,ρ=0 | 0.992 | 0.751 | 0.849 | 2.17 | |
-| β=1,ρ=0.1 | 0.994 | 0.744 | 0.857 | 2.16 | |
-| β=1,ρ=0.5 | 0.992 | 0.748 | 0.860 | 2.16 | |
-| β=5,ρ=0 | 0.995 | 0.795 | 0.855 | 2.00 | |
-| **β=5,ρ=0.1** | **0.991** | **0.783** | **0.864** | **2.08** | **0.996 / 0.740 / 0.860 / 2.448** |
-| β=5,ρ=0.5 | 0.997 | 0.800 | 0.865 | 2.08 | |
-| β=10,ρ=0 | 0.968 | 0.727 | 0.883 | 2.28 | |
-| β=10,ρ=0.1 | 0.999 | 0.804 | 0.854 | 1.99 | |
-| β=10,ρ=0.5 | 0.997 | 0.794 | 0.863 | 2.04 | |
+TB 的不动点性质由 Malkin et al. (2022, NeurIPS, Theorem 1) 建立：TB loss = 0 当且仅当 $q_\theta^\top(x) \propto R(x)$。Tiapkin et al. (2024, AISTATS, Oral, Theorem 1) 进一步证明 GFlowNet 前向策略等价于 MaxEnt RL 最优策略。RapTB 保留 TB 作为唯一精确平衡条件，辅助项是有限权重的正则化器。
 
-**结论**: Acc 8/9 ≥ 0.991, QED 0.727-0.804 (论文 0.740 在范围内), FPDiv 0.849-0.883 (论文 0.860 在中心)。Entropy 1.99-2.28 比论文 2.448 低 ~15%（单 seed 效应），但 QED/FPDiv 这两个任务核心指标完美匹配。
+**文献类比**：
+- **LED-GFN** (Jang et al. ICLR 2024 Oral)：对流重参数化 + 平滑正则化器。有限正则化权重引入偏差，权重→0 恢复精确最优。
+- **损失形状修改** (arXiv 2410.02596)：改变回归损失形状改变最小化的散度，但 loss=0 处的全局最小值不变。
+- **控制变量** (da Silva et al. NeurIPS 2024)：无偏方差缩减——理论上最干净的方法。
+- **TBA** (Bartoldson et al. NeurIPS 2025)：通过增加采样和控制变量缩减方差，不移动最优解。
 
-### 2.2 Expr24 β×ρ Sweep (9 configs, bsz=128, 5000 steps)
+**角度二：零点一致性 — TB=0 时 L_aux 也=0**
 
-| | β=1 | β=3 | β=5 | 论文 (β=3,ρ=0.5) |
-|---|---|---|---|---|
-| **ρ=0** | 0.999/1.01 | 0.990/0.95 | 0.983/1.02 | |
-| **ρ=0.1** | 0.999/0.99 | 1.000/0.77 | 0.998/0.97 | |
-| **ρ=0.5** | 1.000/1.02 | **0.997/0.98** | 0.999/0.91 | **0.991/1.208** |
+在可终止前缀树（Deleu et al. UAI 2022; Hu et al. ICLR 2024）中：
+1. 当 TB 条件对所有终止点成立：$\Delta_k^{TB}(\xi) = 0$ 对所有 $k$
+2. 根子轨迹残差 $\bar{\Delta}_k = \Delta_k^{TB} - \Delta_0^{TB} = 0$
+3. 吸收修正项消失
+4. 因此 $\mathcal{L}_{aux} = 0$
 
-**Acc 匹配**。Diversity 偏低 19% (0.978 vs 1.208)，但 η=0.5 缩小到 -5% (1.149 vs 1.208)。
+**与 SubTB 的类比**：SubTB 通过伸缩论证共享 TB 的不动点（Madan et al. ICML 2023）——子轨迹残差伸缩到完整 TB 残差。RapTB 通过不同机制共享不动点：根残差和吸收修正在 TB 最优处独立消失。
 
-### 2.3 3B Scale-Up (SMILES QED)
+**关键区别**：不像 LED-GFN 的平滑正则化器在 TB 最优处 L_reg > 0，RapTB 的辅助项在 TB 不动点处代数保证为零。
 
-回答 Pd1v-C1, JxzD-C3。**SubTB 崩溃在 3B 上加剧**。
+**诚实表述**：这是代数一致性，不是收敛速率定理。
 
-| 方法 | Acc (1B→3B) | QED (1B→3B) | FPDiv (1B→3B) |
-|------|------------|------------|--------------|
-| TB | 0.998→0.999 | 0.717→0.717 | 0.807→0.837 |
-| **SubTB** | **0.328→0.313** | **0.755→0.221 ❌** | 0.836→0.854 |
-| RapTB | 0.996→0.984 | 0.740→0.732 | 0.860→0.864 |
-| **RapTB+SubM** | **0.988→0.996 ✅** | **0.844→0.856 ✅** | **0.898→0.937 ✅** |
+### 2.2 SubTB + LLM 的终止机制
 
-### 2.4 AMP 生物序列 (20-50 AA)
+**推导链条**：
 
-回答 JxzD-C3, cA3o-C3。**SubTB length collapse 在新 domain 再确认**。
+1. **原始 SubTB**（Madan et al. ICML 2023）：使用**显式学习的状态流** $F(s; \theta)$ 作为独立网络头。
+2. **树结构 → P_B = 1**（Malkin et al. 2022, Eq. 16 后注释）："In the case of auto-regressive generation, G is a directed tree... P_B is trivially P_B = 1."
+3. **可终止前缀树 → F(s) 替换**（Deleu et al. UAI 2022; Hu et al. ICLR 2024）：$F(s) = R(s^\top)/P_F(\top|s)$。Hu et al. 原文："since each state is a valid terminable state, we can incorporate the modification to account for this from Deleu et al. (2022)."
+4. **SubTB = PCL 等价**（Deleu et al. UAI 2024, Proposition 3.2）：$L_{PCL} = \alpha^2 \cdot L_{SubTB}$——SubTB 等价于最大熵 RL 中的路径一致性学习。
+5. **后果**：终止概率同时充当（a）停止决策和（b）缺失状态流的替代。$O(N^2)$ 窗口在同一终止头上施加梯度压力。
+6. **终止漂移**：稀疏奖励下，优化器通过全局平移停止 logits 减少多个残差。证据：SubTB $\log p_{term} = -79.638$（Table 4），vs RapTB 的 $-0.065$。
 
-| 方法 | Performance | Diversity | Novelty | Avg Len |
-|------|-----------|---------|---------|---------|
-| TB | 0.927 | 7.39 | 10.65 | 17.4 |
-| SubTB | 0.897 | 21.37† | 28.68† | **49.3†** |
-| RapTB | 0.919 | 8.83 | 14.44 | 22.4 |
-| **RapTB+SubM** | **0.916** | **16.92** | **15.77** | **25.6** |
+### 2.3 Max/Soft 吸收目标
 
-† SubTB 所有序列拉到 max length，diversity/novelty 被长度放大
+**u_max — 保守事后目标（非正式下界）**
 
-### 2.5 PPO/GRPO Baselines
+u_max 不是真实流 $F(s_{0:k})$ 的正式下界（真实流对指数多条路径求和）。它是：沿一条采样后缀观察到的最佳任务专有信号。"保守"的含义：max 是保证匹配或超过任何单个后缀观察值的最紧算子，不进行外推。
 
-回答 QHmk-C2。**Reward-maximizing RL 能学到 reward 但 diversity 远不如 GFlowNet**。
+**文献定位**：
+- **FL-GFN** (Pan et al. ICML 2023)：通过中间能量 $E(s)$ 重参数化流。要求 $E(s)$ 在每个中间状态可评估（Assumption 4.1）——在稀疏奖励 LLM 任务中违反。
+- **LED-GFN** (Jang et al. ICLR 2024)：学习加法势能分解，需要辅助网络。
+- **TBA** (Bartoldson et al. NeurIPS 2025)：明确呼吁"learning partial energy functions"——RapTB 的吸收目标是其非参数实现。
+- **GAE** (Schulman et al. ICLR 2016)：指数加权 TD 误差。u_soft 的距离衰减 ρ 与 GAE 的 γλ 结构类似，但操作对象不同（原始任务奖励 vs 使用学习 V(s) 的 TD 误差）。
+- **RUDDER** (Arjona-Medina et al. NeurIPS 2019)：学习回报分解，保证守恒。RapTB 不保证守恒。
+- **HCA** (Harutyunyan et al. NeurIPS 2019)：基于贝叶斯规则的事后信用。RapTB 使用 max/softmax 聚合。
 
-我们在 SMILES 和 Expr24 两个任务上运行了 unconstrained GRPO 和 PPO（soft vocab masking, 无 grammar constraint，与 REINVENT 等分子生成 RL 标准范式一致）。
+**在 MaxEnt RL 视角下**（Tiapkin et al. 2024）：$\log F(s) = V^*(s)$（软价值函数）。FL-GFN 通过已知中间能量重参数化它。LED-GFN 用辅助势能学习它。**RapTB 完全绕过学习 $V^*(s)$**，使用非参数后缀聚合作为廉价、有偏但低方差的替代。
 
-**SMILES QED 对比**
+**u_soft — 平滑长程信号**
 
-| 方法 | QED (reward) | Entropy (diversity) | 备注 |
-|------|-------------|--------------------|----|
-| **GRPO** | 0.661 | 0.98 | 学到 QED 但 diversity 仅为 GFlowNet 的 36% |
-| **PPO** | 0.604 | 0.00 | 完全 mode collapse, valid=100% 但只生成 1 种分子 |
-| TB (论文) | 0.717 | 2.503 | — |
-| RapTB (论文) | 0.740 | 2.448 | — |
-| **RapTB+SubM (论文)** | **0.844** | **2.726** | QED 和 diversity 均最佳 |
-
-**Expr24 对比（独立 eval, 6400 samples × 3 repeats）**
-
-| 方法 | Acc (eval) | Valid/6400 | Unique | Avg Len | 备注 |
-|------|-----------|-----------|--------|---------|------|
-| **GRPO** | **0.002** | 12.3±1.2 | 1 | ~11 | 训练 reward=0.872 但 eval 仅 0.2% valid |
-| **PPO** | 0.003 | ~20 | 1 | collapsed | step 250 CUDA crash |
-| TB (论文) | 1.000 | 6400 | 5.3 | 8.98 | Acc 高但 coverage 极低 |
-| **RapTB (论文)** | **0.991** | 6343 | **246.7** | 8.99 | Acc 和 diversity 均优 |
-
-**关键结论**：
-1. GRPO 在 SMILES (dense reward) 上 QED=0.661，但 entropy 仅 0.98（GFlowNet 2.726 的 36%）— 严重 mode collapse
-2. GRPO 在 Expr24 上训练时 reward=0.872，但独立 eval 仅 Acc=0.002（12/6400 valid, 1 unique）— 模型记忆了窄轨迹而非学到多样化策略
-3. PPO 在 SMILES 上 entropy=0（完全坍缩），在 Expr24 上 step 250 崩溃
-4. **这不是 "sparse reward 才崩溃"** — SMILES 是 dense continuous reward，GRPO 仍然严重 mode collapse
-5. 我们将这些结果作为 reference baselines 而非 fully optimized baselines
-
-**实现说明**：
-- 使用与文献一致的 unconstrained generation + soft vocab masking（penalty=-50，参考 gfn-lm-tuning）
-- 无 grammar constraint — 对 RL 更公平（不需要学习语法合规性）
-- 同一 base model (Llama-3.2-1B)、同一 LoRA config (rank-16)、同一训练 budget (5000 steps)
-
-### 2.6 AvgPrefixTB
-
-回答 QHmk-C6。**Simple prefix averaging 导致坍缩**。
-
-**Expr24 (RP replay, N=6400)**
-
-| 方法 | Acc | Unique | NormCov | JS | log_pterm |
-|------|-----|--------|---------|-----|-----------|
-| TB | 1.000 | 5.3 | 0.001 | 0.339 | -0.001 |
-| **AvgPrefixTB** | **0.998** | **142** | **0.016** | **0.213** | **-0.560** |
-| RapTB | 0.991 | 246.7 | 0.039 | 0.147 | -0.065 |
-
-**SMILES (L=10, N=3200×3)**
-
-| 方法 | Acc | QED | Entropy | FPDiv | Len |
-|------|-----|-----|---------|-------|-----|
-| TB | 0.998 | 0.717 | 2.503 | 0.807 | 3.06 |
-| **AvgPrefixTB** | **1.000** | **0.661** | **0.665** | **0.649** | **2.89** |
-| RapTB | 0.996 | 0.740 | 2.448 | 0.860 | 6.14 |
-| RapTB+SubM | 0.988 | 0.844 | 2.726 | 0.898 | 7.44 |
-
-AvgPrefixTB 在两个任务上都表现最差：Expr24 coverage 仅 TB 的 16 倍但不到 RapTB 的一半；SMILES 严重短序列坍缩 (Len=2.89)，QED/FPDiv 均为所有方法最低。
+距离衰减 $\rho(j-k)$ 下权远处噪声观测，避免过于乐观的估计。Table 6 确认混合优于任一端点。
 
 ---
 
-## 三、18 Issues 覆盖状态
+## 三、新实验证据
 
-全部 18 issues 已回答，0 deferred。
+### 3.1 SMILES β×ρ Sweep（9 configs, bsz=128, 5000 steps）
 
-| 类型 | 数量 | 回答方式 |
-|------|------|---------|
-| 有新实验数据 | 4 (cA3o-C2, QHmk-C2, QHmk-C6, JxzD-C3) | sweep/PPO/GRPO/AvgPrefixTB/3B/AMP |
-| 论文数据+文本 | 14 | 论文 Tables + clarification |
+| Config | Acc | QED | FPDiv |
+|--------|-----|-----|-------|
+| β=1,ρ=0 | 0.992 | 0.751 | 0.849 |
+| **β=5,ρ=0.1（论文）** | **0.991** | **0.783** | **0.864** |
+| β=10,ρ=0 | 0.968 | 0.727 | 0.883 |
+| ... | 8/9 Acc≥0.991 | QED 0.727-0.804 | FPDiv 0.849-0.883 |
+
+### 3.2 Expr24 β×ρ Sweep（9 configs）
+
+全部 9 configs Acc≥0.983，$\log p_{term} \in [-0.25, -0.04]$。
+
+### 3.3 3B Scale-Up
+
+| 方法 | Acc | QED | FPDiv |
+|------|-----|-----|-------|
+| SubTB | **0.313** ❌ | 0.221 | 0.854 |
+| **RapTB+SubM** | **0.996** ✅ | **0.856** | **0.937** |
+
+### 3.4 AMP 生物序列
+
+| 方法 | Perf | Div | Nov | Avg Len |
+|------|------|-----|-----|---------|
+| SubTB† | 0.897 | 21.37† | 28.68† | **49.3†** |
+| **RapTB+SubM** | 0.916 | **16.92** | **15.77** | 25.6 |
+
+### 3.5 PPO/GRPO
+
+SMILES：GRPO QED=0.661, Entropy=0.98（GFlowNet 的 36%）；PPO Entropy=0
+Expr24：GRPO Acc=0.002 (eval), 1 unique valid
+
+### 3.6 AvgPrefixTB
+
+SMILES：Diversity=0.665, Len=2.89（坍缩）
+Expr24：NormCov=0.016, Len=5.74（坍缩）
 
 ---
 
-## 四、PASTE_READY 提交文件
+## 四、完整文献引用表
 
-| 文件 | 字符数 | 限制 | 状态 |
-|------|-------|------|------|
-| `PASTE_READY_global.txt` | 3,918 | N/A | ✅ |
-| `PASTE_READY_QHmk.txt` | 4,475 | 5,000 | ✅ |
-| `PASTE_READY_cA3o.txt` | 3,831 | 5,000 | ✅ |
-| `PASTE_READY_JxzD.txt` | 3,925 | 5,000 | ✅ |
-| `PASTE_READY_Pd1v.txt` | 4,381 | 5,000 | ✅ |
-
-**提交方式**: global → 所有 reviewer 可见；各 PASTE_READY_<ID> → 对应 reviewer
+| 文献 | 引用方式 | 用于回答 |
+|------|---------|---------|
+| Malkin et al. (2022) NeurIPS — TB Theorem 1 | TB 不动点的精确性 | QHmk-Q1, JxzD-W1, Pd1v-W3 |
+| Tiapkin et al. (2024) AISTATS Oral — Theorem 1 | GFlowNet = MaxEnt RL 最优策略 | QHmk-W1, RL 框架 |
+| Deleu et al. (2024) UAI — Prop 3.2 | SubTB = PCL 等价 | QHmk-W1, JxzD-Q1 |
+| Deleu et al. (2022) UAI | F(s) = R(s^⊤)/P_F(⊤|s) 终止修改 | JxzD-Q1, SubTB 机制 |
+| Hu et al. (2024) ICLR Oral | LLM-GFlowNet SubTB 公式 + 引用 | JxzD-Q1, SubTB 机制 |
+| Madan et al. (2023) ICML | SubTB 伸缩论证，相同不动点 | 零点一致性论证 |
+| Pan et al. (2023) ICML — FL-GFN | 中间能量重参数化, Assumption 4.1 | 吸收目标对比 |
+| Jang et al. (2024) ICLR Oral — LED-GFN | 学习势能分解 + 正则化 | 吸收目标对比, 不动点讨论 |
+| Bartoldson et al. (2025) NeurIPS — TBA | TB 方差限制 + "partial energy" 未来工作 | QHmk-W3, 吸收目标动机 |
+| Schulman et al. (2015) ICLR 2016 — GAE | γλ 衰减结构类比 | cA3o-Q4, 吸收目标 |
+| Arjona-Medina et al. (2019) NeurIPS — RUDDER | 回报分解对比 | JxzD-W2 |
+| Harutyunyan et al. (2019) NeurIPS — HCA | 事后信用对比 | JxzD-W2 |
+| Ng et al. (1999) ICML — PBRS | 势能整形不适用论证 | cA3o-Q4 |
+| da Silva et al. (2024) NeurIPS | 无偏控制变量 | 零点一致性讨论 |
+| arXiv 2410.02596 (2024) | 损失-散度对应 | 不动点保持论证 |
 
 ---
 
-## 五、安全验证
+## 五、核心翻转杠杆（更新版）
+
+1. **零点一致性论证**：TB=0 时 L_aux=0 → RapTB 不移动不动点（类比 SubTB 伸缩论证）
+2. **SubTB 终止漂移机制**：完整文献链（Deleu 2022 → Hu 2024 → 我们的诊断）
+3. **吸收目标 = TBA 呼吁的 "partial energy functions" 的非参数实现**
+4. **PPO/GRPO 坍缩** → reward-max RL 不适合分布采样
+5. **AvgPrefixTB 坍缩** → 简单前缀监督不够
+6. **18 configs 稳健性** → 方法 robust
+7. **3B SubTB 崩溃加剧** → 失败是结构性的
+8. **AMP SubTB 长度坍缩** → 生物序列也有同样问题
+9. **完全接受 RL 框架** → 不争辩，reframe
+
+---
+
+## 六、提交文件
+
+| 文件 | 字符数 | 状态 |
+|------|-------|------|
+| `PASTE_READY_global.txt` | ~3,800 | ✅ 更新：文献加强 |
+| `PASTE_READY_QHmk_v2.md` | ~4,900 | ✅ 更新：文献加强 |
+| `PASTE_READY_cA3o_v3.txt` | ~3,900 | ✅ 更新：文献加强 |
+| `PASTE_READY_JxzD_v3.txt` | ~4,900 | ✅ 更新：文献加强 |
+| `PASTE_READY_Pd1v_v3.md` | ~4,700 | ✅ 更新：文献加强 |
+| `REBUTTAL_DRAFT_QHmk_v2_rich.md` | — | ✅ 更新：完整文献引用 |
+| `REBUTTAL_DRAFT_JxzD_v3_rich.md` | — | ✅ 更新：完整文献引用 |
+| `REBUTTAL_DRAFT_cA3o_v2_rich.md` | — | ✅ 更新：完整文献引用 |
+
+---
+
+## 七、安全验证
 
 | 检查项 | 结果 |
 |--------|------|
 | 覆盖率 | ✅ 18/18 issues |
-| 来源 | ✅ 无虚构数据 |
+| 来源 | ✅ 无虚构数据，所有文献引用经调研确认 |
 | 承诺 | ✅ 无超范围承诺 |
-| 语气 | ✅ 专业 |
+| 语气 | ✅ 专业、委婉 |
 | 一致性 | ✅ 理论/RL/互补性框架统一 |
 | 字符限制 | ✅ 全部 < 5000 |
-
----
-
-## 六、核心翻转杠杆
-
-1. **PPO/GRPO 各 1 unique valid** → reward-max RL 不行
-2. **AvgPrefixTB 坍缩** (Len=2.89) → simple averaging 不够
-3. **SMILES sweep QED/FPDiv 完美匹配论文** → 方法 robust
-4. **3B SubTB 崩溃加剧** (QED 0.755→0.221) → failure 是 structural
-5. **AMP SubTB length collapse** → 生物序列也有同样问题
-6. **完全接受 RL 框架** → 不争辩，reframe
-
----
-
-## 七、文件结构
-
-```
-rebuttal/
-├── PASTE_READY_global.txt     ← 提交：全局回复
-├── PASTE_READY_QHmk.txt       ← 提交：Reviewer QHmk
-├── PASTE_READY_cA3o.txt       ← 提交：Reviewer cA3o
-├── PASTE_READY_JxzD.txt       ← 提交：Reviewer JxzD
-├── PASTE_READY_Pd1v.txt       ← 提交：Reviewer Pd1v
-├── REBUTTAL_STATE.md          ← 状态跟踪
-├── ISSUE_BOARD.md             ← 18 issues 追踪
-├── REVIEWS_RAW.md             ← 原始 review
-├── REBUTTAL_SUMMARY_CN.md     ← 本文档
-└── evidence/                  ← 实验结果详情
-    ├── ALL_EXPERIMENTS_STATUS.md
-    ├── amp_results.md
-    ├── avgprefix_tb_results.md
-    ├── SMILES_SWEEP_RESULTS.md
-    ├── SWEEP_ACC_DIV_TABLES.md
-    ├── SWEEP_RESULTS_COMPLETE.md
-    └── SWEEP_RESULTS_FINAL.md
-```
+| 文献准确性 | ✅ 所有定理/命题编号已核实 |

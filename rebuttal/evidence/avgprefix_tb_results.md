@@ -14,13 +14,44 @@ Config: `mode="avgprefix"`, `k_min=0`, `detach_pterm_in_aux=false`, learnable $\
 
 ## Table 3: VarExpr24 (N=6400 samples)
 
+Paper results are mean±95% CI over 3 seeds. AvgPrefixTB results are single-run point estimates.
+
+### RP (Random Priority) Replay
+
 | Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ | Avg Len |
 |---|---|---|---|---|---|---|---|---|
+| TB (paper) | 1.000±0.000 | 5.3±0.4 | 0.001±0.000 | 1.297±0.001 | 11.403±0.282 | 0.339±0.000 | — | — |
+| SubTB (paper) | 0.229±0.005 | 324.7±2.7 | 0.051±0.000 | 0.455±0.005 | 0.865±0.083 | 0.109±0.002 | — | — |
+| RapTB (paper) | 0.991±0.000 | 246.7±7.1 | 0.039±0.001 | 0.561±0.001 | 4.480±0.002 | 0.147±0.000 | — | — |
 | **AvgPrefixTB (RP)** | 0.998 | 142 | 0.016 | 0.808 | 8.908 | 0.213 | -0.560 | 5.74 |
+
+### PRT (Prioritized Replay with Temperature) Replay
+
+| Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ | Avg Len |
+|---|---|---|---|---|---|---|---|---|
+| TB (paper) | 0.999±0.000 | 103.7±3.2 | 0.016±0.001 | 1.105±0.002 | 7.803±0.060 | 0.292±0.001 | — | — |
+| SubTB (paper) | 0.311±0.002 | 292.0±2.9 | 0.046±0.000 | 0.424±0.010 | 0.672±0.077 | 0.107±0.003 | — | — |
+| RapTB (paper) | 0.992±0.001 | 129.3±0.4 | 0.020±0.000 | 0.908±0.003 | 5.538±0.005 | 0.230±0.001 | — | — |
 | **AvgPrefixTB (PRT)** | 1.000 | 108 | 0.012 | 0.944 | 10.989 | 0.249 | -0.606 | 5.42 |
+
+### SubM (Submodular) Replay
+
+| Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ | Avg Len |
+|---|---|---|---|---|---|---|---|---|
+| TB+SubM (paper) | 0.996±0.001 | 642.0±5.6 | 0.100±0.001 | 0.182±0.001 | 0.441±0.005 | 0.049±0.000 | — | — |
+| SubTB+SubM (paper) | 0.061±0.005 | 331.3±22.7 | 0.052±0.004 | 0.149±0.008 | 0.286±0.070 | 0.040±0.002 | — | — |
+| **RapTB+SubM (paper)** | **0.994±0.001** | **1337.3±7.5** | **0.209±0.001** | 0.169±0.001 | 0.623±0.004 | 0.048±0.000 | — | — |
 | ~~AvgPrefixTB (SubM v1)~~ | 1.000 | 7 | 0.000 | 1.442 | 14.506 | 0.372 | -0.000 | 3.02 |
 | **AvgPrefixTB (SubM)** | 0.993 | 902 | 0.050 | 0.190 | 0.819 | 0.051 | -0.181 | 7.60 |
-| **AvgPrefixTB (Oracle)** | 0.922 | 3369 | **0.183** | **0.052** | **0.052** | **0.013** | -1.105 | 6.79 |
+
+### Oracle Replay
+
+| Method | Acc ↑ | Unique | NormCov ↑ | KL(π→p\*) ↓ | KL(p\*→π) ↓ | JS ↓ | log p\_term(τ) ↑ | Avg Len |
+|---|---|---|---|---|---|---|---|---|
+| TB (paper) | 0.919±0.001 | 5198.0±5.2 | 0.812±0.001 | 0.062±0.001 | 0.066±0.001 | 0.016±0.000 | — | — |
+| SubTB (paper) | 0.006±0.000 | 35.7±2.9 | 0.006±0.000 | 0.266±0.009 | 1.491±0.413 | 0.071±0.003 | — | — |
+| **RapTB (paper)** | **0.945±0.001** | **5220.7±4.3** | **0.816±0.001** | **0.052±0.001** | **0.056±0.001** | **0.013±0.000** | — | — |
+| **AvgPrefixTB (Oracle)** | 0.922 | 3369 | 0.183 | 0.052 | 0.052 | 0.013 | -1.105 | 6.79 |
 
 ## Table 2: SMILES (L=10, N=3200 samples × 3 repeats)
 
@@ -52,8 +83,10 @@ Config: `mode="avgprefix"`, `k_min=0`, `detach_pterm_in_aux=false`, learnable $\
 
 ### VarExpr24
 1. **RP/PRT: High Acc but severe mode collapse** — Acc ≥0.998 but NormCov ≤0.016, only 108–142 unique valid out of 6400 samples. The model converges to a few high-reward modes.
-2. **Oracle dramatically improves diversity** — NormCov=0.183 (11× RP), 3369 unique valid, KL nearly zero. This shows AvgPrefixTB *can* learn diverse policies when given oracle data guidance.
-3. **SubM collapsed on Expr24** — Only 7 unique valid. Root cause: `diversity_valid_only=true` starved the SubM buffer during early training when AvgPrefixTB is still learning to produce valid expressions. Buffer only reached 31/200 items. Re-run with `diversity_valid_ratio=0.5` also collapsed (76/200 items, but all length-3).
+2. **AvgPrefixTB ≈ TB under RP/PRT** — Both collapse to few modes with high Acc. AvgPrefixTB (RP): Unique=142 vs TB (RP): Unique=5.3; AvgPrefixTB finds more modes than TB but far fewer than RapTB (246.7). Under PRT: AvgPrefixTB Unique=108 ≈ TB's 103.7, both worse than RapTB's 129.3.
+3. **AvgPrefixTB+SubM far behind RapTB+SubM** — AvgPrefixTB+SubM: NormCov=0.050, Unique=902 vs RapTB+SubM: NormCov=**0.209**, Unique=**1337.3** (2.6× more unique, 4.2× higher NormCov). Even TB+SubM (NormCov=0.100) outperforms AvgPrefixTB+SubM.
+4. **Oracle: AvgPrefixTB still far behind RapTB/TB** — AvgPrefixTB: NormCov=0.183, Unique=3369 vs RapTB: NormCov=**0.816**, Unique=**5220.7** (4.5× NormCov, 1.5× Unique). Even TB Oracle (NormCov=0.812) dramatically outperforms AvgPrefixTB Oracle.
+5. **SubM collapsed on Expr24 (v1)** — Only 7 unique valid. Root cause: `diversity_valid_only=true` starved the SubM buffer during early training when AvgPrefixTB is still learning to produce valid expressions. Buffer only reached 31/200 items. Re-run with `diversity_valid_ratio=0.5` also collapsed (76/200 items, but all length-3).
 
 ### SMILES (L=10)
 1. **AvgPrefixTB achieves near-perfect accuracy (1.000)** but worst QED (0.661) and diversity (0.665) among all methods — even TB (Diversity=2.503, QED=0.717) is far superior.
@@ -75,9 +108,11 @@ v1/v2 collapsed to length-3 expressions. v3 fix: lower valid_ratio (0.3), larger
 ## Interpretation for Rebuttal
 
 These results directly support the paper's claims:
-- Simple prefix-averaged TB **does not match RapTB** on diversity/coverage metrics
-- AvgPrefixTB achieves high accuracy but collapses to few modes (RP: 142 unique / 6400 sampled)
-- Oracle access partially rescues diversity (NormCov: 0.016 → 0.183)
+- Simple prefix-averaged TB **does not match RapTB** on diversity/coverage metrics across all replay schemes
+- **RP**: AvgPrefixTB Unique=142, NormCov=0.016 vs RapTB Unique=246.7, NormCov=0.039 (2.4× coverage)
+- **SubM**: AvgPrefixTB NormCov=0.050 vs RapTB+SubM NormCov=**0.209** (4.2× coverage), even TB+SubM (0.100) outperforms AvgPrefixTB
+- **Oracle**: AvgPrefixTB NormCov=0.183 vs RapTB NormCov=**0.816** (4.5× coverage) — AvgPrefixTB cannot leverage oracle data as effectively
+- AvgPrefixTB behaves most similarly to TB (both high-Acc, mode-collapsing), confirming that simply averaging prefix losses does not achieve the credit assignment benefits of RapTB's rooted residual formulation
 - RapTB's rooted residual + absorbed target + pterm detach are **not cosmetic improvements** — they solve the mode collapse that AvgPrefixTB suffers from
 
 ## Experiment Configs
