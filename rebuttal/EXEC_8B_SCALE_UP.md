@@ -47,7 +47,7 @@ print('Done!')
 
 If access is gated, ensure `huggingface-cli login` is done with a token that has Llama-3.1 access.
 
-### Step 1: Verify Environment
+### Step 1: Verify Environment and Tokenizer
 
 ```bash
 cd /path/to/ChemGFN
@@ -57,6 +57,29 @@ pip install -e .
 # Verify GPU availability
 python -c "import torch; print(f'GPUs: {torch.cuda.device_count()}'); [print(f'  {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem // 1024**3}GB)') for i in range(torch.cuda.device_count())]"
 ```
+
+**CRITICAL: Verify eos_token is correct (must be `<|end_of_text|>`, id=128001)**
+
+```bash
+python -c "
+from transformers import AutoTokenizer
+t = AutoTokenizer.from_pretrained('meta-llama/Llama-3.1-8B')
+assert t.eos_token == '<|end_of_text|>', f'WRONG eos_token: {t.eos_token}'
+assert t.eos_token_id == 128001, f'WRONG eos_token_id: {t.eos_token_id}'
+print(f'OK: eos_token={t.eos_token!r} (id={t.eos_token_id})')
+
+# Also verify SMILES token list compatibility
+with open('assets/token_list/SMILES/allowed_llama3.2_1B_allowed_token') as f:
+    tokens = [line.rstrip('\n') for line in f.readlines()]
+for tok in tokens:
+    ids = t.encode(tok, add_special_tokens=False)
+    assert len(ids) == 1, f'MULTI-TOKEN: {tok!r} -> {ids}'
+print(f'OK: all {len(tokens)} SMILES tokens are single tokens')
+"
+```
+
+If the eos check fails, you may have downloaded the **Instruct** model by mistake.
+The Instruct variant uses `<|eot_id|>` (id=128009) as eos, which will cause silent training errors.
 
 ## Execution
 
