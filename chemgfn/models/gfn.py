@@ -101,9 +101,10 @@ class ChemGFNModule(LightningModule):
         model = AutoModelForCausalLM.from_pretrained(self.net_config.pretrained_model_name_or_path)
         model.train()
 
-        model_frozen = AutoModelForCausalLM.from_pretrained(
-            self.net_config.pretrained_model_name_or_path
+        frozen_model_path = getattr(
+            self.net_config, "frozen_model_name_or_path", self.net_config.pretrained_model_name_or_path
         )
+        model_frozen = AutoModelForCausalLM.from_pretrained(frozen_model_path)
         model_frozen.eval()
         model_frozen.requires_grad_(False)
 
@@ -2335,10 +2336,25 @@ class ChemGFNModule(LightningModule):
     # Helpers
     # --------------------------------------------------------------------- #
 
+    def _pad_mask_to_model_vocab(self, mask: torch.Tensor) -> torch.Tensor:
+        """Pad a token mask to match the model's actual vocab_size if needed.
+
+        Some tokenizers (e.g. Qwen3) have len(tokenizer) < model.config.vocab_size.
+        Extra positions are marked as illegal (False for legal mask, True for illegal).
+        """
+        model_vocab_size = self.net.config.vocab_size if hasattr(self.net, "config") else len(self.tokenizer)
+        if mask.shape[0] < model_vocab_size:
+            pad = torch.zeros(model_vocab_size - mask.shape[0], dtype=mask.dtype)
+            mask = torch.cat([mask, pad], dim=0)
+        return mask
+
     def _load_token_masks(self):
         tokens_path = getattr(self.constraint_config, "legal_tokens", None)
         if tokens_path and os.path.exists(tokens_path):
-            return prepare_token_mask(self.tokenizer, tokens_path)
+            legal_mask, illegal_mask, legal_ids = prepare_token_mask(self.tokenizer, tokens_path)
+            legal_mask = self._pad_mask_to_model_vocab(legal_mask)
+            illegal_mask = ~legal_mask
+            return legal_mask, illegal_mask, legal_ids
 
         if tokens_path:
             log.warning("Legal tokens file not found: %s", tokens_path)

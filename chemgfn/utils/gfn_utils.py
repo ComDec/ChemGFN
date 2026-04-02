@@ -87,7 +87,8 @@ def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse:
     legal_token_mask[legal_tokens] = True
 
     # add bos and eos as legal tokens
-    legal_token_mask[tokenizer.bos_token_id] = False
+    if tokenizer.bos_token_id is not None:
+        legal_token_mask[tokenizer.bos_token_id] = False
     legal_token_mask[tokenizer.eos_token_id] = True
 
     illegal_token_mask = ~legal_token_mask
