@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=str,
-        default="/data1/xw3763/project/gflow/ChemGFN/logs/train",
+        default=None,
         help="Root directory to search recursively.",
     )
     parser.add_argument(
@@ -186,8 +186,11 @@ def main() -> None:
         if not roots:
             print(f"[info] root_glob matched nothing: {args.root_glob}")
             return
-    else:
+    elif args.root is not None:
         roots = [Path(args.root).expanduser().resolve()]
+    else:
+        print("[error] provide --root or --root-glob")
+        raise SystemExit(1)
 
     for root in roots:
         print(f"[root] expanding {root}")
