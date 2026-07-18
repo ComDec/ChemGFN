@@ -1,4 +1,6 @@
-# ChemGFN
+# RapTB (ChemGFN)
+
+To be updated.
 
 ChemGFN is a minimal, camera-ready codebase for training GFlowNets with LLMs on two tasks:
 
