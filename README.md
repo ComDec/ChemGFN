@@ -84,19 +84,30 @@ from the suffix.
 
 ## Installation
 
+Clone with submodules — grammar-constrained sampling needs the `gflow` fork of
+`transformers_cfg`, which is vendored as a submodule:
+
+```bash
+git clone --recurse-submodules https://github.com/ComDec/ChemGFN.git
+cd ChemGFN
+```
+
+Already cloned? `git submodule update --init --recursive`.
+
 ```bash
 conda env create -f environment.yaml
 conda activate chemgfn
 pip install -e .
+pip install -e third_party/transformers-CFG      # the gflow fork
 ```
 
 `pyproject.toml` is the single source of truth for dependencies; `environment.yaml` only pins the
 Python runtime and the two binaries that are painful to build from source (PyTorch, RDKit).
 
 > [!IMPORTANT]
-> **Grammar-constrained sampling requires a patched `transformers_cfg`.** The tasks import
-> `GrammarIncrementalLogitsProcessorGeneral`, which is not part of any published
-> `transformers_cfg` release. See [Known limitations](#known-limitations).
+> Install `third_party/transformers-CFG`, not the PyPI `transformers_cfg`. The released package
+> does not provide the incremental grammar processor these tasks use, so training fails at import
+> without the fork.
 
 The SMILES, Expr24 and AMP tasks fine-tune `meta-llama/Llama-3.2-1B`, a **gated** model. Request
 access on the Hub, then:
@@ -203,10 +214,9 @@ those skip cleanly.
 
 Stated plainly so nobody hunts for something that is not here.
 
-- **Grammar-constrained sampling depends on an unpublished `transformers_cfg` fork.**
-  `chemgfn/models/gfn.py` imports `GrammarIncrementalLogitsProcessorGeneral`, which does not exist
-  in `transformers_cfg` 0.2.6 or 0.2.7 — the only published releases. Until that fork is vendored
-  here or published, `python chemgfn/train.py` fails at import.
+- **Grammar-constrained sampling needs the `gflow` fork of `transformers_cfg`**, vendored as the
+  `third_party/transformers-CFG` submodule. The PyPI package (0.2.6 / 0.2.7) does not provide
+  `GrammarIncrementalLogitsProcessorGeneral`. Clone with `--recurse-submodules`.
 - **No released checkpoints.** Every reported number requires retraining.
 - **PPO / GRPO baselines** (rows in the SMILES and Expr24 tables) were produced with external
   TRL-based scripts and are not part of this repository.

@@ -29,7 +29,7 @@ scheduler:
   power: 1.0
 
 reward:
-  _target_: chemgfn.models.reward.MixedReferenceReward
+  _target_: chemgfn.models.reward.PrefixShapedReward
   illegal_vocab_penalty: -99
   grammar_disagree_penalty: 0
   sentence_validator:

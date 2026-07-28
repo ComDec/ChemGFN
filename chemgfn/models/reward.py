@@ -9,8 +9,6 @@ Every reward in this module is the sum of two terms:
 
 The classes differ only in how the two terms are combined:
 
-* :class:`MixedReferenceReward` weights the task score by the magnitude of the terminal
-  reference log reward.
 * :class:`PrefixShapedReward` subtracts the terminal reference log reward instead, turning the
   task score into a per-prefix shaping signal (Expr24).
 * :class:`AbsorbingPrefixReward` builds the absorbed suffix target: the score of the terminating
@@ -36,7 +34,6 @@ from chemgfn.models.validators import Validator
 __all__ = [
     "AbsorbingPrefixReward",
     "CommonGenReward",
-    "MixedReferenceReward",
     "PrefixShapedReward",
     "compute_active_before",
     "score_fast",
@@ -160,107 +157,6 @@ def _resolve_score_function(name: str) -> Callable[..., dict[str, Tensor]]:
 # --------------------------------------------------------------------------- #
 # Reward models
 # --------------------------------------------------------------------------- #
-
-
-class MixedReferenceReward:
-    """Reference prior mixed with a per-state task score.
-
-    The log reward at every state is the frozen reference log reward plus the validator's local
-    score, weighted both by the magnitude of the terminal reference log reward and by the
-    ``scaling_factor`` schedule.
-    """
-
-    def __init__(
-        self,
-        sentence_validator: Validator | None,
-        illegal_vocab_penalty: float = -99,
-        score_function: ScoreFunctionName = "score_fast",
-        **kwargs: Any,
-    ) -> None:
-        """Configure the reward.
-
-        Args:
-            sentence_validator: Validator producing the per-state task score, or ``None`` to use
-                the reference prior alone.
-            illegal_vocab_penalty: Logit offset applied to task-forbidden tokens in the
-                reference prior.
-            score_function: Name of the reference-prior scoring function.
-        """
-
-        self.sentence_validator = sentence_validator
-        self.illegal_vocab_penalty = float(illegal_vocab_penalty)
-        self.temperature = 1.0
-        self.score_function = score_function
-
-    def score(
-        self,
-        input_batch: Tensor,
-        prompt_length: int,
-        model,
-        tokenizer: PreTrainedTokenizer,
-        reward_temperature: float = 1.0,
-        vocab_invalid_mask: Tensor | None = None,
-        scaling_factor: float = 0.5,
-        scaffold: str | None = None,
-        termination_token_id: int | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Compute the per-state log reward for a batch of trajectories.
-
-        Args:
-            input_batch: ``(B, P + T)`` prompt tokens followed by generated tokens.
-            prompt_length: Prompt length ``P``.
-            model: Frozen reference language model.
-            tokenizer: Tokenizer used to decode trajectories for the validator.
-            reward_temperature: Temperature applied to the reference logits.
-            vocab_invalid_mask: Optional ``(V,)`` mask of task-forbidden tokens.
-            scaling_factor: Weight of the validator's local score.
-            scaffold: Optional task conditioning passed through to the validator.
-            termination_token_id: Termination token id; defaults to the tokenizer's EOS.
-
-        Returns:
-            Dict with the per-state log reward and the reference-model diagnostics.
-        """
-
-        eos = int(
-            termination_token_id if termination_token_id is not None else tokenizer.eos_token_id
-        )
-        reference_results = _resolve_score_function(self.score_function)(
-            model=model,
-            encoded_input=input_batch,
-            termination_token_id=eos,
-            skip_first=prompt_length,
-            reward_temperature=reward_temperature,
-            invalid_vocab_mask=vocab_invalid_mask,
-            illegal_vocab_penalty=self.illegal_vocab_penalty,
-        )
-
-        validator_dict = None
-        reference_logP = reference_results["reward"]
-        ref_log_pf = reference_results["ref_log_pf"]
-        ref_log_pterm = reference_results["ref_log_pterm"]
-
-        reward_mixed = reference_logP
-
-        if self.sentence_validator is not None:
-            validator_dict = self.sentence_validator(
-                input_batch[:, prompt_length:], tokenizer, scaffold
-            )
-            local_score = validator_dict["local_score"]
-            reward_mixed = (
-                reference_logP
-                + torch.abs(reference_logP[..., -1]).unsqueeze(-1) * local_score
-                + scaling_factor * local_score
-            )
-
-        return {
-            "reward": reward_mixed,
-            "reward_unpenalized": reward_mixed,
-            "full_tokens": None if validator_dict is None else validator_dict.get("full_tokens"),
-            "log_pf_ref": ref_log_pf,
-            "log_pterm_ref": ref_log_pterm,
-            "validator_dict": validator_dict,
-        }
 
 
 class PrefixShapedReward:

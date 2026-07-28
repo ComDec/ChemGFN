@@ -7,13 +7,12 @@ import torch
 
 from chemgfn.models.reward import (
     AbsorbingPrefixReward,
-    MixedReferenceReward,
     PrefixShapedReward,
     compute_active_before,
     score_fast,
 )
 
-REWARD_CLASSES = [MixedReferenceReward, PrefixShapedReward, AbsorbingPrefixReward]
+REWARD_CLASSES = [PrefixShapedReward, AbsorbingPrefixReward]
 
 EOS = 0
 VOCAB_SIZE = 12
@@ -183,7 +182,7 @@ class TestRewardContract:
             illegal_vocab_penalty=reward_cls(sentence_validator=None).illegal_vocab_penalty,
         )["reward"]
 
-        scale = 1.0 if reward_cls is MixedReferenceReward else 0.5
+        scale = 0.5
         assert torch.allclose(out["reward"], reference * scale, atol=1e-6)
         assert out["validator_dict"] is None
 
@@ -256,43 +255,6 @@ class TestRewardContract:
         assert delta.max().item() == pytest.approx(1.0)
         assert delta.min().item() >= 0.0
         assert torch.allclose(delta, delta.round())
-
-
-class TestMixedReferenceReward:
-    """Reference prior mixed with a per-state task score (AMP)."""
-
-    def test_local_score_is_weighted_by_the_terminal_prior(self, batch, constant_logits_model):
-        num_states = batch.shape[1] - PROMPT_LEN + 1
-        local_score = torch.ones(batch.shape[0], num_states)
-        model = constant_logits_model(VOCAB_SIZE)
-
-        reference = score_fast(
-            model=model,
-            encoded_input=batch,
-            termination_token_id=EOS,
-            skip_first=PROMPT_LEN,
-        )["reward"]
-
-        out = MixedReferenceReward(sentence_validator=_ConstantScoreValidator(local_score)).score(
-            input_batch=batch,
-            prompt_length=PROMPT_LEN,
-            model=model,
-            tokenizer=_StubTokenizer(),
-            scaling_factor=0.0,
-        )
-
-        expected = reference + reference[:, -1].abs().unsqueeze(-1) * local_score
-        assert torch.allclose(out["reward"], expected, atol=1e-6)
-
-    def test_unknown_score_function_is_rejected(self, batch, constant_logits_model):
-        reward = MixedReferenceReward(sentence_validator=None, score_function="nonexistent")
-        with pytest.raises(ValueError):
-            reward.score(
-                input_batch=batch,
-                prompt_length=PROMPT_LEN,
-                model=constant_logits_model(VOCAB_SIZE),
-                tokenizer=_StubTokenizer(),
-            )
 
 
 class TestPrefixShapedReward:
