@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: smiles_opt
+  - model: llama3_smiles_opt
+  - callbacks: default
+  - logger: wandb # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
+  - trainer: default
+  - paths: default
+  - extras: default
+  - hydra: default
+
+  # experiment configs allow for version control of specific hyperparameters
+  # e.g. best hyperparameters for given model and datamodule
+  - experiment: null
+
+  # optional local config for machine/user specific settings
+  # it's optional since it doesn't need to exist and is excluded from version control
+  - optional local: default
+
+task_name: "eval"
+exp_name: "default"
+
+tags: ["dev"]
+
+# passing checkpoint path is necessary for evaluation
+ckpt_path: ???
+
+# number of repeated test runs (sampling) in a single invocation
+test_repeats: 1

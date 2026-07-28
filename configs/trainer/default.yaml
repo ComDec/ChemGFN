@@ -1,0 +1,21 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+default_root_dir: ${paths.output_dir}
+
+accelerator: gpu
+devices: 1
+
+strategy: auto
+
+# perform a validation loop every N training epochs
+check_val_every_n_epoch: 4
+
+# Deterministic kernels trade throughput for exact reproducibility beyond seeding.
+deterministic: false
+
+precision: bf16-true
+
+accumulate_grad_batches: 4
+
+num_sanity_val_steps: 0
+log_every_n_steps: 1

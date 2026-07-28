@@ -1,0 +1,8 @@
+# disable python warnings if they annoy you
+ignore_warnings: false
+
+# do not prompt for tags during runs
+enforce_tags: false
+
+# pretty print config tree at the start of the run using Rich library
+print_config: true

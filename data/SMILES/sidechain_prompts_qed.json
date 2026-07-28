@@ -1,0 +1,10 @@
+[{
+    "prompt": "Optimize the molecule by replacing the marked * with valid molecule fragments to improve the Drug-likeness (QED), making it easier to synthesis, you only need to generate the fragement in SMILES format: O=C1Nc2cc(*)ccc2N1",
+    "scaffold": "O=C1Nc2cc(*)ccc2N1"
+}
+,
+{
+    "prompt": "Optimize the molecule by replacing the marked * with valid molecule fragments to improve the Drug-likeness (QED), making it easier to synthesis, you only need to generate the fragement in SMILES format: O=C1Nc2cc(*)ccc2N1",
+    "scaffold": "O=C1Nc2cc(*)ccc2N1"
+}
+]

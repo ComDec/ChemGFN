@@ -1,0 +1,16 @@
+defaults:
+  - model_checkpoint
+  - model_summary
+  - _self_
+
+model_checkpoint:
+  dirpath: ${paths.output_dir}/checkpoints
+  filename: "epoch_{epoch:03d}_diversity_{val/diversity:.4f}"
+  every_n_epochs: 10
+  monitor: "val/diversity_valid"
+  save_last: true
+  auto_insert_metric_name: false
+  mode: "max"
+
+model_summary:
+  max_depth: 1

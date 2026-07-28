@@ -1,0 +1,23 @@
+# Conda environment for ChemGFN / RapTB.
+#
+# Conda provides the Python runtime and the binary packages that are painful to build from
+# source (PyTorch, RDKit). Everything else comes from pyproject.toml, which is the single
+# source of truth for dependencies:
+#
+#   conda env create -f environment.yaml
+#   conda activate chemgfn
+#   pip install -e .                # add ".[commongen]" for the CommonGen task
+
+name: chemgfn
+
+channels:
+  - pytorch
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pytorch=2.*
+  - rdkit
+  - pip>=23
+  - pip:
+      - -e .
