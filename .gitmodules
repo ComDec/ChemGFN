@@ -1,0 +1,4 @@
+[submodule "third_party/transformers-CFG"]
+	path = third_party/transformers-CFG
+	url = https://github.com/ComDec/transformers-CFG.git
+	branch = gflow

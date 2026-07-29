@@ -145,33 +145,11 @@ dmypy.json
 *.tar.gz
 *.ckpt
 
-# Lightning-Hydra-Template
-configs/local/default.yaml
+# Hydra / Lightning run artifacts
 /logs/
+/outputs/
+/multirun/
+configs/local/default.yaml
 
-# Large data files (exclude from repo)
-data/SMILES/buffer_smiles_test.pt
-.env
-
-# Aim logging
-.aim
-
-# results
-**/results/
-
-# archived
-**/archived/**
-
-*.slout
-*.slerr
-
-# temporary files
-configs/experiment/templates/*.backup.*
-notebooks/zinc15_250k.txt
-notebooks/ppo_expr24_eval.csv
-evaluation/**/*.json
-logs_s3/
-
-# External repos cloned into project dir
-Auto-claude-code-research-in-sleep/
-gfn-lm-tuning/
+# Paper source and archives (not part of the released code)
+*.zip

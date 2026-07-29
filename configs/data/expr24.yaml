@@ -3,11 +3,8 @@ tokenizer_name: ${model.tokenizer.pretrained_model_name_or_path}
 data_path: ${paths.data_dir}/24_points/prompts.txt
 train_size: 0.5
 num_workers: 0
-pin_memory: True
+pin_memory: true
 total_size: 100000
 prompt_size: 1
 n_samples: ${model.training_mixed_config.n_samples}
-allowed_vocab_path: ${model.constraint_config.legal_tokens}
 buffer_sample_path: ${paths.data_dir}/24_points/buffer_24_non_zero.pt
-add_prompt: False
-buffer_tokenization: False

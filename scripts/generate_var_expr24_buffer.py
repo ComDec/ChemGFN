@@ -1,11 +1,19 @@
 #!/usr/bin/env python
-"""
-Generate Expr24 solution buffer covering lengths 3, 5, 7, 9, and 11.
+"""Generate the Expr24 dataset buffer of exact solutions.
 
-The script enumerates all digit/operator combinations (no parentheses) that
-evaluate exactly to the target value (default 24) under standard precedence,
-tokenizes them with the specified tokenizer (default: meta-llama/Llama-3.2-1B),
-pads to the longest sequence with the EOS token, and saves a torch tensor.
+The script enumerates every digit/operator combination (no parentheses) that evaluates exactly
+to the target value (default 24) under standard precedence, tokenizes the resulting expressions
+with the specified tokenizer (default: meta-llama/Llama-3.2-1B), pads them to the longest
+sequence with the EOS token, and saves the result as a 2-D int64 tensor. Configs load that
+tensor through ``BufferDataModule(buffer_sample_path=...)``.
+
+The buffer shipped as ``data/24_points/buffer_24_len1to9_non_zero.pt`` (57904 x 9) is reproduced
+by restricting the enumeration to lengths up to 9::
+
+    python scripts/generate_var_expr24_buffer.py --lengths 3 5 7 9
+
+Note that the default ``--lengths`` also enumerates length 11, which yields a much larger buffer
+than any of the ones checked into ``data/24_points/``.
 """
 
 from __future__ import annotations
@@ -68,6 +76,7 @@ def eval_vectorized(digits_float: np.ndarray, ops: Sequence[str]) -> np.ndarray:
 
 
 def build_expression(nums: Sequence[int], ops: Sequence[str]) -> str:
+    """Render digits and operators as an infix expression string."""
     parts: list[str] = []
     for n, op in zip(nums[:-1], ops):
         parts.append(str(int(n)))
@@ -77,6 +86,7 @@ def build_expression(nums: Sequence[int], ops: Sequence[str]) -> str:
 
 
 def generate_digits(num_digits: int, include_zero: bool) -> np.ndarray:
+    """Return every ordered digit tuple of the requested length."""
     symbols = np.arange(0 if include_zero else 1, 10, dtype=np.int8)
     mesh = np.stack(np.meshgrid(*([symbols] * num_digits), indexing="ij"), axis=-1)
     return mesh.reshape(-1, num_digits)
@@ -111,6 +121,7 @@ def collect_expressions(
 
 
 def pad_and_stack(seqs: Iterable[Sequence[int]], pad_id: int) -> torch.Tensor:
+    """Right-pad token sequences with ``pad_id`` and stack them into a 2-D tensor."""
     seq_list = [list(seq) for seq in seqs]
     if not seq_list:
         return torch.empty((0, 0), dtype=torch.long)
@@ -122,12 +133,13 @@ def pad_and_stack(seqs: Iterable[Sequence[int]], pad_id: int) -> torch.Tensor:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse the command-line arguments."""
     parser = argparse.ArgumentParser(description="Generate Expr24 buffer for var lengths.")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/24_points/buffer_24_varlen_non_zero.pt"),
-        help="Where to save the padded token tensor.",
+        default=Path("data/24_points/buffer_24_len1to9_non_zero.pt"),
+        help="Where to save the padded token tensor. An existing file is overwritten.",
     )
     parser.add_argument(
         "--tokenizer",
@@ -163,6 +175,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Enumerate, tokenize and save the Expr24 solution buffer."""
     args = parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)

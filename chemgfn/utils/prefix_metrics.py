@@ -1,26 +1,36 @@
+"""Prefix-collapse metrics over sampled token sequences.
+
+These are the diagnostics reported in the paper's prefix-level metrics: prefix
+survival, prefix entropy ``PefEnt`` and its exponential ``Eff``, top-1 prefix
+mass ``Top1`` and the unique-prefix count, measured both per position and per
+prefix depth ``k``. Every quantity is also computed restricted to the sequences
+that are ultimately valid, which is the population the paper's definitions use.
+"""
+
 from __future__ import annotations
 
 import math
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
+from typing import Hashable, Iterable, Sequence
 
 Token = Hashable
 
 
-def _entropy_from_counter(c: Counter) -> float:
-    n = sum(c.values())
+def _entropy_from_counter(counts: Counter) -> float:
+    """Shannon entropy (natural log) of the empirical distribution in ``counts``."""
+    n = sum(counts.values())
     if n <= 0:
         return 0.0
     ent = 0.0
-    for v in c.values():
+    for v in counts.values():
         p = v / n
         ent -= p * math.log(p + 1e-12)
     return float(ent)
 
 
-def _to_bool_list(x) -> list[bool] | None:
-    """Accept list/bool-seq/torch.Tensor/np.array and convert to List[bool]."""
+def _to_bool_list(x: object) -> list[bool] | None:
+    """Convert a bool sequence, tensor or array to ``list[bool]``; ``None`` passes through."""
     if x is None:
         return None
     if hasattr(x, "tolist"):
@@ -30,6 +40,27 @@ def _to_bool_list(x) -> list[bool] | None:
 
 @dataclass
 class PrefixCollapseResult:
+    """Per-position prefix-collapse curves and their scalar summaries.
+
+    Attributes:
+        top1_mass: ``Top1`` at each position, over all survivors.
+        entropy: ``PefEnt`` at each position, over all survivors.
+        eff_support: ``Eff = exp(PefEnt)`` at each position.
+        unique: Number of distinct tokens observed at each position.
+        support: Number of surviving sequences at each position.
+        top1_auc: Mean of ``top1_mass`` over positions.
+        collapse_depth: Number of leading positions with ``top1_mass >= collapse_thr``.
+        collapse_thr: Threshold used to define ``collapse_depth``.
+        top1_mass_correct: ``top1_mass`` restricted to ultimately-valid sequences.
+        entropy_correct: ``entropy`` restricted to ultimately-valid sequences.
+        eff_support_correct: ``eff_support`` restricted to ultimately-valid sequences.
+        unique_correct: ``unique`` restricted to ultimately-valid sequences.
+        support_correct: Number of surviving valid sequences at each position.
+        top1_auc_correct: Mean of ``top1_mass_correct`` over supported positions.
+        collapse_depth_correct: ``collapse_depth`` restricted to valid sequences.
+        correct_frac: Fraction of survivors that are ultimately valid, per position.
+    """
+
     top1_mass: list[float]
     entropy: list[float]
     eff_support: list[float]
@@ -39,7 +70,6 @@ class PrefixCollapseResult:
     collapse_depth: int
     collapse_thr: float
 
-    # ---- NEW: only prefixes from ultimately-correct sequences (valid SMILES) ----
     top1_mass_correct: list[float] = field(default_factory=list)
     entropy_correct: list[float] = field(default_factory=list)
     eff_support_correct: list[float] = field(default_factory=list)
@@ -49,7 +79,6 @@ class PrefixCollapseResult:
     top1_auc_correct: float = 0.0
     collapse_depth_correct: int = 0
 
-    # optional: fraction of correct samples among active samples at each position
     correct_frac: list[float] = field(default_factory=list)
 
 
@@ -59,22 +88,22 @@ def prefix_collapse_by_position(
     *,
     max_T: int | None = None,
     collapse_thr: float = 0.95,
-    # NEW: invalid[i]=True means the whole sequence is invalid (final output is not a valid SMILES)
     invalid: Sequence[bool] | None = None,
 ) -> PrefixCollapseResult:
-    """
-    Compute prefix-collapse metrics per position t.
-    Additionally compute collapse metrics restricted to prefixes from sequences with (not invalid[i]).
+    """Compute prefix-collapse metrics at each token position.
 
     Args:
-      seqs: list of token sequences.
-      active_before: same shape as seqs, True if token at t is active (not past EOS).
-      max_T: optional cap on time steps.
-      collapse_thr: threshold for collapse_depth.
-      invalid: per-sample invalid flags from your validator. True => invalid SMILES.
+        seqs: Sampled token sequences.
+        active_before: Same shape as ``seqs``; ``True`` where the token at that
+            position is part of the trajectory (i.e. not past termination).
+        max_T: Optional cap on the number of positions to score.
+        collapse_thr: Top-1 mass above which a position counts as collapsed.
+        invalid: Per-sequence validity flags, ``True`` when the terminal state is
+            invalid. When given, the ``*_correct`` curves are also filled in.
 
     Returns:
-      PrefixCollapseResult with both all-samples curves and correct-only curves.
+        A :class:`PrefixCollapseResult` holding both the all-sample curves and,
+        if ``invalid`` was supplied, the valid-only curves.
     """
     if len(seqs) == 0:
         return PrefixCollapseResult([], [], [], [], [], 0.0, 0, float(collapse_thr))
@@ -118,7 +147,6 @@ def prefix_collapse_by_position(
             toks_all.append(tok)
 
             if want_correct:
-                # correct prefix <=> this sequence is ultimately valid SMILES <=> invalid[i] == False
                 if i < len(invalid) and (not invalid[i]):
                     toks_cor.append(tok)
 
@@ -153,13 +181,12 @@ def prefix_collapse_by_position(
                 eff_support_c.append(float(eff_cor))
                 unique_c.append(int(len(c_cor)))
             else:
-                # keep curve lengths aligned
+                # Pad so the valid-only curves stay aligned with the all-sample curves.
                 top1_mass_c.append(0.0)
                 entropy_c.append(0.0)
                 eff_support_c.append(0.0)
                 unique_c.append(0)
 
-    # scalar summaries (all)
     top1_auc = float(sum(top1_mass) / max(1, len(top1_mass)))
     depth = 0
     for x in top1_mass:
@@ -168,7 +195,7 @@ def prefix_collapse_by_position(
         else:
             break
 
-    # scalar summaries (correct-only): average over positions where support_correct > 0
+    # Valid-only summaries average over the positions that still have survivors.
     top1_auc_c = 0.0
     depth_c = 0
     if want_correct and len(top1_mass_c) > 0:
@@ -176,7 +203,6 @@ def prefix_collapse_by_position(
         if len(idx) > 0:
             top1_auc_c = float(sum(top1_mass_c[j] for j in idx) / len(idx))
 
-        # depth: consecutive from t=0 with support_correct>0 and top1>=thr
         for j, x in enumerate(top1_mass_c):
             if j < len(support_c) and support_c[j] > 0 and x >= collapse_thr:
                 depth_c += 1
@@ -208,17 +234,23 @@ def prefix_collapse_by_k(
     active_before: Sequence[Sequence[bool]] | None = None,
     *,
     k_list: Iterable[int] = (1, 2, 3, 4, 5, 6),
-    # NEW: invalid[i]=True means the whole sequence is invalid
     invalid: Sequence[bool] | None = None,
 ) -> dict[int, dict[str, float]]:
-    """
-    Compute collapse metrics over k-prefixes.
-    Additionally, compute correct-only collapse restricted to sequences with (not invalid[i]).
+    """Compute prefix-collapse metrics over whole length-``k`` prefixes.
 
-    Returns dict: k -> {
-      "n","unique","top1","top5","entropy","eff",
-      "n_correct","unique_correct","top1_correct","top5_correct","entropy_correct","eff_correct"
-    }
+    Args:
+        seqs: Sampled token sequences.
+        active_before: Same shape as ``seqs``; ``True`` where the token at that
+            position is part of the trajectory. A sequence contributes at depth
+            ``k`` only if all of its first ``k`` positions are active.
+        k_list: Prefix depths to score.
+        invalid: Per-sequence validity flags, ``True`` when the terminal state is
+            invalid. When given, the ``*_correct`` entries are also filled in.
+
+    Returns:
+        A mapping from ``k`` to a dict with keys ``n``, ``unique``, ``top1``,
+        ``top5``, ``entropy`` and ``eff``, plus their ``*_correct`` counterparts
+        when ``invalid`` was supplied.
     """
     invalid = _to_bool_list(invalid)
     want_correct = invalid is not None
@@ -255,7 +287,6 @@ def prefix_collapse_by_k(
                 if i < len(invalid) and (not invalid[i]):
                     prefixes_cor.append(pref)
 
-        # all
         n = len(prefixes_all)
         if n == 0:
             base = {"n": 0.0, "unique": 0.0, "top1": 0.0, "top5": 0.0, "entropy": 0.0, "eff": 0.0}
@@ -275,7 +306,6 @@ def prefix_collapse_by_k(
                 "eff": float(eff),
             }
 
-        # correct-only
         if want_correct:
             nc = len(prefixes_cor)
             if nc == 0:
