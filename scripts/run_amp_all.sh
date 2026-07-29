@@ -1,48 +1,48 @@
-#!/bin/bash
-# Launch 4 AMP experiments on GPU 4-7, one per GPU
-# TB (GPU4), SubTB (GPU5), RapTB (GPU6), RapTB+SubM (GPU7)
+#!/usr/bin/env bash
+#
+# Train the four AMP experiments reported in the paper (TB, SubTB, RapTB, RapTB+SubM), one job
+# per GPU. The trainer overrides below are the ones the reported AMP numbers were produced with.
+#
+# Environment variables:
+#   GPUS     (optional)  Space-separated CUDA device ids, one per experiment. Default: 0 1 2 3.
+#                        Fewer ids than experiments are reused round-robin, which will oversubscribe
+#                        the listed devices.
+#   LOG_DIR  (optional)  Directory for the nohup logs. Default: logs.
+#
+# Example:
+#   GPUS="4 5 6 7" bash scripts/run_amp_all.sh
 
-set -e
+set -euo pipefail
+
+read -r -a gpus <<< "${GPUS:-0 1 2 3}"
+LOG_DIR="${LOG_DIR:-logs}"
+mkdir -p "${LOG_DIR}"
 
 COMMON="trainer.max_steps=5000 trainer.limit_train_batches=500 trainer.limit_val_batches=50"
 
-echo "=== Launching AMP experiments on GPU 4-7 ==="
+experiments=(
+  "amp/tb"
+  "amp/subtb"
+  "amp/raptb"
+  "amp/raptb_subm"
+)
 
-# GPU 4: TB
-CUDA_VISIBLE_DEVICES=4 nohup python chemgfn/train.py \
-  experiment=AMP/AMP_cfg_TB \
-  $COMMON \
-  > logs/amp_tb.log 2>&1 &
-echo "TB       -> PID $! on GPU 4"
+echo "=== Launching ${#experiments[@]} AMP experiments ==="
 
-# GPU 5: SubTB
-CUDA_VISIBLE_DEVICES=5 nohup python chemgfn/train.py \
-  experiment=AMP/AMP_cfg_SubTB \
-  $COMMON \
-  > logs/amp_subtb.log 2>&1 &
-echo "SubTB    -> PID $! on GPU 5"
+idx=0
+for experiment in "${experiments[@]}"; do
+  log_name="${experiment//\//_}"
+  gpu="${gpus[$((idx % ${#gpus[@]}))]}"
 
-# GPU 6: RapTB
-CUDA_VISIBLE_DEVICES=6 nohup python chemgfn/train.py \
-  experiment=AMP/AMP_cfg_RapTB \
-  $COMMON \
-  > logs/amp_raptb.log 2>&1 &
-echo "RapTB    -> PID $! on GPU 6"
+  CUDA_VISIBLE_DEVICES="${gpu}" nohup python chemgfn/train.py \
+    experiment="${experiment}" \
+    ${COMMON} \
+    > "${LOG_DIR}/${log_name}.log" 2>&1 &
+  echo "${experiment} -> PID $! on CUDA ${gpu} (${LOG_DIR}/${log_name}.log)"
+  idx=$((idx + 1))
+done
 
-# GPU 7: RapTB+SubM
-CUDA_VISIBLE_DEVICES=7 nohup python chemgfn/train.py \
-  experiment=AMP/AMP_cfg_RapTB_SubM \
-  $COMMON \
-  > logs/amp_raptb_subm.log 2>&1 &
-echo "RapTB+SubM -> PID $! on GPU 7"
-
-echo ""
-echo "All 4 jobs launched. Monitor with:"
-echo "  tail -f logs/amp_tb.log"
-echo "  tail -f logs/amp_subtb.log"
-echo "  tail -f logs/amp_raptb.log"
-echo "  tail -f logs/amp_raptb_subm.log"
-echo ""
+echo
 echo "Validation metrics to watch:"
 echo "  val/topk_performance  (paper: Performance)"
 echo "  val/topk_diversity    (paper: Diversity)"

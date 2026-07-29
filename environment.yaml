@@ -1,56 +1,23 @@
-# reasons you might want to use `environment.yaml` instead of `requirements.txt`:
-# - pip installs packages in a loop, without ensuring dependencies across all packages
-#   are fulfilled simultaneously, but conda achieves proper dependency control across
-#   all packages
-# - conda allows for installing packages without requiring certain compilers or
-#   libraries to be available in the system, since it installs precompiled binaries
+# Conda environment for ChemGFN / RapTB.
+#
+# Conda provides the Python runtime and the binary packages that are painful to build from
+# source (PyTorch, RDKit). Everything else comes from pyproject.toml, which is the single
+# source of truth for dependencies:
+#
+#   conda env create -f environment.yaml
+#   conda activate chemgfn
+#   pip install -e .                # add ".[commongen]" for the CommonGen task
 
 name: chemgfn
 
 channels:
   - pytorch
   - conda-forge
-  - defaults
-
-# it is strongly recommended to specify versions of packages installed through conda
-# to avoid situation when version-unspecified packages install their latest major
-# versions which can sometimes break things
-
-# current approach below keeps the dependencies in the same major versions across all
-# users, but allows for different minor and patch versions of packages where backwards
-# compatibility is usually guaranteed
 
 dependencies:
   - python=3.10
   - pytorch=2.*
-  - torchvision=0.*
-  - lightning=2.*
-  - torchmetrics=0.*
-  - hydra-core=1.*
-  - numpy
-  - pandas
-  - matplotlib
   - rdkit
-  - rich=13.*
-  - pytest=7.*
-
-  # --------- loggers --------- #
-  # - wandb
-  # - neptune-client
-  # - mlflow
-  # - comet-ml
-  # - aim>=3.16.2 # no lower than 3.16.2, see https://github.com/aimhubio/aim/issues/2550
-
   - pip>=23
   - pip:
-      - hydra-colorlog
-      - rootutils
-      - editdistance
-      - partialsmiles
-      - peft
-      - sentence-transformers
-      - transformers
-      - transformers_cfg==0.2.6
-      - wandb
-      - polyleven
-      - protobuf
+      - -e .

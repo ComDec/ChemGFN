@@ -1,25 +1,89 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chemgfn"
+version = "1.0.0"
+description = "RapTB: dense prefix-level credit assignment for LLM GFlowNets (ICML 2026)"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { file = "LICENSE" }
+keywords = ["gflownet", "llm", "molecular-generation", "reinforcement-learning"]
+classifiers = [
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  "torch>=2.0",
+  "lightning>=2.0",
+  "transformers",
+  # transformers_cfg is deliberately NOT listed here. Grammar-constrained sampling needs the
+  # `gflow` fork, vendored as the third_party/transformers-CFG submodule; the PyPI package does
+  # not provide the incremental processor this code uses. Install it with:
+  #   pip install -e third_party/transformers-CFG
+  "peft",
+  "hydra-core==1.3.2",
+  "hydra-colorlog==1.2.0",
+  "omegaconf",
+  "rootutils",
+  "rich",
+  "wandb",
+  "numpy",
+  "pandas",
+  "rdkit",
+  "partialsmiles",
+  "polyleven",
+  "editdistance",
+]
+
+[project.optional-dependencies]
+# Needed only by the CommonGen task (configs/experiment/commongen/*).
+commongen = [
+  "datasets",
+  "spacy",
+  "nltk",
+  "bert-score",
+  "pycocoevalcap",
+  "sentence-transformers",
+]
+dev = [
+  "pytest",
+  "black==23.*",
+  "isort==5.*",
+  "flake8",
+  "pre-commit",
+]
+
+[project.urls]
+Homepage = "https://github.com/ComDec/ChemGFN"
+Paper = "https://icml.cc/virtual/2026/poster/65366"
+
+[tool.setuptools.packages.find]
+include = ["chemgfn*"]
+
+[tool.black]
+line-length = 99
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 99
+
 [tool.pytest.ini_options]
-addopts = [
-  "--color=yes",
-  "--durations=0",
-  "--strict-markers",
-  "--doctest-modules",
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = ["--color=yes", "-ra", "--strict-markers"]
+markers = [
+  "slow: long-running tests",
+  "gpu: requires a CUDA device",
+  "gated_model: requires access to a gated Hugging Face model",
+  "requires_model: downloads pretrained weights from the Hugging Face Hub",
 ]
 filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::UserWarning",
-]
-log_cli = "True"
-markers = [
-  "slow: slow tests",
-]
-minversion = "6.0"
-testpaths = "tests/"
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: nocover",
-    "raise NotImplementedError",
-    "raise NotImplementedError()",
-    "if __name__ == .__main__.:",
 ]

@@ -1,72 +1,103 @@
 #!/usr/bin/env bash
-# run all evals distributed across selected CUDA devices; keep going if one fails
+#
+# Evaluate every Expr24 experiment reported in the paper.
+#
+# No model weights ship with this repository, so this script cannot be run as-is: train the
+# experiments first with `python chemgfn/train.py experiment=<name>`, then point CKPT_ROOT at
+# the directory holding the resulting checkpoints.
+#
+# Expected layout (one directory per run, named after the experiment's `exp_name`, which is the
+# config path with `/` replaced by `_`):
+#
+#   ${CKPT_ROOT}/expr24_rp_tb/last.ckpt
+#   ${CKPT_ROOT}/expr24_rp_subtb/last.ckpt
+#   ...
+#
+# Environment variables:
+#   CKPT_ROOT  (required)  Directory containing one subdirectory per run.
+#   CKPT_NAME  (optional)  Checkpoint file inside each subdirectory. Default: last.ckpt.
+#   GPUS       (optional)  Space-separated CUDA device ids to spread jobs over. Default: 0.
+#
+# Example:
+#   CKPT_ROOT=/path/to/checkpoints GPUS="0 1 2 3" bash scripts/run_eval_expr24_all.sh
+#
+# The evaluation protocol (200 test batches, 3 independent sampling repeats) is fixed here
+# because it is the protocol the reported numbers use; do not change it when comparing to the
+# paper.
+
 set -uo pipefail
 
-readarray -t cmds <<'EOF'
-# baseline
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_TB_no_data_buffer_hit" exp_name="VarExpr24_TB" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_TB_hit24_dense/train/runs/2026-01-13_09-08-36/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_SubTB_no_data_buffer_hit" exp_name="VarExpr24_SubTB" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_SubTB_no_data_buffer_hit24_dense/train/runs/2026-01-13_09-08-56/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RapTB_kmin_7_to_3_mix_wo_dbuff_hit_tune" exp_name="VarExpr24_RapTB" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_v0/train/runs/2026-01-14_12-26-48/checkpoints/epoch_039_diversity_1.2109.ckpt" test_repeats=3
+: "${CKPT_ROOT:?Set CKPT_ROOT to the directory containing your trained checkpoints}"
+CKPT_NAME="${CKPT_NAME:-last.ckpt}"
+read -r -a gpus <<< "${GPUS:-0}"
 
-# SubM
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_TB_no_data_buffer_hit_subM_div_on_valid"  exp_name="VarExpr24_TB_SubM" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_TB_no_data_buffer_hit24_dense_subM/train/runs/2026-01-14_11-33-39/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_SubTB_no_data_buffer_hit_subM_div_on_valid"  exp_name="VarExpr24_SubTB_SubM" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_SubTB_no_data_buffer_hit24_dense_subM_div_on_valid/train/runs/2026-01-14_11-34-19/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RapTB_kmin_7_to_3_mix_wo_dbuff_hit_tune_subM_div_on_valid" exp_name="VarExpr24_RapTB_SubM" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_subM_div_on_valid_wo_len_ext_size/train/runs/2026-01-16_13-32-52/checkpoints/epoch_029_diversity_1.5169.ckpt" test_repeats=3
+experiments=(
+  # standard replay buffer
+  "expr24/rp_tb"
+  "expr24/rp_subtb"
+  "expr24/rp_raptb"
+  "expr24/rp_avgprefixtb"
+  "expr24/rp_rootsubtblogz"
 
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_TB_no_data_buffer_hit_subM_div_on_valid"  exp_name="VarExpr24_TB_SubM_ext_size" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_TB_no_data_buffer_hit24_dense_subM_ext_size/train/runs/2026-01-24_06-16-38/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_SubTB_no_data_buffer_hit_subM_div_on_valid"  exp_name="VarExpr24_SubTB_SubM_ext_size" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_SubTB_no_data_buffer_hit24_dense_subM_ext_size/train/runs/2026-01-24_06-16-57/checkpoints/last.ckpt" test_repeats=3
+  # + submodular replay buffer
+  "expr24/subm_tb"
+  "expr24/subm_subtb"
+  "expr24/subm_raptb"
 
+  # oracle dataset buffer
+  "expr24/oracle_tb"
+  "expr24/oracle_subtb"
+  "expr24/oracle_raptb"
+  "expr24/oracle_rootsubtblogz"
 
-# Oracle
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_TB_no_data_buffer_hit_oracle" exp_name="VarExpr24_TB_Oracle" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_TB_hit24_dense_oracle/train/runs/2026-01-13_09-11-34/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_SubTB_no_data_buffer_hit_oracle" exp_name="VarExpr24_SubTB_Oracle" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_SubTB_no_data_buffer_hit24_dense_oracle/train/runs/2026-01-13_09-11-55/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RapTB_kmin_7_to_3_mix_wo_dbuff_hit_tune_oracle" exp_name="VarExpr24_RapTB_Oracle" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_oracle/train/runs/2026-01-13_09-30-05/checkpoints/last.ckpt" test_repeats=3
+  # pretrained-reference (PRT) variants
+  "expr24/prt_tb"
+  "expr24/prt_subtb"
+  "expr24/prt_raptb"
+)
 
-
-# SubTB variants
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RootSubTBLogZ_no_data_buffer_hit_dense_oracle"  exp_name="VarExpr24_RootSubTBLogZ_Oracle" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RootSubTBLogZ_hit24_dense_oracle/train/runs/2026-01-15_12-28-26/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RootSubTBLogZ_no_data_buffer_hit_dense"  exp_name="VarExpr24_RootSubTBLogZ" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RootSubTBLogZ_hit24_dense/train/runs/2026-01-15_12-27-27/checkpoints/last.ckpt" test_repeats=3
-
-# PRT variants
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_TB_no_data_buffer_hit_PRT" exp_name="VarExpr24_TB_PRT" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_TB_hit24_dense_PRT/train/runs/2026-01-21_07-22-37/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_SubTB_no_data_buffer_hit_PRT" exp_name="VarExpr24_SubTB_PRT" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_SubTB_no_data_buffer_hit24_dense_PRT/train/runs/2026-01-21_07-22-42/checkpoints/last.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RapTB_kmin_7_to_3_mix_wo_dbuff_hit_tune_PRT" exp_name="VarExpr24_RapTB_PRT" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_v0_PRT/train/runs/2026-01-21_07-22-47/checkpoints/epoch_019_diversity_0.9058.ckpt" test_repeats=3
-python chemgfn/eval.py experiment="VarExpr24/VarExpr24_RapTB_kmin_7_to_3_mix_wo_dbuff_hit_tune_PRT" exp_name="VarExpr24_RapTB_PRT_last_ckpt" +trainer.limit_test_batches=200 ckpt_path="/data1/xw3763/project/gflow/ChemGFN/logs/train/VarExpr24_CFG_RapTB_kmin_7_to_3_mix_wo_dbuff_hit24_dense_tune_v0_PRT/train/runs/2026-01-21_07-22-47/checkpoints/last.ckpt" test_repeats=3
-
-EOF
-
-gpus=(0 1 2 3 4 5 6 7)
-per_batch=${#gpus[@]}
 pids=()
+failures=0
 idx=0
-failures=()
 
-launch_batch() {
+wait_for_batch() {
   for pid in "${pids[@]}"; do
-    if ! wait "$pid"; then
-      failures+=("$pid")
+    if ! wait "${pid}"; then
+      failures=$((failures + 1))
     fi
   done
   pids=()
 }
 
-for cmd in "${cmds[@]}"; do
-  # skip comments/blank lines from the here-doc
-  [[ -z "${cmd// }" || "${cmd}" == \#* ]] && continue
-  gpu=${gpus[$((idx % per_batch))]}
-  echo "Launching on CUDA ${gpu}: ${cmd}"
-  CUDA_VISIBLE_DEVICES="${gpu}" ${cmd} &
-  pids+=("$!")
-  ((idx++))
+for experiment in "${experiments[@]}"; do
+  exp_name="${experiment//\//_}"
+  ckpt="${CKPT_ROOT}/${exp_name}/${CKPT_NAME}"
 
-  if (( ${#pids[@]} >= per_batch )); then
-    launch_batch
+  if [[ ! -f "${ckpt}" ]]; then
+    echo "Skipping ${experiment}: no checkpoint at ${ckpt}"
+    continue
+  fi
+
+  gpu="${gpus[$((idx % ${#gpus[@]}))]}"
+  echo "Launching ${experiment} on CUDA ${gpu} with ${ckpt}"
+  CUDA_VISIBLE_DEVICES="${gpu}" python chemgfn/eval.py \
+    experiment="${experiment}" \
+    exp_name="${exp_name}" \
+    ckpt_path="${ckpt}" \
+    +trainer.limit_test_batches=200 \
+    test_repeats=3 &
+  pids+=("$!")
+  idx=$((idx + 1))
+
+  if (( ${#pids[@]} >= ${#gpus[@]} )); then
+    wait_for_batch
   fi
 done
 
-launch_batch
-if (( ${#failures[@]} )); then
-  echo "All evaluations finished with ${#failures[@]} failed job(s): ${failures[*]}"
-else
-  echo "All evaluations finished successfully."
+wait_for_batch
+
+if (( failures > 0 )); then
+  echo "All evaluations finished with ${failures} failed job(s)."
+  exit 1
 fi
+echo "All evaluations finished successfully."

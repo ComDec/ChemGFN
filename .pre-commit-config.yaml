@@ -17,6 +17,9 @@ repos:
       - id: check-case-conflict
       - id: check-added-large-files
         args: ["--maxkb", "5000"]
+        # data/ holds the task fixtures the experiments need, including the 20 MB
+        # AMP reward oracle from Jain et al. (2022).
+        exclude: ^data/
 
   # python code formatting
   - repo: https://github.com/psf/black
@@ -37,4 +40,4 @@ repos:
     rev: v3.3.1
     hooks:
       - id: pyupgrade
-        args: [--py38-plus]
+        args: [--py310-plus]

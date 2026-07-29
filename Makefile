@@ -23,8 +23,7 @@ help:
 
 # Installation
 install:
-	pip install -e .
-	pip install -r requirements.txt
+	pip install -e ".[dev]"
 
 install-hooks:
 	pip install pre-commit
@@ -33,11 +32,11 @@ install-hooks:
 
 # Code quality
 format:
-	black chemgfn tests scripts --line-length 100
+	black chemgfn tests scripts --line-length 99
 	isort chemgfn tests scripts --profile black
 
 lint:
-	flake8 chemgfn tests scripts --max-line-length 100
+	flake8 chemgfn tests scripts --max-line-length 99
 
 test:
 	pytest tests/ -v

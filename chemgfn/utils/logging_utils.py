@@ -1,4 +1,8 @@
-from typing import Any, Dict
+"""Hyperparameter logging for the training and evaluation entry points."""
+
+from __future__ import annotations
+
+from typing import Any
 
 from lightning_utilities.core.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
@@ -9,16 +13,12 @@ log = pylogger.RankedLogger(__name__, rank_zero_only=True)
 
 
 @rank_zero_only
-def log_hyperparameters(object_dict: Dict[str, Any]) -> None:
-    """Controls which config parts are saved by Lightning loggers.
+def log_hyperparameters(object_dict: dict[str, Any]) -> None:
+    """Send the resolved config and the model's parameter counts to every logger.
 
-    Additionally saves:
-        - Number of model parameters
-
-    :param object_dict: A dictionary containing the following objects:
-        - `"cfg"`: A DictConfig object containing the main config.
-        - `"model"`: The Lightning model.
-        - `"trainer"`: The Lightning trainer.
+    Args:
+        object_dict: Must contain ``"cfg"`` (the composed ``DictConfig``),
+            ``"model"`` (the ``LightningModule``) and ``"trainer"``.
     """
     hparams = {}
 
@@ -32,7 +32,6 @@ def log_hyperparameters(object_dict: Dict[str, Any]) -> None:
 
     hparams["model"] = cfg["model"]
 
-    # save number of model parameters
     hparams["model/params/total"] = sum(p.numel() for p in model.parameters())
     hparams["model/params/trainable"] = sum(
         p.numel() for p in model.parameters() if p.requires_grad
@@ -52,6 +51,5 @@ def log_hyperparameters(object_dict: Dict[str, Any]) -> None:
     hparams["ckpt_path"] = cfg.get("ckpt_path")
     hparams["seed"] = cfg.get("seed")
 
-    # send hparams to all loggers
     for logger in trainer.loggers:
         logger.log_hyperparams(hparams)

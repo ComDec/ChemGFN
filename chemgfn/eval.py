@@ -6,23 +6,9 @@ from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, open_dict
 
+# Adds the project root to PYTHONPATH and exports PROJECT_ROOT, which "configs/paths/default.yaml"
+# resolves paths against. See https://github.com/ashleve/rootutils.
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-# ------------------------------------------------------------------------------------ #
-# the setup_root above is equivalent to:
-# - adding project root dir to PYTHONPATH
-#       (so you don't need to force user to install project as a package)
-#       (necessary before importing any local modules e.g. `from src import utils`)
-# - setting up PROJECT_ROOT environment variable
-#       (which is used as a base for paths in "configs/paths/default.yaml")
-#       (this way all filepaths are the same no matter where you run the code)
-# - loading environment variables from ".env" in root dir
-#
-# you can remove it if you:
-# 1. either install project as a package or move entry files to project root dir
-# 2. set `root_dir` to "." in "configs/paths/default.yaml"
-#
-# more info: https://github.com/ashleve/rootutils
-# ------------------------------------------------------------------------------------ #
 
 from chemgfn.utils import (
     RankedLogger,
@@ -37,13 +23,17 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 @task_wrapper
 def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Evaluates given checkpoint on a datamodule testset.
+    """Sample from a trained checkpoint on the test split and report the task metrics.
 
-    This method is wrapped in optional @task_wrapper decorator, that controls the behavior during
-    failure. Useful for multiruns, saving info about the crash, etc.
+    ``test_repeats`` independent passes are run, each with its own trainer so that per-repeat
+    sample dumps land in separate directories; the model tags itself with a repeat suffix so
+    ``on_test_epoch_end`` can name its output files accordingly.
 
-    :param cfg: DictConfig configuration composed by Hydra.
-    :return: Tuple[dict, dict] with metrics and dict with all instantiated objects.
+    Args:
+        cfg: Hydra configuration composed from ``configs/eval.yaml``.
+
+    Returns:
+        The callback metrics of the final repeat and a dict of every instantiated object.
     """
     assert cfg.ckpt_path
 
@@ -71,12 +61,12 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
 
-    repeats = int(getattr(cfg, "test_repeats", 1))
+    repeats = int(cfg.get("test_repeats", 1))
     log.info(f"Starting testing for {repeats} repeat(s)!")
 
+    rep_trainer = trainer
     for rep in range(repeats):
-        # Create a fresh trainer each repeat to isolate default_root_dir outputs.
-        rep_trainer: Trainer = hydra.utils.instantiate(
+        rep_trainer = hydra.utils.instantiate(
             cfg.trainer,
             logger=logger,
             default_root_dir=f"{cfg.trainer.default_root_dir}/repeat_{rep}"
@@ -85,34 +75,28 @@ def evaluate(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         )
         object_dict["trainer"] = rep_trainer
 
-        # Tag the model with repeat suffix so on_test_epoch_end can suffix files.
-        if hasattr(model, "__setattr__"):
-            model.test_repeat_suffix = f"_run{rep}" if repeats > 1 else ""
+        model.test_repeat_suffix = f"_run{rep}" if repeats > 1 else ""
 
         log.info(f"Testing repeat {rep + 1}/{repeats}")
         rep_trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
 
-    # for predictions use trainer.predict(...)
-    # predictions = trainer.predict(model=model, dataloaders=dataloaders, ckpt_path=cfg.ckpt_path)
-
-    metric_dict = rep_trainer.callback_metrics
-
-    return metric_dict, object_dict
+    return dict(rep_trainer.callback_metrics), object_dict
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="eval.yaml")
 def main(cfg: DictConfig) -> None:
-    """Main entry point for evaluation.
+    """Entry point for evaluation.
 
-    :param cfg: DictConfig configuration composed by Hydra.
+    Args:
+        cfg: Hydra configuration composed from ``configs/eval.yaml``.
     """
-    # allow mutating the hydra config to append an eval suffix
     with open_dict(cfg):
         cfg.exp_name = f"{cfg.exp_name}_eval"
-        cfg.logger.wandb.project = "ChemGFN_eval"
+        wandb_project = cfg.get("wandb_project")
+        if wandb_project is not None and cfg.get("logger") is not None:
+            if "wandb" in cfg.logger:
+                cfg.logger.wandb.project = wandb_project
 
-    # apply extra utilities
-    # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
     evaluate(cfg)
 

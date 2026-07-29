@@ -5,10 +5,7 @@ buffer_sample_path: null
 scaffold_list: null
 train_size: 0.95
 num_workers: 0
-pin_memory: True
+pin_memory: true
 total_size: 10000
 prompt_size: 1
-add_prompt: False
-allowed_vocab_path: ${model.constraint_config.legal_tokens}
 n_samples: ${model.training_mixed_config.n_samples}
-buffer_tokenization: False

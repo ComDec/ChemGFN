@@ -1,4 +1,0 @@
-root  ::= expr4
-expr4 ::= num op num op num op num
-op    ::= "+" | "-" | "*" | "/"
-num   ::= [0-9]
