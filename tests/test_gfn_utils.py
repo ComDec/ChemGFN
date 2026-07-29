@@ -15,6 +15,7 @@ from chemgfn.utils.gfn_utils import (
     get_termination_vals,
     lora_to_base,
     prepare_token_mask,
+    prepare_token_mask_from_illegal,
 )
 
 EOS = 0
@@ -319,3 +320,31 @@ class TestGenerateAndReturnTerminationLogprob:
         batch_size, prompt_len = encoded_data["encoded_prompt"].shape
         assert seen["shape"] == (batch_size, prompt_len + max_len)
         assert seen["scaffold"] == "O=C1Nc2cc(*)ccc2N1"
+
+
+class TestPrepareTokenMaskFromIllegal:
+    """Open-vocabulary masking, used by CommonGen (``legal_tokens: null``)."""
+
+    def test_only_named_tokens_are_masked(self, gpt2_tokenizer):
+        illegal = ["the", "and"]
+        legal_mask, illegal_mask, legal_ids = prepare_token_mask_from_illegal(
+            gpt2_tokenizer, illegal
+        )
+
+        assert legal_ids is None, "open-vocabulary mode has no explicit legal-id list"
+        assert legal_mask.shape == illegal_mask.shape == (len(gpt2_tokenizer),)
+        assert torch.equal(legal_mask, ~illegal_mask)
+
+        expected = [gpt2_tokenizer.encode(t, add_special_tokens=False)[0] for t in illegal]
+        assert illegal_mask.sum().item() == len(expected)
+        for token_id in expected:
+            assert illegal_mask[token_id]
+            assert not legal_mask[token_id]
+
+    def test_rest_of_vocabulary_stays_legal(self, gpt2_tokenizer):
+        legal_mask, _, _ = prepare_token_mask_from_illegal(gpt2_tokenizer, ["the"])
+        assert legal_mask.sum().item() == len(gpt2_tokenizer) - 1
+
+    def test_multi_piece_tokens_are_rejected(self, gpt2_tokenizer):
+        with pytest.raises(ValueError, match="single token id"):
+            prepare_token_mask_from_illegal(gpt2_tokenizer, ["不可能存在"])

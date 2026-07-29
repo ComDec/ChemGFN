@@ -54,7 +54,7 @@ constraint_config:
   grammar_path: ${paths.assets_dir}/SMILES_grammars/generic.ebnf
   processor_type: "prefix"
   legal_tokens: ${paths.assets_dir}/token_list/SMILES/allowed_llama3.2_1B_allowed_token
-  parse_mode: "full"
+  parse_mode: "limited"
 
 training_mixed_config:
   pf_temp_high: 2.0

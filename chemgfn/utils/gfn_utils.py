@@ -6,6 +6,7 @@ log-probabilities that the trajectory-balance objectives consume, and scores the
 sequences with a reward module.
 """
 
+from collections.abc import Sequence
 from typing import Any, Callable, Optional
 
 import torch
@@ -62,6 +63,44 @@ def prepare_token_mask(
     illegal_token_mask = ~legal_token_mask
 
     return legal_token_mask, illegal_token_mask, legal_token_ids
+
+
+def prepare_token_mask_from_illegal(
+    tokenizer: PreTrainedTokenizer, illegal_tokens: Sequence[str]
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """Build boolean vocabulary masks by excluding tokens from the full vocabulary.
+
+    Open-vocabulary tasks such as CommonGen cannot enumerate their legal tokens, so they name the
+    few tokens to suppress instead. Only tokens that encode to a single id can be masked; anything
+    that tokenizes into multiple pieces has no single vocabulary entry to switch off.
+
+    Args:
+        tokenizer: Tokenizer used for generation.
+        illegal_tokens: Token strings to forbid.
+
+    Returns:
+        Tuple of ``(legal_token_mask, illegal_token_mask, None)``. The third element is ``None``
+        because this mode has no explicit legal-id list.
+
+    Raises:
+        ValueError: If none of ``illegal_tokens`` maps to a single vocabulary entry.
+    """
+    illegal_ids: list[int] = []
+    for token in illegal_tokens:
+        ids = tokenizer.encode(str(token), add_special_tokens=False)
+        if len(ids) == 1:
+            illegal_ids.append(int(ids[0]))
+
+    if not illegal_ids:
+        raise ValueError(
+            f"None of the configured illegal tokens {list(illegal_tokens)!r} maps to a single "
+            "token id for this tokenizer, so no vocabulary entry can be masked."
+        )
+
+    illegal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
+    illegal_token_mask[illegal_ids] = True
+
+    return ~illegal_token_mask, illegal_token_mask, None
 
 
 def calculate_diversity(token_id_list: torch.Tensor) -> float:

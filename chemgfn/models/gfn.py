@@ -34,6 +34,7 @@ from chemgfn.utils.gfn_utils import (
     generate_and_return_termination_logprob,
     get_termination_vals,
     prepare_token_mask,
+    prepare_token_mask_from_illegal,
 )
 from chemgfn.utils.prefix_metrics import (
     PrefixCollapseResult,
@@ -1110,20 +1111,30 @@ class ChemGFNModule(LightningModule):
     # Setup helpers
     # --------------------------------------------------------------------- #
 
-    def _load_token_masks(self) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-        """Load the legal-token list and build the legal/illegal vocabulary masks."""
+    def _load_token_masks(self) -> tuple[torch.Tensor, torch.Tensor, list[int] | None]:
+        """Build the legal/illegal vocabulary masks for this task.
+
+        Closed-vocabulary tasks (SMILES, Expr24, AMP) enumerate their legal tokens in a file named
+        by ``constraint_config.legal_tokens``. Open-vocabulary tasks (CommonGen) leave that null
+        and instead name the few tokens to suppress in ``constraint_config.illegal_tokens``.
+        """
         tokens_path = getattr(self.constraint_config, "legal_tokens", None)
-        if not tokens_path:
-            raise ValueError(
-                "constraint_config.legal_tokens is required: it must point to the file listing "
-                "the tokens this task is allowed to emit."
-            )
-        if not os.path.exists(tokens_path):
-            raise FileNotFoundError(
-                f"Legal token list not found at {tokens_path!r}. Set "
-                "constraint_config.legal_tokens to an existing token list (see assets/token_list)."
-            )
-        return prepare_token_mask(self.tokenizer, tokens_path)
+        if tokens_path:
+            if not os.path.exists(tokens_path):
+                raise FileNotFoundError(
+                    f"Legal token list not found at {tokens_path!r}. Point "
+                    "constraint_config.legal_tokens at an existing file (see assets/token_list)."
+                )
+            return prepare_token_mask(self.tokenizer, tokens_path)
+
+        illegal_tokens = getattr(self.constraint_config, "illegal_tokens", None)
+        if illegal_tokens:
+            return prepare_token_mask_from_illegal(self.tokenizer, illegal_tokens)
+
+        raise ValueError(
+            "constraint_config needs either legal_tokens (a file listing the tokens this task may "
+            "emit) or illegal_tokens (token strings to suppress); both are unset."
+        )
 
     def _build_grammar_processor(self) -> GrammarIncrementalLogitsProcessorGeneral:
         """Build the incremental grammar-constrained logits processor for this task."""
