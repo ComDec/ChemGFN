@@ -154,6 +154,15 @@ python chemgfn/train.py experiment=smiles/raptb_subm trainer.max_steps=2000 seed
 **No trained checkpoints are released** — reproducing a number means retraining from its config.
 Each config carries a header comment naming the exact table and row it produces.
 
+> [!IMPORTANT]
+> **Checkpoints from before this release will not load.** Preparing this repository involved
+> extensive renaming of classes, modules and config keys, so any checkpoint trained against the
+> earlier code is incompatible. Retrain from the config.
+>
+> **If you cannot reproduce a reported number, please tell us** — open an
+> [issue](https://github.com/ComDec/ChemGFN/issues) with the config you ran, your environment, and
+> what you got. We would rather hear about it than not.
+
 | Config | Reproduces |
 |:--|:--|
 | `smiles/{tb,subtb,raptb,raptb_subm}` | Table 1 — SMILES, `L_max = 10` |
