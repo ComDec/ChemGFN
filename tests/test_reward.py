@@ -1,660 +1,349 @@
-"""Unit tests for chemgfn/models/reward.py
+"""Tests for the reward models in ``chemgfn.models.reward``."""
 
-Tests reward computation, validators, and scoring functions including:
-- Score computation (score_fast)
-- Sentence validators
-- Reward model classes
-- Invalid penalty application
-"""
-
-from unittest.mock import MagicMock, Mock, patch
+from __future__ import annotations
 
 import pytest
 import torch
-from transformers import GPT2Tokenizer
 
 from chemgfn.models.reward import (
-    FrozenModelSentenceGivenPrompt,
-    Reference_Target_Score_Positive_Mixed_Invalid_Mask,
-    SentenceValidator,
-    _apply_invalid_penalty,
-    _build_penalty_ramp,
-    _decode_tokens_to_string,
-    _ensure_tensor_like,
-    _stack_if_not_empty,
+    AbsorbingPrefixReward,
+    PrefixShapedReward,
+    compute_active_before,
     score_fast,
-    use_base_model,
 )
 
-# ============================================================================
-# Test Utility Functions
-# ============================================================================
+REWARD_CLASSES = [PrefixShapedReward, AbsorbingPrefixReward]
+
+EOS = 0
+VOCAB_SIZE = 12
+PROMPT_LEN = 3
 
 
-class TestUtilityFunctions:
-    """Test utility functions in reward module."""
+class _StubTokenizer:
+    """Minimal tokenizer surface used by the reward models."""
 
-    def test_ensure_tensor_like_with_tensor(self):
-        """Test _ensure_tensor_like with tensor input."""
-        value = torch.tensor([1.0, 2.0, 3.0])
-        reference = torch.zeros(3)
-
-        result = _ensure_tensor_like(value, reference)
-
-        assert torch.equal(result, value)
-
-    def test_ensure_tensor_like_with_scalar(self):
-        """Test _ensure_tensor_like with scalar input."""
-        value = 5.0
-        reference = torch.zeros(3)
-
-        result = _ensure_tensor_like(value, reference)
-
-        assert result.shape == (3,)
-        assert torch.all(result == 5.0)
-
-    def test_build_penalty_ramp(self):
-        """Test penalty ramp building."""
-        base_values = torch.tensor([1.0, 2.0])
-        steps = 5
-        start_ratio = 0.5
-        end_ratio = 1.5
-        reference = torch.zeros(2, steps)
-
-        ramp = _build_penalty_ramp(base_values, steps, start_ratio, end_ratio, reference)
-
-        assert ramp.shape == (2, steps)
-        # First column should be base_values * start_ratio
-        assert torch.allclose(ramp[:, 0], base_values * start_ratio)
-        # Last column should be base_values * end_ratio
-        assert torch.allclose(ramp[:, -1], base_values * end_ratio)
-
-    def test_apply_invalid_penalty(self):
-        """Test invalid penalty application."""
-        batch_size = 4
-        seq_len = 5
-
-        reward = torch.randn(batch_size, seq_len) + 10  # Positive rewards
-        invalid_mask = torch.zeros(batch_size, seq_len)
-        invalid_mask[:, 3:] = 1  # Mark last 2 positions as invalid
-
-        start_ratio = 0.2
-        end_ratio = 1.2
-
-        penalized = _apply_invalid_penalty(reward, invalid_mask, start_ratio, end_ratio)
-
-        assert penalized.shape == reward.shape
-        # Invalid positions should have lower rewards
-        assert (penalized[:, 3:] <= reward[:, 3:]).all()
-
-    def test_stack_if_not_empty(self):
-        """Test stacking tensors if list is not empty."""
-        tensors = [torch.randn(2, 3) for _ in range(4)]
-
-        result = _stack_if_not_empty(tensors)
-
-        assert result.shape == (4, 2, 3)
-
-    def test_stack_if_not_empty_with_empty_list(self):
-        """Test stacking with empty list."""
-        tensors = []
-
-        result = _stack_if_not_empty(tensors)
-
-        assert result is None
-
-    def test_decode_tokens_to_string(self):
-        """Test token decoding to string."""
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-        # Create a simple sequence
-        sequence = torch.tensor([464, 2068, 318])  # "The world is"
-
-        result = _decode_tokens_to_string(sequence, tokenizer)
-
-        assert isinstance(result, str)
-        assert len(result) > 0
-
-    def test_decode_tokens_with_eos(self):
-        """Test token decoding stops at EOS."""
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-        sequence = torch.tensor([464, 2068, tokenizer.eos_token_id, 318])
-
-        result = _decode_tokens_to_string(sequence, tokenizer)
-
-        # Should stop at EOS, not include token 318
-        assert isinstance(result, str)
+    eos_token_id = EOS
 
 
-# ============================================================================
-# Test Score Fast Function
-# ============================================================================
+class _ConstantScoreValidator:
+    """Validator returning a fixed per-state local score."""
+
+    def __init__(self, local_score: torch.Tensor) -> None:
+        self.local_score = local_score
+        self.calls: list[tuple] = []
+
+    def __call__(self, sentences, tokenizer, scaffold=None, *args, **kwargs):
+        self.calls.append((sentences, scaffold))
+        batch_size = sentences.shape[0]
+        return {
+            "local_score": self.local_score,
+            "global_score": self.local_score[:, -1],
+            "invalid": torch.zeros_like(self.local_score),
+            "full_tokens": ["stub"] * batch_size,
+        }
+
+
+@pytest.fixture
+def batch():
+    """Prompt-plus-generation token ids that terminate two tokens into the generation."""
+    tokens = torch.full((2, PROMPT_LEN + 4), 5, dtype=torch.long)
+    tokens[:, PROMPT_LEN + 2 :] = EOS
+    return tokens
+
+
+class TestComputeActiveBefore:
+    """Mask of states still on-trajectory before each action."""
+
+    def test_positions_after_the_first_eos_are_inactive(self):
+        gen_tokens = torch.tensor([[EOS, 5, 6, EOS], [1, 3, 4, 5]])
+        active = compute_active_before(gen_tokens, eos=EOS)
+
+        assert active.shape == gen_tokens.shape
+        assert active[0].tolist() == [True, False, False, False]
+        assert active[1].tolist() == [True, True, True, True]
+
+    def test_the_first_position_is_always_active(self):
+        gen_tokens = torch.full((3, 5), EOS)
+        assert compute_active_before(gen_tokens, eos=EOS)[:, 0].all()
+
+    def test_single_step_trajectories(self):
+        gen_tokens = torch.tensor([[EOS], [7]])
+        assert compute_active_before(gen_tokens, eos=EOS).tolist() == [[True], [True]]
 
 
 class TestScoreFast:
-    """Test the score_fast function for reward computation."""
+    """Reference prior computed under the frozen model."""
 
-    @pytest.fixture
-    def mock_model(self):
-        """Create a mock model."""
-        model = Mock()
-
-        def forward(*args, **kwargs):
-            input_ids = args[0] if args else kwargs.get("input_ids")
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-            # Use GPT2 vocab_size (50257) to match tokenizer
-            vocab_size = 50257
-
-            output = Mock()
-            output.logits = torch.randn(batch_size, seq_len, vocab_size)
-            return output
-
-        model.side_effect = forward
-        model.__call__ = forward
-        return model
-
-    def test_score_fast_basic(self, mock_model):
-        """Test basic score computation."""
-        batch_size = 4
-        seq_len = 10
-        skip_first = 3
-        termination_token_id = 0
-
-        encoded_input = torch.randint(1, 100, (batch_size, seq_len))
-
-        reward, reward_unpenalized = score_fast(
-            model=mock_model,
-            encoded_input=encoded_input,
-            termination_token_id=termination_token_id,
-            skip_first=skip_first,
+    def test_output_shapes(self, batch, constant_logits_model):
+        out = score_fast(
+            model=constant_logits_model(VOCAB_SIZE),
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
         )
 
-        assert reward.shape[0] == batch_size
-        assert reward_unpenalized.shape[0] == batch_size
-        assert not torch.isnan(reward).any()
-        assert not torch.isnan(reward_unpenalized).any()
+        num_generated = batch.shape[1] - PROMPT_LEN
+        assert out["ref_log_pf"].shape == (batch.shape[0], num_generated)
+        assert out["ref_log_pterm"].shape == (batch.shape[0], num_generated + 1)
+        assert out["reward"].shape == (batch.shape[0], num_generated + 1)
 
-    def test_score_fast_with_invalid_mask(self, mock_model):
-        """Test score computation with vocabulary mask."""
-        batch_size = 4
-        seq_len = 10
-        skip_first = 3
-        termination_token_id = 0
-        vocab_size = 50257  # GPT2 vocab_size
-
-        encoded_input = torch.randint(1, vocab_size, (batch_size, seq_len))
-        invalid_mask = torch.zeros(vocab_size, dtype=torch.bool)
-        invalid_mask[50:60] = True  # Mark tokens 50-59 as invalid
-
-        reward, _ = score_fast(
-            model=mock_model,
-            encoded_input=encoded_input,
-            termination_token_id=termination_token_id,
-            skip_first=skip_first,
-            invalid_vocab_mask=invalid_mask,
-            illegal_vocab_penalty=-50,
+    def test_reference_log_probabilities_are_non_positive(self, batch, constant_logits_model):
+        out = score_fast(
+            model=constant_logits_model(VOCAB_SIZE),
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
         )
 
-        assert not torch.isnan(reward).any()
+        assert (out["ref_log_pf"] <= 0).all()
+        assert (out["ref_log_pterm"] <= 0).all()
 
-    def test_score_fast_with_temperature(self, mock_model):
-        """Test score computation with different temperatures."""
-        batch_size = 4
-        seq_len = 10
-        skip_first = 3
-        termination_token_id = 0
+    def test_states_past_termination_carry_no_reward(self, batch, constant_logits_model):
+        out = score_fast(
+            model=constant_logits_model(VOCAB_SIZE),
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+        )
 
-        encoded_input = torch.randint(1, 100, (batch_size, seq_len))
+        # The batch terminates at generated position 2, so states 3 and 4 are past termination.
+        assert (out["reward"][:, 3:] == 0.0).all()
+        assert (out["reward"][:, :3] != 0.0).all()
 
-        reward_temp1, _ = score_fast(
-            model=mock_model,
-            encoded_input=encoded_input,
-            termination_token_id=termination_token_id,
-            skip_first=skip_first,
+    def test_forbidden_tokens_are_penalised(self, batch, constant_logits_model):
+        model = constant_logits_model(VOCAB_SIZE)
+        invalid = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
+        invalid[5] = True
+
+        baseline = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+        )
+        masked = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+            invalid_vocab_mask=invalid,
+            illegal_vocab_penalty=-50.0,
+        )
+
+        emitted_the_masked_token = batch[:, PROMPT_LEN:] == 5
+        assert emitted_the_masked_token.any()
+        assert (
+            masked["ref_log_pf"][emitted_the_masked_token]
+            < baseline["ref_log_pf"][emitted_the_masked_token]
+        ).all()
+        # EOS was left alone, so its share of the distribution can only grow.
+        assert (masked["ref_log_pterm"] > baseline["ref_log_pterm"]).all()
+
+    def test_temperature_flattens_the_prior(self, batch, constant_logits_model):
+        model = constant_logits_model(VOCAB_SIZE)
+        cold = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
             reward_temperature=1.0,
         )
-
-        reward_temp2, _ = score_fast(
-            model=mock_model,
-            encoded_input=encoded_input,
-            termination_token_id=termination_token_id,
-            skip_first=skip_first,
-            reward_temperature=2.0,
+        hot = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+            reward_temperature=5.0,
         )
 
-        # Different temperatures should give different rewards
-        assert not torch.allclose(reward_temp1, reward_temp2)
+        assert not torch.allclose(cold["reward"], hot["reward"])
 
-    def test_score_fast_with_agree_list(self, mock_model):
-        """Test score computation with agreement list."""
-        batch_size = 4
-        seq_len = 10
-        skip_first = 3
-        termination_token_id = 0
-        vocab_size = 50257  # GPT2 vocab_size
 
-        encoded_input = torch.randint(1, vocab_size, (batch_size, seq_len))
+@pytest.mark.parametrize("reward_cls", REWARD_CLASSES)
+class TestRewardContract:
+    """Behaviour shared by every reward model."""
 
-        # Create agreement list (grammar constraints)
-        agree_list = [
-            torch.ones(batch_size, vocab_size, dtype=torch.bool)
-            for _ in range(seq_len - skip_first + 1)
-        ]
-
-        reward, _ = score_fast(
-            model=mock_model,
-            encoded_input=encoded_input,
-            termination_token_id=termination_token_id,
-            skip_first=skip_first,
-            agree_list=agree_list,
+    def test_reference_only_reward_matches_the_prior(
+        self, reward_cls, batch, constant_logits_model
+    ):
+        model = constant_logits_model(VOCAB_SIZE)
+        out = reward_cls(sentence_validator=None).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=model,
+            tokenizer=_StubTokenizer(),
         )
 
-        assert not torch.isnan(reward).any()
+        reference = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+            illegal_vocab_penalty=reward_cls(sentence_validator=None).illegal_vocab_penalty,
+        )["reward"]
 
+        scale = 0.5
+        assert torch.allclose(out["reward"], reference * scale, atol=1e-6)
+        assert out["validator_dict"] is None
 
-# ============================================================================
-# Test Sentence Validator Base Class
-# ============================================================================
-
-
-class TestSentenceValidator:
-    """Test base sentence validator."""
-
-    def test_sentence_validator_init(self):
-        """Test validator initialization."""
-        validator = SentenceValidator(termination_token_id=0)
-
-        assert validator.termination_token_id == 0
-
-    def test_sentence_validator_call_not_implemented(self):
-        """Test that base class __call__ is not implemented."""
-        validator = SentenceValidator(termination_token_id=0)
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-
-        sentences = torch.randint(1, 100, (4, 10))
-
-        # Base class should not implement validation
-        # This might raise NotImplementedError or return basic result
-        try:
-            result = validator(sentences, tokenizer)
-            # If it doesn't raise, it should return a dict
-            assert isinstance(result, dict)
-        except (NotImplementedError, AttributeError):
-            # Expected if not implemented
-            pass
-
-
-# ============================================================================
-# Test Frozen Model Sentence Given Prompt
-# ============================================================================
-
-
-class TestFrozenModelSentenceGivenPrompt:
-    """Test FrozenModelSentenceGivenPrompt reward model."""
-
-    @pytest.fixture
-    def mock_model(self):
-        """Create a mock model."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-        model.eval = Mock()
-        model.train = Mock()
-
-        def forward(*args, **kwargs):
-            input_ids = args[0] if args else kwargs.get("input_ids")
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-            # Use GPT2 vocab_size (50257) to match tokenizer
-            vocab_size = 50257
-
-            output = Mock()
-            output.logits = torch.randn(batch_size, seq_len, vocab_size)
-            return output
-
-        model.side_effect = forward
-        model.__call__ = forward
-        return model
-
-    @pytest.fixture
-    def tokenizer(self):
-        """Create a tokenizer."""
-        return GPT2Tokenizer.from_pretrained("gpt2")
-
-    def test_reward_model_init(self):
-        """Test reward model initialization."""
-        reward_model = FrozenModelSentenceGivenPrompt(
-            sentence_validator=None,
+    def test_output_keys(self, reward_cls, batch, constant_logits_model):
+        out = reward_cls(sentence_validator=None).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=constant_logits_model(VOCAB_SIZE),
+            tokenizer=_StubTokenizer(),
         )
 
-        assert reward_model.sentence_validator is None
+        for key in ("reward", "reward_unpenalized", "log_pf_ref", "log_pterm_ref"):
+            assert key in out
 
-    def test_reward_model_score(self, mock_model, tokenizer):
-        """Test reward scoring."""
-        reward_model = FrozenModelSentenceGivenPrompt(
-            sentence_validator=None,
+    def test_reward_shape_matches_the_number_of_states(
+        self, reward_cls, batch, constant_logits_model
+    ):
+        num_states = batch.shape[1] - PROMPT_LEN + 1
+        validator = _ConstantScoreValidator(torch.zeros(batch.shape[0], num_states))
+
+        out = reward_cls(sentence_validator=validator).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=constant_logits_model(VOCAB_SIZE),
+            tokenizer=_StubTokenizer(),
         )
 
-        batch_size = 4
-        seq_len = 10
-        prompt_length = 3
+        assert out["reward"].shape == (batch.shape[0], num_states)
+        assert torch.isfinite(out["reward"]).all()
 
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
+    def test_validator_sees_the_generation_and_the_scaffold(
+        self, reward_cls, batch, constant_logits_model
+    ):
+        num_states = batch.shape[1] - PROMPT_LEN + 1
+        validator = _ConstantScoreValidator(torch.zeros(batch.shape[0], num_states))
 
-        reward, reward_unpen = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
+        reward_cls(sentence_validator=validator).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=constant_logits_model(VOCAB_SIZE),
+            tokenizer=_StubTokenizer(),
+            scaffold="O=C1Nc2cc(*)ccc2N1",
         )
 
-        assert reward.shape[0] == batch_size
-        assert reward_unpen.shape[0] == batch_size
+        sentences, scaffold = validator.calls[0]
+        assert torch.equal(sentences, batch[:, PROMPT_LEN:])
+        assert scaffold == "O=C1Nc2cc(*)ccc2N1"
 
-    def test_reward_model_with_validator(self, mock_model, tokenizer):
-        """Test reward scoring with validator."""
-        # Mock validator
-        mock_validator = Mock()
-        mock_validator.return_value = {"invalid": torch.zeros(4, 7, dtype=torch.bool)}
+    def test_scaling_factor_scales_the_task_score(self, reward_cls, batch, constant_logits_model):
+        num_states = batch.shape[1] - PROMPT_LEN + 1
+        local_score = torch.ones(batch.shape[0], num_states)
+        model = constant_logits_model(VOCAB_SIZE)
 
-        reward_model = FrozenModelSentenceGivenPrompt(
-            sentence_validator=mock_validator,
+        def score_with(scaling_factor):
+            return reward_cls(
+                sentence_validator=_ConstantScoreValidator(local_score.clone())
+            ).score(
+                input_batch=batch,
+                prompt_length=PROMPT_LEN,
+                model=model,
+                tokenizer=_StubTokenizer(),
+                scaling_factor=scaling_factor,
+            )[
+                "reward"
+            ]
+
+        # A unit increase in the scaling factor adds the task score once, at every state the
+        # reward attributes a score to.
+        delta = score_with(2.0) - score_with(1.0)
+        assert delta.max().item() == pytest.approx(1.0)
+        assert delta.min().item() >= 0.0
+        assert torch.allclose(delta, delta.round())
+
+
+class TestPrefixShapedReward:
+    """Reference prior shaped by the per-prefix task score (Expr24)."""
+
+    def test_unpenalized_reward_is_the_scaled_prior(self, batch, constant_logits_model):
+        num_states = batch.shape[1] - PROMPT_LEN + 1
+        model = constant_logits_model(VOCAB_SIZE)
+
+        out = PrefixShapedReward(
+            sentence_validator=_ConstantScoreValidator(torch.ones(batch.shape[0], num_states))
+        ).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=model,
+            tokenizer=_StubTokenizer(),
+            reference_logits_scale=0.25,
         )
 
-        batch_size = 4
-        seq_len = 10
-        prompt_length = 3
+        reference = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+        )["reward"]
 
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
+        assert torch.allclose(out["reward_unpenalized"], reference * 0.25, atol=1e-6)
 
-        reward, reward_unpen = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
+    def test_a_fully_scoring_prefix_cancels_the_terminal_prior(self, batch, constant_logits_model):
+        num_states = batch.shape[1] - PROMPT_LEN + 1
+        model = constant_logits_model(VOCAB_SIZE)
+
+        out = PrefixShapedReward(
+            sentence_validator=_ConstantScoreValidator(torch.ones(batch.shape[0], num_states))
+        ).score(
+            input_batch=batch,
+            prompt_length=PROMPT_LEN,
+            model=model,
+            tokenizer=_StubTokenizer(),
+            scaling_factor=0.0,
+            reference_logits_scale=1.0,
         )
 
-        assert reward.shape[0] == batch_size
-        # Validator should have been called
-        mock_validator.assert_called_once()
+        reference = score_fast(
+            model=model,
+            encoded_input=batch,
+            termination_token_id=EOS,
+            skip_first=PROMPT_LEN,
+        )["reward"]
+
+        expected = reference - reference[:, -1].unsqueeze(-1)
+        assert torch.allclose(out["reward"], expected, atol=1e-6)
 
 
-# ============================================================================
-# Test Reference Target Score Positive Mixed Invalid Mask
-# ============================================================================
+class TestAbsorbingPrefixReward:
+    """Reference prior plus an absorbed suffix target (SMILES, AMP)."""
 
+    def test_terminal_score_is_copied_onto_the_absorbing_states(self, constant_logits_model):
+        # Generation terminates after two tokens, so states 3 and 4 are the absorbing region.
+        tokens = torch.full((1, PROMPT_LEN + 4), 5, dtype=torch.long)
+        tokens[:, PROMPT_LEN + 2 :] = EOS
 
-class TestReferenceTargetScorePositiveMixedInvalidMask:
-    """Test the main reward model with mixed scoring."""
+        local_score = torch.tensor([[0.0, 0.1, 0.7, 0.0, 0.0]])
+        model = constant_logits_model(VOCAB_SIZE)
 
-    @pytest.fixture
-    def mock_model(self):
-        """Create a mock model."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-        model.eval = Mock()
-        model.train = Mock()
-
-        def forward(*args, **kwargs):
-            input_ids = args[0] if args else kwargs.get("input_ids")
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-            # Use GPT2 vocab_size (50257) to match tokenizer
-            vocab_size = 50257
-
-            output = Mock()
-            output.logits = torch.randn(batch_size, seq_len, vocab_size)
-            return output
-
-        model.side_effect = forward
-        model.__call__ = forward
-        return model
-
-    @pytest.fixture
-    def tokenizer(self):
-        """Create a tokenizer."""
-        return GPT2Tokenizer.from_pretrained("gpt2")
-
-    def test_init_with_default_params(self):
-        """Test initialization with default parameters."""
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=None,
+        out = AbsorbingPrefixReward(sentence_validator=_ConstantScoreValidator(local_score)).score(
+            input_batch=tokens,
+            prompt_length=PROMPT_LEN,
+            model=model,
+            tokenizer=_StubTokenizer(),
+            scaling_factor=1.0,
+            reference_logits_scale=0.0,
         )
 
-        assert reward_model.sentence_validator is None
-        assert reward_model.temperature == 1.0
+        # With the reference prior switched off, the reward is the absorbed score alone: state 2
+        # terminates and scores 0.7, state 3 absorbs it, and state 4 is never reached.
+        assert out["reward"][0].tolist() == pytest.approx([0.0, 0.1, 0.7, 0.7, 0.0])
 
-    def test_init_with_custom_params(self):
-        """Test initialization with custom parameters."""
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=None,
-            invalid_start_ratio=0.3,
-            invalid_end_ratio=1.5,
-            illegal_vocab_penalty=-100,
-            grammar_disagree_penalty=-100,
+    def test_a_shorter_local_score_is_padded_at_the_root(self, constant_logits_model):
+        tokens = torch.full((2, PROMPT_LEN + 4), 5, dtype=torch.long)
+        tokens[:, -1] = EOS
+
+        # One score per generated token rather than per state.
+        validator = _ConstantScoreValidator(torch.ones(2, 4))
+        out = AbsorbingPrefixReward(sentence_validator=validator).score(
+            input_batch=tokens,
+            prompt_length=PROMPT_LEN,
+            model=constant_logits_model(VOCAB_SIZE),
+            tokenizer=_StubTokenizer(),
         )
 
-        assert reward_model.invalid_start_ratio == 0.3
-        assert reward_model.invalid_end_ratio == 1.5
-        assert reward_model.illegal_vocab_penalty == -100
-        assert reward_model.grammar_disagree_penalty == -100
-
-    def test_score_basic(self, mock_model, tokenizer):
-        """Test basic scoring."""
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=None,
-        )
-
-        batch_size = 4
-        seq_len = 10
-        prompt_length = 3
-
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
-
-        result = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
-        )
-
-        assert isinstance(result, dict)
-        assert "reward" in result
-        assert "reward_unpenalized" in result
-        assert "log_pf_ref" in result
-        assert "validator_dict" in result
-
-    def test_score_with_scaling_factor(self, mock_model, tokenizer):
-        """Test scoring with scaling factor."""
-        # Mock validator
-        mock_validator = Mock()
-        mock_validator.return_value = {
-            "invalid": torch.zeros(4, 7, dtype=torch.bool),
-            "local_score": torch.ones(4, 7),
-        }
-
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=mock_validator,
-        )
-
-        batch_size = 4
-        seq_len = 10
-        prompt_length = 3
-
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
-
-        result = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
-            scaling_factor=50.0,
-        )
-
-        assert result["reward"].shape[0] == batch_size
-        # With validator, reward should be modified by scaling factor
-        assert not torch.equal(result["reward"], result["log_pf_ref"])
-
-    def test_score_with_target_molecule(self, mock_model, tokenizer):
-        """Test scoring with target molecule."""
-        mock_validator = Mock()
-        mock_validator.return_value = {
-            "invalid": torch.zeros(4, 7, dtype=torch.bool),
-            "local_score": torch.ones(4, 7),
-        }
-
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=mock_validator,
-        )
-
-        batch_size = 4
-        seq_len = 10
-        prompt_length = 3
-
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
-
-        result = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
-            target_molecule="CCO",
-        )
-
-        assert isinstance(result, dict)
-        # Validator should have received target_molecule
-        assert mock_validator.called
-
-
-# ============================================================================
-# Test Use Base Model Context Manager
-# ============================================================================
-
-
-class TestUseBaseModel:
-    """Test the use_base_model context manager."""
-
-    def test_use_base_model_enable_disable(self):
-        """Test that adapters are properly enabled/disabled."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-
-        with use_base_model(model, disable_peft=False):
-            # Inside context, adapters should be disabled
-            model.base_model.disable_adapter_layers.assert_called_once()
-
-        # After context, adapters should be re-enabled
-        model.base_model.enable_adapter_layers.assert_called_once()
-
-    def test_use_base_model_with_disable_peft(self):
-        """Test that nothing happens when disable_peft=True."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-
-        with use_base_model(model, disable_peft=True):
-            pass
-
-        # No calls should have been made
-        model.base_model.disable_adapter_layers.assert_not_called()
-        model.base_model.enable_adapter_layers.assert_not_called()
-
-    def test_use_base_model_exception_handling(self):
-        """Test that adapters are re-enabled even on exception."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-
-        try:
-            with use_base_model(model, disable_peft=False):
-                raise ValueError("Test exception")
-        except ValueError:
-            pass
-
-        # Even with exception, adapters should be re-enabled
-        model.base_model.enable_adapter_layers.assert_called_once()
-
-
-# ============================================================================
-# Integration Tests
-# ============================================================================
-
-
-class TestRewardIntegration:
-    """Integration tests for reward computation pipeline."""
-
-    @pytest.fixture
-    def mock_model(self):
-        """Create a mock model."""
-        model = Mock()
-        model.base_model = Mock()
-        model.base_model.disable_adapter_layers = Mock()
-        model.base_model.enable_adapter_layers = Mock()
-        model.eval = Mock()
-        model.train = Mock()
-
-        def forward(*args, **kwargs):
-            input_ids = args[0] if args else kwargs.get("input_ids")
-            batch_size = input_ids.shape[0]
-            seq_len = input_ids.shape[1]
-            # Use GPT2 vocab_size (50257) to match tokenizer
-            vocab_size = 50257
-
-            output = Mock()
-            # Create deterministic logits for testing
-            output.logits = torch.randn(batch_size, seq_len, vocab_size)
-            return output
-
-        model.side_effect = forward
-        model.__call__ = forward
-        return model
-
-    @pytest.fixture
-    def tokenizer(self):
-        """Create a tokenizer."""
-        return GPT2Tokenizer.from_pretrained("gpt2")
-
-    def test_end_to_end_reward_computation(self, mock_model, tokenizer):
-        """Test end-to-end reward computation."""
-        reward_model = Reference_Target_Score_Positive_Mixed_Invalid_Mask(
-            sentence_validator=None,
-        )
-
-        batch_size = 8
-        seq_len = 15
-        prompt_length = 5
-
-        # Generate some trajectories
-        input_batch = torch.randint(1, 100, (batch_size, seq_len))
-
-        # Compute rewards
-        result = reward_model.score(
-            input_batch=input_batch,
-            prompt_length=prompt_length,
-            model=mock_model,
-            tokenizer=tokenizer,
-            reward_temperature=1.0,
-            scaling_factor=10.0,
-        )
-
-        # Verify output structure
-        assert "reward" in result
-        assert "reward_unpenalized" in result
-        assert result["reward"].shape == (batch_size, seq_len - prompt_length + 1)
-
-        # Verify no NaN or Inf
-        assert not torch.isnan(result["reward"]).any()
-        assert not torch.isinf(result["reward"]).any()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+        assert out["reward"].shape == (2, 5)

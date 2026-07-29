@@ -2,23 +2,16 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-# min_epochs: 1 # prevents early stopping
-# max_steps: 100
-
 accelerator: gpu
 devices: 1
 
 strategy: auto
 
-# mixed precision for extra speed-up
-# precision: 16
-
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 4
 
-# set True to to ensure deterministic results
-# makes training slower but gives more reproducibility than just setting seeds
-deterministic: False
+# Deterministic kernels trade throughput for exact reproducibility beyond seeding.
+deterministic: false
 
 precision: bf16-true
 
@@ -26,7 +19,3 @@ accumulate_grad_batches: 4
 
 num_sanity_val_steps: 0
 log_every_n_steps: 1
-
-# profiler:
-#   _target_: lightning.pytorch.profilers.PyTorchProfiler
-#   sort_by_key: "cpu_time_total"

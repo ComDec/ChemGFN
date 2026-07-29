@@ -1,6 +1,19 @@
+"""Task validators.
+
+A validator is the task-specific half of a reward: it decodes a batch of generated token
+sequences and reports, for every state on every trajectory, whether the state is a legal prefix
+and what it scores. :mod:`chemgfn.models.reward` combines that signal with the frozen reference
+model's prior to form the GFlowNet log reward.
+
+One validator is provided per released task: :class:`Expr24Validator` (arithmetic expressions),
+:class:`RDKitValidator` (SMILES), :class:`AMPValidator` (antimicrobial peptides) and
+:class:`CommonGenValidator` (concept-to-sentence generation).
+"""
+
 from __future__ import annotations
 
 import re
+from collections import Counter
 from fractions import Fraction
 from typing import Any, Literal
 
@@ -11,7 +24,7 @@ from rdkit.Chem import AllChem
 from torch import Tensor
 from transformers import PreTrainedTokenizer
 
-from chemgfn.utils.rdkit_utils import FUNCTION_MAPPING
+from chemgfn.utils.molecule_scores import FUNCTION_MAPPING
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -30,16 +43,32 @@ def _merge_target(template: str | None, fragment: str) -> str:
     return fragment if template is None else template.replace("*", fragment)
 
 
-class ValidatorBase:
+class Validator:
+    """Base class for task validators.
+
+    A validator turns a batch of generated token sequences into the per-state quantities the
+    reward module needs:
+
+    ``invalid``
+        ``(B, T + 1)`` mask over states; ``1.0`` marks a state that is not a legal prefix of a
+        terminal object.
+    ``local_score``
+        ``(B, T + 1)`` task score attached to each state, used for prefix and absorbed-suffix
+        shaping.
+    ``global_score``
+        ``(B,)`` task score of the complete trajectory.
+    ``full_tokens``
+        Decoded string for each trajectory, used for logging and replay-buffer keys.
+
+    Subclasses implement :meth:`__call__` for scoring and may override :meth:`accuracy` to report
+    task-specific evaluation metrics.
+    """
+
     name: str = "validator"
-    supports_prefix: bool = True
-    requires_target_molecule: bool = False
-    returns_invalid_mask: bool = True
-    returns_global_score: bool = True
-    returns_valid_score: bool = True
-    returns_full_tokens: bool = True
 
     def __init__(self, name: str | None = None, termination_token_id: int = -1) -> None:
+        """Store the validator's name and the token id that terminates a trajectory."""
+
         self.name = name or self.name
         self.termination_token_id = termination_token_id
 
@@ -49,46 +78,38 @@ class ValidatorBase:
         tokenizer: PreTrainedTokenizer,
         *args,
         **kwargs,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
+        """Return evaluation metrics for a batch of generated sequences."""
+
         return {}
 
-    def __call__(self, sentences: Tensor, tokenizer: PreTrainedTokenizer, *args, **kwargs):
+    def __call__(
+        self, sentences: Tensor, tokenizer: PreTrainedTokenizer, *args, **kwargs
+    ) -> dict[str, Any]:
+        """Score a batch of generated sequences."""
+
         raise NotImplementedError
 
 
-class SentenceValidator(ValidatorBase):
-    pass
+class Expr24Validator(Validator):
+    """Validator for the variable-length arithmetic task ("make 24").
 
-
-class Expr24Validator(SentenceValidator):
-    """
-    Target-sum validator (default target=24).
-    Supports variable-length expressions with digits and +-*/,
-    evaluated using standard precedence. Scoring modes:
-      - hit24        : 1.0 if expression == target else 0.0
-      - near_24      : 1.0 at target, linearly decays with distance to 0.0
-      - hit24_dense  : hit24 but local_score filled for every valid prefix
-      - near_24_dense: near_24 but local_score filled for every valid prefix
+    An expression is a parenthesis-free alternation of non-negative integers and the operators
+    ``+ - * /``, evaluated exactly over the rationals with standard precedence. A state scores
+    ``1.0`` when the prefix read so far already evaluates to the target value and ``0.0``
+    otherwise, so ``local_score`` is dense over every parseable prefix.
     """
 
-    def __init__(
-        self,
-        scorer: str = "hit24",
-        amortize_valid_state: bool = False,
-        target_value: int | float = 24,
-        allow_parentheses: bool = False,
-    ) -> None:
-        if scorer not in {"hit24", "near_24", "hit24_dense", "near_24_dense"}:
-            raise ValueError(f"Unsupported scorer for Expr24Validator: {scorer}")
+    def __init__(self, target_value: int | float = 24) -> None:
+        """Configure the validator.
 
-        super().__init__(scorer)
-        self.scorer = scorer
+        Args:
+            target_value: Value an expression must evaluate to in order to score ``1.0``.
+        """
+
+        super().__init__("expr24")
         self.target_value = Fraction(target_value)
-
-        self.amortize_valid_state = amortize_valid_state
-        self.allow_parentheses = bool(allow_parentheses)
-        token_pattern = r"\d+|[+\-*/]" if not self.allow_parentheses else r"\d+|[+\-*/()]"
-        self.token_re = re.compile(token_pattern)
+        self.token_re = re.compile(r"\d+|[+\-*/]")
 
     def _decode_expr(self, tokens: Tensor, tokenizer: PreTrainedTokenizer) -> str | None:
         try:
@@ -98,19 +119,23 @@ class Expr24Validator(SentenceValidator):
         decoded = decoded.strip()
         return decoded or None
 
-    def expression_accuracy(
+    def accuracy(
         self,
-        generated_tokens: Tensor,
+        sentences: Tensor,
         tokenizer: PreTrainedTokenizer,
+        scaffold: str | None = None,
+        **kwargs,
     ) -> dict[str, float]:
-        if generated_tokens is None or generated_tokens.ndim == 0:
+        """Return the fraction of sequences that evaluate exactly to the target value."""
+
+        if sentences is None or sentences.ndim == 0:
             return {"acc": 0.0}
-        total = generated_tokens.shape[0]
+        total = sentences.shape[0]
         if total == 0:
             return {"acc": 0.0}
 
         score_sum = 0.0
-        for sample in generated_tokens:
+        for sample in sentences:
             expr = self._decode_expr(sample, tokenizer)
             if expr is None:
                 continue
@@ -119,23 +144,16 @@ class Expr24Validator(SentenceValidator):
                 score_sum += 1.0
         return {"acc": score_sum / total}
 
-    def accuracy(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
-        **kwargs,
-    ) -> dict[str, float]:
-        return self.expression_accuracy(sentences, tokenizer)
-
     def __call__(
         self,
         sentences: Tensor,
         tokenizer: PreTrainedTokenizer,
-        target_molecule: str | None = None,
+        scaffold: str | None = None,
         *args,
         **kwargs,
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Any]:
+        """Score expressions and every legal prefix of them."""
+
         if sentences is None or sentences.ndim < 1:
             return {
                 "invalid": torch.zeros(1, 1),
@@ -155,8 +173,6 @@ class Expr24Validator(SentenceValidator):
 
         invalid[:, 0] = 1.0
 
-        dense_mode = self.scorer in {"hit24_dense", "near_24_dense"}
-
         for i in range(batch_size):
             stop_pos = seq_len
             for pos in range(seq_len):
@@ -169,8 +185,7 @@ class Expr24Validator(SentenceValidator):
                 is_valid_prefix, prefix_score, prefix_value = self._score_expression(prefix_expr)
                 is_hit_target_prefix = is_valid_prefix and prefix_value == self.target_value
                 invalid[i, pos + 1] = 0.0 if is_hit_target_prefix else 1.0
-                if dense_mode:
-                    local_score[i, pos + 1] = float(prefix_score)
+                local_score[i, pos + 1] = float(prefix_score)
 
             final_expr = self._decode_expr(sentences[i], tokenizer)
             if final_expr is None:
@@ -186,11 +201,6 @@ class Expr24Validator(SentenceValidator):
             global_score[i] = float(score)
             invalid[i, -1] = 0.0 if (is_valid and value == self.target_value) else 1.0
             full_tokens_list.append(final_expr)
-
-        if self.amortize_valid_state:
-            mask = global_score > 0
-            local_score[mask, 1:] = global_score[mask].unsqueeze(1)
-            invalid[mask, 1:] = 0.0
 
         return {
             "invalid": invalid,
@@ -209,160 +219,60 @@ class Expr24Validator(SentenceValidator):
         return tokens
 
     def _parse_and_eval(self, tokens: list[str]) -> Fraction | None:
+        """Evaluate a token list exactly, or return ``None`` if it is not a valid expression.
+
+        Tokens must alternate integer, operator, integer, ... Multiplication and division bind
+        tighter than addition and subtraction; division by zero makes the expression invalid.
+        """
+
         if len(tokens) == 0:
             return None
 
-        if not self.allow_parentheses:
-            if len(tokens) % 2 == 0:
-                return None
-            for idx, tk in enumerate(tokens):
-                if idx % 2 == 0:
-                    if not tk.isdigit():
-                        return None
-                else:
-                    if tk not in "+-*/":
-                        return None
-            try:
-                values: list[Fraction] = [Fraction(int(tokens[0]))]
-            except Exception:
-                return None
-
-            pending_ops: list[str] = []
-            try:
-                for idx in range(1, len(tokens), 2):
-                    op = tokens[idx]
-                    nxt = Fraction(int(tokens[idx + 1]))
-
-                    if op in "*/":
-                        prev = values.pop()
-                        if op == "*":
-                            values.append(prev * nxt)
-                        else:
-                            if nxt == 0:
-                                return None
-                            values.append(prev / nxt)
-                    else:
-                        values.append(nxt)
-                        pending_ops.append(op)
-            except Exception:
-                return None
-
-            try:
-                result = values[0]
-                for op, val in zip(pending_ops, values[1:]):
-                    result = result + val if op == "+" else result - val
-                return result
-            except Exception:
-                return None
-
-        def precedence(op: str) -> int:
-            return 2 if op in "*/" else 1
-
-        def apply_op(op: str, b: Fraction, a: Fraction) -> Fraction | None:
-            try:
-                if op == "+":
-                    return a + b
-                if op == "-":
-                    return a - b
-                if op == "*":
-                    return a * b
-                if op == "/":
-                    if b == 0:
-                        return None
-                    return a / b
-            except Exception:
-                return None
+        if len(tokens) % 2 == 0:
             return None
-
-        values: list[Fraction] = []
-        ops: list[str] = []
-
-        def pop_and_apply() -> bool:
-            if not ops or len(values) < 2:
-                return False
-            op = ops.pop()
-            b = values.pop()
-            a = values.pop()
-            res = apply_op(op, b, a)
-            if res is None:
-                return False
-            values.append(res)
-            return True
-
-        prev_token_type = None
-        for tk in tokens:
-            if tk.isdigit():
-                values.append(Fraction(int(tk)))
-                prev_token_type = "num"
-            elif tk in "+-*/":
-                if prev_token_type not in {"num", ")"}:
+        for idx, tk in enumerate(tokens):
+            if idx % 2 == 0:
+                if not tk.isdigit():
                     return None
-                while ops and ops[-1] not in "(" and precedence(ops[-1]) >= precedence(tk):
-                    if not pop_and_apply():
-                        return None
-                ops.append(tk)
-                prev_token_type = "op"
-            elif tk == "(":
-                if prev_token_type not in {None, "op", "("}:
-                    return None
-                ops.append(tk)
-                prev_token_type = "("
-            elif tk == ")":
-                if prev_token_type not in {"num", ")"}:
-                    return None
-                found_lparen = False
-                while ops:
-                    top = ops.pop()
-                    if top == "(":
-                        found_lparen = True
-                        break
-                    if len(values) < 2:
-                        return None
-                    b = values.pop()
-                    a = values.pop()
-                    res = apply_op(top, b, a)
-                    if res is None:
-                        return None
-                    values.append(res)
-                if not found_lparen:
-                    return None
-                prev_token_type = ")"
             else:
-                return None
-
-        if prev_token_type not in {"num", ")"}:
+                if tk not in "+-*/":
+                    return None
+        try:
+            values: list[Fraction] = [Fraction(int(tokens[0]))]
+        except Exception:
             return None
 
-        while ops:
-            op = ops.pop()
-            if op == "(":
-                return None
-            if len(values) < 2:
-                return None
-            b = values.pop()
-            a = values.pop()
-            res = apply_op(op, b, a)
-            if res is None:
-                return None
-            values.append(res)
+        pending_ops: list[str] = []
+        try:
+            for idx in range(1, len(tokens), 2):
+                op = tokens[idx]
+                nxt = Fraction(int(tokens[idx + 1]))
 
-        if len(values) != 1:
+                if op in "*/":
+                    prev = values.pop()
+                    if op == "*":
+                        values.append(prev * nxt)
+                    else:
+                        if nxt == 0:
+                            return None
+                        values.append(prev / nxt)
+                else:
+                    values.append(nxt)
+                    pending_ops.append(op)
+        except Exception:
             return None
-        return values[0]
 
-    def _score_value(self, value: Fraction) -> float:
-        base_scorer = self.scorer.replace("_dense", "")
-        target = self.target_value
-        if base_scorer == "hit24":
-            return 1.0 if value == target else 0.0
-        if base_scorer == "near_24":
-            diff = abs(value - target)
-            denom = float(max(abs(target), 1))
-            score = 1.0 - float(diff) / denom
-            return float(max(0.0, score))
-        raise ValueError(f"Unsupported scorer for Expr24Validator: {self.scorer}")
+        try:
+            result = values[0]
+            for op, val in zip(pending_ops, values[1:]):
+                result = result + val if op == "+" else result - val
+            return result
+        except Exception:
+            return None
 
     def _score_expression(self, expr: str) -> tuple[bool, float, Fraction | None]:
+        """Return ``(is_valid, score, value)`` for a decoded expression string."""
+
         tokens = self._tokenize_expr(expr)
         if tokens is None:
             return False, 0.0, None
@@ -371,23 +281,36 @@ class Expr24Validator(SentenceValidator):
         if value is None:
             return False, 0.0, None
 
-        return True, self._score_value(value), value
+        return True, 1.0 if value == self.target_value else 0.0, value
 
 
-class RDKitValidator(SentenceValidator):
-    requires_target_molecule = False
+class RDKitValidator(Validator):
+    """SMILES validator scoring molecules with an RDKit property function.
+
+    Prefixes are checked with ``partialsmiles``, which accepts a string that can still be
+    extended into a valid molecule. Every state on a trajectory therefore receives a validity
+    flag and, once the prefix parses as a complete molecule, a property score.
+    """
 
     def __init__(
         self,
         scorer: str = "sa",
-        backend: Literal["rdkit", "pa"] = "pa",
         fp_radius: int = 2,
         fp_nbits: int = 2048,
         topk_diversity: int = 20,
     ) -> None:
+        """Configure the validator.
+
+        Args:
+            scorer: Key into :data:`chemgfn.utils.molecule_scores.FUNCTION_MAPPING` selecting the
+                molecular property to optimise.
+            fp_radius: Morgan fingerprint radius used for the diversity metrics.
+            fp_nbits: Morgan fingerprint length used for the diversity metrics.
+            topk_diversity: Number of highest-scoring molecules in the top-k diversity metric.
+        """
+
         super().__init__(scorer)
         self.score_function = FUNCTION_MAPPING[scorer]
-        self.backend = backend
         self.scorer_name = scorer
 
         self.fp_radius = int(fp_radius)
@@ -395,30 +318,14 @@ class RDKitValidator(SentenceValidator):
         self.topk_diversity = int(topk_diversity)
 
     @staticmethod
-    def rdkit_validate(smiles: str) -> bool:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return False
-        try:
-            Chem.SanitizeMol(mol)
-            return True
-        except Exception:
-            return False
+    def _is_valid_smiles(smiles: str) -> bool:
+        """Whether ``smiles`` is a valid SMILES prefix."""
 
-    @staticmethod
-    def pa_validate(smiles: str) -> bool:
         try:
             ps.ParseSmiles(smiles)
             return True
         except Exception:
             return False
-
-    def _is_valid_smiles(self, smiles: str) -> bool:
-        if self.backend == "rdkit":
-            return self.rdkit_validate(smiles)
-        if self.backend == "pa":
-            return self.pa_validate(smiles)
-        raise ValueError(f"Unknown backend: {self.backend}")
 
     def _decode_batch(self, generated_tokens: Tensor, tokenizer: PreTrainedTokenizer) -> list[str]:
         return [_decode_tokens_to_string(sample, tokenizer) for sample in generated_tokens]
@@ -498,15 +405,17 @@ class RDKitValidator(SentenceValidator):
             cnt += len(sims)
         return s / max(1, cnt)
 
-    def smiles_accuracy(
+    def accuracy(
         self,
-        generated_tokens: Tensor,
+        sentences: Tensor,
         tokenizer: PreTrainedTokenizer,
         scaffold: str | None = None,
         *,
         return_hist: bool = False,
     ) -> dict[str, Any]:
-        num_samples = int(generated_tokens.shape[0])
+        """Report validity, property score, fingerprint diversity and length statistics."""
+
+        num_samples = int(sentences.shape[0])
         if num_samples == 0:
             out: dict[str, Any] = {
                 "acc": 0.0,
@@ -540,11 +449,11 @@ class RDKitValidator(SentenceValidator):
             return out
 
         eos_id = int(tokenizer.eos_token_id)
-        first_eos, has_eos = self._first_eos_pos(generated_tokens, eos_id)
+        first_eos, has_eos = self._first_eos_pos(sentences, eos_id)
         tok_lens = first_eos.to(torch.int64).tolist()
         eos_rate = float(has_eos.float().mean().item())
 
-        decoded = self._decode_batch(generated_tokens, tokenizer)
+        decoded = self._decode_batch(sentences, tokenizer)
 
         valid_flags: list[bool] = [False] * num_samples
         scores: list[float] = [0.0] * num_samples
@@ -658,22 +567,14 @@ class RDKitValidator(SentenceValidator):
 
         return out
 
-    def accuracy(
-        self,
-        sentences: Tensor,
-        tokenizer: PreTrainedTokenizer,
-        scaffold: str | None = None,
-        *,
-        return_hist: bool = False,
-    ) -> dict[str, float]:
-        return self.smiles_accuracy(sentences, tokenizer, scaffold, return_hist=return_hist)
-
     def __call__(
         self,
         sentences: Tensor,
         tokenizer: PreTrainedTokenizer,
         scaffold: str | None = None,
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Any]:
+        """Score complete molecules and every parseable SMILES prefix."""
+
         termination_token_id = tokenizer.eos_token_id
         batch_size, seq_len = sentences.shape
         device = sentences.device
@@ -727,12 +628,12 @@ class RDKitValidator(SentenceValidator):
         }
 
 
-class AMPValidator(SentenceValidator):
-    """Validator for AMP (Antimicrobial Peptide) generation.
+class AMPValidator(Validator):
+    """Validator for antimicrobial peptide (AMP) generation.
 
-    Uses a pre-trained oracle (ProtTrans AlBert + MLP) to score sequences.
-    Per-position reward uses absorbing pattern: score placed only at terminal position.
-    All amino acid prefixes are considered valid.
+    Sequences are scored with a pre-trained oracle (ProtTrans ALBERT encoder plus an MLP head).
+    Every amino-acid prefix is a legal state, and the oracle score is attached to the terminal
+    state only, giving the absorbed suffix target its sparse terminal signal.
     """
 
     AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
@@ -745,6 +646,18 @@ class AMPValidator(SentenceValidator):
         training_set_path: str | None = None,
         topk: int = 100,
     ) -> None:
+        """Configure the validator and load the oracle.
+
+        Args:
+            oracle_weights_path: Path to the oracle MLP state dict. ``None`` leaves the head
+                randomly initialised, which is only useful for smoke tests.
+            oracle_device: Torch device the oracle runs on.
+            mc_samples: Number of MC-dropout passes; ``0`` scores deterministically.
+            training_set_path: Optional file of one training peptide per line, used as the
+                reference set for the novelty metric.
+            topk: Number of highest-scoring peptides used by the top-k metrics.
+        """
+
         super().__init__("amp_validator")
         from chemgfn.models.amp_oracle import AMPOracle
 
@@ -755,7 +668,6 @@ class AMPValidator(SentenceValidator):
         )
         self.topk = topk
 
-        # Load training set for novelty computation
         self._training_sequences: list[str] | None = None
         if training_set_path is not None:
             with open(training_set_path) as f:
@@ -775,7 +687,9 @@ class AMPValidator(SentenceValidator):
         scaffold: str | None = None,
         *args,
         **kwargs,
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Any]:
+        """Score peptides with the oracle, placing the score at the terminal state."""
+
         if sentences is None or sentences.ndim < 1:
             return {
                 "invalid": torch.zeros(1, 1),
@@ -841,6 +755,8 @@ class AMPValidator(SentenceValidator):
         return_hist: bool = False,
         **kwargs,
     ) -> dict[str, Any]:
+        """Report oracle score plus top-k performance, diversity and novelty."""
+
         from chemgfn.utils.sequence_metrics import (
             levenshtein_diversity,
             levenshtein_novelty,
@@ -896,7 +812,9 @@ class AMPValidator(SentenceValidator):
             "amp_score": float(sum(scores_list) / num_samples),
             "amp_score_filter": float(
                 sum(s for s, v in zip(scores_list, valid_flags) if v) / total_valid
-            ) if total_valid else 0.0,
+            )
+            if total_valid
+            else 0.0,
             "performance_topk": float(performance),
             "diversity": float(diversity),
             "novelty": float(novelty),
@@ -908,3 +826,623 @@ class AMPValidator(SentenceValidator):
             out["score_hist"] = scores_list
 
         return out
+
+
+class CommonGenValidator(Validator):
+    """Validator for the CommonGen concept-to-sentence task.
+
+    Each prompt carries a concept set and, on the validation split, one or more human reference
+    sentences. Both are passed through the ``scaffold`` argument as a dict with keys ``concepts``
+    and ``references``.
+
+    The score has three parts, matching the reward definition used in the paper:
+
+    * structural validity -- a terminal sentence is legal only if it is ASCII, uses an allowed
+      character set, parses as a single sentence and contains a verb;
+    * concept coverage -- a soft coverage ratio at every prefix, plus a lemma-matched hard
+      coverage bonus at the terminal state when all concepts are present;
+    * linguistic quality -- an n-gram overlap term between the prefix and the reference sentence,
+      acting as a step-wise proxy for fluency.
+
+    Requires the optional CommonGen dependencies: ``spacy`` (with the ``en_core_web_sm`` model)
+    for parsing and lemmatisation, and ``nltk`` / ``bert-score`` / ``pycocoevalcap`` for the
+    reported BLEU and BERTScore metrics.
+    """
+
+    name = "common_gen"
+
+    def __init__(
+        self,
+        termination_token_id: int = -1,
+        spacy_model: str = "en_core_web_sm",
+        coverage_weight: float = 1.0,
+        quality_weight: float = 0.5,
+        hard_coverage_bonus: float = 1.0,
+        validity_mode: Literal["english", "keywords"] = "english",
+        strict_ascii: bool = True,
+        allowed_punctuation: str = " .,!?;:'\"()/-",
+        require_capital_start: bool = True,
+        require_verb: bool = True,
+        min_alpha_tokens: int = 2,
+        single_sentence: bool = True,
+        require_terminal_punct: bool = False,
+        valid_step_weight: float = 0.0,
+        valid_step_every: int = 1,
+        valid_terminal_bonus: float = 0.0,
+        ngram_n: int = 2,
+        compute_bleu: bool = False,
+        compute_bertscore: bool = False,
+        bertscore_model_name: str = "microsoft/deberta-xlarge-mnli",
+        bertscore_lang: str = "en",
+        bertscore_rescale: bool = True,
+    ) -> None:
+        """Configure the validator.
+
+        Args:
+            termination_token_id: Token id that terminates a sentence; ``-1`` falls back to the
+                tokenizer's EOS at scoring time.
+            spacy_model: spaCy pipeline used for parsing and lemmatisation.
+            coverage_weight: Weight of the soft concept-coverage ratio in the prefix score.
+            quality_weight: Weight of the n-gram overlap term in the prefix score.
+            hard_coverage_bonus: Bonus added at the terminal state when every concept is covered
+                under lemma matching.
+            validity_mode: ``"english"`` marks a terminal sentence legal when it is
+                sentence-like; ``"keywords"`` marks it legal when it covers every concept.
+            strict_ascii: Whether non-ASCII characters make a state illegal.
+            allowed_punctuation: Punctuation characters permitted in a legal sentence.
+            require_capital_start: Whether a legal sentence must start with a capital letter.
+            require_verb: Whether a legal sentence must contain a verb.
+            min_alpha_tokens: Minimum number of alphabetic tokens in a legal sentence.
+            single_sentence: Whether the output must parse as exactly one sentence.
+            require_terminal_punct: Whether a legal sentence must end in terminal punctuation.
+            valid_step_weight: Weight of the step-wise terminability bonus.
+            valid_step_every: Stride at which the terminability bonus is evaluated.
+            valid_terminal_bonus: Bonus added at a legal terminal state.
+            ngram_n: Order of the n-gram overlap used by the quality term.
+            compute_bleu: Whether :meth:`accuracy` reports BLEU.
+            compute_bertscore: Whether :meth:`accuracy` reports BERTScore.
+            bertscore_model_name: Model backing BERTScore.
+            bertscore_lang: Language passed to BERTScore.
+            bertscore_rescale: Whether BERTScore is rescaled with its baseline.
+        """
+
+        super().__init__(self.name, termination_token_id=termination_token_id)
+        self.coverage_weight = float(coverage_weight)
+        self.quality_weight = float(quality_weight)
+        self.hard_coverage_bonus = float(hard_coverage_bonus)
+
+        self.validity_mode = str(validity_mode)
+        self.strict_ascii = bool(strict_ascii)
+        self.allowed_punctuation = str(allowed_punctuation)
+        self.require_capital_start = bool(require_capital_start)
+        self.require_verb = bool(require_verb)
+        self.min_alpha_tokens = int(min_alpha_tokens)
+        self.single_sentence = bool(single_sentence)
+        self.require_terminal_punct = bool(require_terminal_punct)
+
+        self.valid_step_weight = float(valid_step_weight)
+        self.valid_step_every = max(1, int(valid_step_every))
+        self.valid_terminal_bonus = float(valid_terminal_bonus)
+
+        self._allowed_char_set = set(self.allowed_punctuation)
+        self.ngram_n = int(ngram_n)
+
+        self.compute_bleu = bool(compute_bleu)
+
+        self.compute_bertscore = bool(compute_bertscore)
+        self.bertscore_model_name = str(bertscore_model_name)
+        self.bertscore_lang = str(bertscore_lang)
+        self.bertscore_rescale = bool(bertscore_rescale)
+        self._bertscorer = None
+
+        self._treebank_tokenizer = None
+
+        self.scorer_name = "coverage"
+
+        self._nlp = self._load_spacy_model(spacy_model)
+
+    @staticmethod
+    def _load_spacy_model(spacy_model: str):
+        try:
+            import spacy
+        except ImportError as exc:
+            raise ImportError(
+                "CommonGenValidator requires the optional CommonGen dependencies. Install them "
+                "with `pip install spacy nltk bert-score pycocoevalcap`, then run "
+                f"`python -m spacy download {spacy_model}`."
+            ) from exc
+        try:
+            return spacy.load(spacy_model)
+        except OSError as exc:
+            raise ImportError(
+                f"The spaCy model '{spacy_model}' is not installed. Run "
+                f"`python -m spacy download {spacy_model}`."
+            ) from exc
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        text = (text or "").lower()
+        text = re.sub(r"[^a-z0-9 ]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _sanitize_caption(text: str) -> str:
+        """Strip control characters that would otherwise break the PTB tokenizer."""
+
+        s = text or ""
+        s = s.replace("�", " ")
+        s = "".join((ch if (ch == "\n" or ord(ch) >= 32) else " ") for ch in s)
+        s = s.replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _chars_ok(self, text: str) -> bool:
+        s = text or ""
+        if not s:
+            return False
+        if self.strict_ascii and any(ord(ch) > 127 for ch in s):
+            return False
+        for ch in s:
+            if ch.isalnum() or ch.isspace() or (ch in self._allowed_char_set):
+                continue
+            return False
+        return True
+
+    def _capital_start_ok(self, text: str) -> bool:
+        if not self.require_capital_start:
+            return True
+        s = (text or "").lstrip()
+        # Skip leading punctuation and quotes before looking for the first letter.
+        for ch in s:
+            if ch.isalpha():
+                return "A" <= ch <= "Z"
+            if ch.isspace():
+                continue
+            if ch in self._allowed_char_set:
+                continue
+            break
+        return False
+
+    def _is_english_sentence_like(self, text: str) -> bool:
+        s = self._sanitize_caption(text)
+        if not s:
+            return False
+        if self.require_terminal_punct and not s.endswith((".", "!", "?")):
+            return False
+        if not self._chars_ok(s):
+            return False
+        if not self._capital_start_ok(s):
+            return False
+
+        doc = self._nlp(s)
+        if self.single_sentence:
+            try:
+                if len(list(doc.sents)) != 1:
+                    return False
+            except Exception:
+                pass
+
+        alpha_toks = [t for t in doc if (not t.is_space and not t.is_punct and t.is_alpha)]
+        if len(alpha_toks) < max(0, self.min_alpha_tokens):
+            return False
+        if self.require_verb:
+            if not any(t.pos_ in {"VERB", "AUX"} for t in doc if not t.is_space):
+                return False
+        return True
+
+    def _would_be_valid_if_terminated(self, prefix: str) -> bool:
+        """Check whether a prefix would be a legal sentence if terminated right now.
+
+        The task uses ``.`` as the end-of-sentence token, so a period is appended before the
+        legality check unless the prefix already ends in terminal punctuation.
+        """
+
+        s = self._sanitize_caption(prefix)
+        if not s:
+            return False
+        if not self._chars_ok(s):
+            return False
+        if s.endswith((".", "!", "?")):
+            cand = s
+        else:
+            cand = s + "."
+        return self._is_english_sentence_like(cand)
+
+    @staticmethod
+    def _word_tokens(text: str) -> list[str]:
+        return re.findall(r"[a-z0-9']+", (text or "").lower())
+
+    def _tokenize_for_metrics(self, text: str) -> list[str]:
+        """Tokenize with NLTK's Treebank tokenizer, approximating COCO-style PTB tokenization."""
+
+        if self._treebank_tokenizer is None:
+            try:
+                from nltk.tokenize import TreebankWordTokenizer
+            except ImportError as exc:
+                raise ImportError(
+                    "CommonGen metrics require NLTK. Install it with `pip install nltk`."
+                ) from exc
+
+            self._treebank_tokenizer = TreebankWordTokenizer()
+        s = (text or "").replace("\n", " ").strip()
+        s = re.sub(r"\s+", " ", s)
+        return [t for t in self._treebank_tokenizer.tokenize(s) if t]
+
+    @staticmethod
+    def _ngrams(tokens: list[str], n: int) -> list[tuple[str, ...]]:
+        n = max(1, int(n))
+        if len(tokens) < n:
+            return []
+        return [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+
+    @classmethod
+    def _ngram_f1(cls, cand: str, ref: str, n: int) -> float:
+        cand_toks = cls._word_tokens(cand)
+        ref_toks = cls._word_tokens(ref)
+        cand_ng = cls._ngrams(cand_toks, n)
+        ref_ng = cls._ngrams(ref_toks, n)
+        if not cand_ng or not ref_ng:
+            return 0.0
+        c_cnt = Counter(cand_ng)
+        r_cnt = Counter(ref_ng)
+        overlap = 0
+        for k, v in c_cnt.items():
+            overlap += min(v, r_cnt.get(k, 0))
+        denom = len(cand_ng) + len(ref_ng)
+        return float((2.0 * overlap) / denom) if denom > 0 else 0.0
+
+    def _get_bertscorer(self):
+        if not self.compute_bertscore:
+            return None
+        if self._bertscorer is not None:
+            return self._bertscorer
+        try:
+            from bert_score import BERTScorer
+        except ImportError as exc:
+            raise ImportError(
+                "BERTScore is required. Install it with `pip install bert-score`."
+            ) from exc
+        self._bertscorer = BERTScorer(
+            model_type=self.bertscore_model_name,
+            lang=self.bertscore_lang,
+            rescale_with_baseline=self.bertscore_rescale,
+            device="cpu",
+        )
+        return self._bertscorer
+
+    @staticmethod
+    def _parse_scaffold(scaffold: Any) -> tuple[list[str], list[str]]:
+        """Split the per-prompt scaffold into ``(concepts, references)``."""
+
+        if scaffold is None:
+            return [], []
+        if isinstance(scaffold, dict):
+            concepts = scaffold.get("concepts", [])
+            refs = scaffold.get("references", [])
+            concepts = (
+                [str(x) for x in concepts]
+                if isinstance(concepts, (list, tuple))
+                else [str(concepts)]
+            )
+            if isinstance(refs, (list, tuple)):
+                references = [str(x) for x in refs if str(x)]
+            else:
+                references = [str(refs)] if str(refs) else []
+            return concepts, references
+        if isinstance(scaffold, (list, tuple)):
+            references = [str(x) for x in scaffold if str(x)]
+            return [], references
+        if isinstance(scaffold, str):
+            s = scaffold.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    import json
+
+                    obj = json.loads(s)
+                    if isinstance(obj, dict):
+                        return CommonGenValidator._parse_scaffold(obj)
+                except Exception:
+                    pass
+            return [], [scaffold]
+        return [], []
+
+    def _coverage_ratio_surface(self, text: str, concepts_norm: list[str]) -> tuple[float, bool]:
+        """Surface-form concept coverage, used for the cheap per-prefix shaping term."""
+
+        if not concepts_norm:
+            return 0.0, False
+        norm = self._normalize_text(text)
+        if not norm:
+            return 0.0, False
+        hit = 0
+        for c in concepts_norm:
+            if not c:
+                continue
+            if re.search(r"\b" + re.escape(c) + r"\b", norm):
+                hit += 1
+        ratio = float(hit) / float(len(concepts_norm)) if concepts_norm else 0.0
+        return ratio, hit == len(concepts_norm)
+
+    def _coverage_ratio_lemma(self, text: str, concepts_norm: list[str]) -> tuple[float, bool]:
+        """Lemma-matched concept coverage, used for the terminal score and the hard bonus."""
+
+        if not concepts_norm:
+            return 0.0, False
+        doc = self._nlp((text or "").strip())
+        lemmas = []
+        for t in doc:
+            if t.is_space or t.is_punct:
+                continue
+            lt = (t.lemma_ or t.text).lower()
+            lt = re.sub(r"[^a-z0-9]+", "", lt)
+            if lt:
+                lemmas.append(lt)
+        lemma_norm = " ".join(lemmas)
+        hit = 0
+        for c in concepts_norm:
+            if not c:
+                continue
+            c_lemma = " ".join(
+                [
+                    re.sub(r"[^a-z0-9]+", "", (tok.lemma_ or tok.text).lower())
+                    for tok in self._nlp(c)
+                    if not tok.is_space and not tok.is_punct
+                ]
+            ).strip()
+            needle = c_lemma if c_lemma else re.sub(r"[^a-z0-9 ]+", " ", c.lower()).strip()
+            needle = re.sub(r"\s+", " ", needle)
+            if needle and re.search(r"\b" + re.escape(needle) + r"\b", lemma_norm):
+                hit += 1
+        ratio = float(hit) / float(len(concepts_norm)) if concepts_norm else 0.0
+        return ratio, hit == len(concepts_norm)
+
+    def accuracy(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        scaffold: Any = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Report sentence legality, concept coverage and reference-similarity metrics.
+
+        BLEU and BERTScore are expensive, so they are computed only when gradients are disabled,
+        i.e. during validation and test, and skipped inside the training step.
+        """
+
+        if sentences is None or sentences.ndim == 0:
+            return {"acc": 0.0, "cov_ratio": 0.0, "cov_ratio_filter": 0.0, "ngram_f1": 0.0}
+
+        concepts, references = self._parse_scaffold(scaffold)
+        concepts_norm = [self._normalize_text(c) for c in concepts if self._normalize_text(c)]
+
+        eos_id = int(
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        eos_text = tokenizer.decode([eos_id], skip_special_tokens=True).strip()
+        include_eos = eos_text in {".", "!", "?"}
+        candidates: list[str] = []
+        for row in sentences:
+            row = row.detach().cpu()
+            try:
+                stop_pos = (row == eos_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = int(row.shape[0])
+            end = min(int(row.shape[0]), stop_pos + 1) if include_eos else stop_pos
+            cand = tokenizer.decode(row[:end], skip_special_tokens=True).strip()
+            candidates.append(self._sanitize_caption(cand))
+
+        cov_hard = []
+        legal_flags = []
+        cov_ratio = []
+        ngram_f1 = []
+        bleu3 = None
+        bleu4 = None
+        for cand in candidates:
+            legal_flags.append(1.0 if self._is_english_sentence_like(cand) else 0.0)
+            r, ok = self._coverage_ratio_lemma(cand, concepts_norm)
+            cov_ratio.append(r)
+            cov_hard.append(1.0 if ok else 0.0)
+            if references:
+                best_f1 = 0.0
+                for ref in references:
+                    best_f1 = max(best_f1, self._ngram_f1(cand, ref, self.ngram_n))
+                ngram_f1.append(best_f1)
+            else:
+                ngram_f1.append(0.0)
+        # `acc` is the legal-English-sentence rate; full keyword coverage is `keyword_acc`.
+        acc = float(sum(legal_flags) / max(1, len(legal_flags)))
+        keyword_acc = float(sum(cov_hard) / max(1, len(cov_hard)))
+        cov_mean = float(sum(cov_ratio) / max(1, len(cov_ratio)))
+        num_valid = int(sum(1 for x in cov_hard if x > 0.5))
+        cov_filter = (
+            float(sum(r for r, ok in zip(cov_ratio, cov_hard) if ok > 0.5) / num_valid)
+            if num_valid
+            else 0.0
+        )
+
+        out: dict[str, Any] = {
+            "acc": acc,
+            "keyword_acc": keyword_acc,
+            "cov_ratio": cov_mean,
+            "cov_ratio_filter": cov_filter,
+            "coverage": 100.0 * cov_mean,
+            "coverage_filter": 100.0 * cov_filter,
+            "ngram_f1": float(sum(ngram_f1) / max(1, len(ngram_f1))),
+        }
+
+        if torch.is_grad_enabled():
+            return out
+
+        if self.compute_bleu and references and candidates:
+            # BLEU-3/4 on a 0-100 scale with PTB tokenization, as reported for CommonGen.
+            try:
+                import contextlib
+                import io
+
+                from pycocoevalcap.bleu.bleu import Bleu
+                from pycocoevalcap.tokenizer.ptbtokenizer import PTBTokenizer
+
+                refs_clean = [self._sanitize_caption(r) for r in references]
+                gts_raw = {i: [{"caption": r} for r in refs_clean] for i in range(len(candidates))}
+                res_raw = {i: [{"caption": candidates[i]}] for i in range(len(candidates))}
+                tokenizer_ptb = PTBTokenizer()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gts = tokenizer_ptb.tokenize(gts_raw)
+                    res = tokenizer_ptb.tokenize(res_raw)
+                    score, _ = Bleu(4).compute_score(gts, res)
+                bleu3 = 100.0 * float(score[2])
+                bleu4 = 100.0 * float(score[3])
+            except Exception:
+                # Fall back to NLTK corpus BLEU with smoothing when the COCO tools are absent.
+                try:
+                    from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
+
+                    smooth = SmoothingFunction().method1
+                    refs_tok = [
+                        [self._tokenize_for_metrics(r) for r in references] for _ in candidates
+                    ]
+                    cands_tok = [self._tokenize_for_metrics(c) for c in candidates]
+                    bleu3 = 100.0 * float(
+                        corpus_bleu(
+                            refs_tok,
+                            cands_tok,
+                            weights=(1.0 / 3, 1.0 / 3, 1.0 / 3, 0.0),
+                            smoothing_function=smooth,
+                        )
+                    )
+                    bleu4 = 100.0 * float(
+                        corpus_bleu(
+                            refs_tok,
+                            cands_tok,
+                            weights=(0.25, 0.25, 0.25, 0.25),
+                            smoothing_function=smooth,
+                        )
+                    )
+                except Exception:
+                    bleu3 = None
+                    bleu4 = None
+
+        if bleu3 is not None:
+            out["bleu3"] = float(bleu3)
+        if bleu4 is not None:
+            out["bleu4"] = float(bleu4)
+
+        if self.compute_bertscore and references:
+            scorer = self._get_bertscorer()
+            if scorer is not None:
+                # Compare against the first reference; max-over-references is too expensive here.
+                refs = [references[0]] * len(candidates)
+                try:
+                    with torch.inference_mode():
+                        with torch.autocast(device_type="cuda", enabled=False):
+                            _, _, f1 = scorer.score(candidates, refs, verbose=False)
+                    out["bertscore_f1"] = float(f1.mean().item())
+                except Exception:
+                    pass
+
+        return out
+
+    def __call__(
+        self,
+        sentences: Tensor,
+        tokenizer: PreTrainedTokenizer,
+        scaffold: Any = None,
+        *args,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Score sentences and their prefixes against the prompt's concept set."""
+
+        if sentences is None or sentences.ndim < 1:
+            empty = torch.zeros(
+                1, device=sentences.device if torch.is_tensor(sentences) else "cpu"
+            )
+            return {
+                "invalid": empty.unsqueeze(1),
+                "global_score": empty,
+                "local_score": empty.unsqueeze(1),
+                "full_tokens": [""],
+            }
+
+        termination_token_id = (
+            self.termination_token_id if self.termination_token_id >= 0 else tokenizer.eos_token_id
+        )
+        batch_size, seq_len = sentences.shape
+        device = sentences.device
+
+        concepts, references = self._parse_scaffold(scaffold)
+        concepts_norm = [self._normalize_text(c) for c in concepts if self._normalize_text(c)]
+        ref_for_shaping = references[0] if references else None
+
+        # States start out invalid; reachable prefixes are marked valid below.
+        invalid = torch.ones(batch_size, seq_len + 1, device=device)
+        local_score = torch.zeros(batch_size, seq_len + 1, device=device)
+        global_score = torch.zeros(batch_size, device=device)
+        full_tokens: list[str] = []
+
+        invalid[:, 0] = 1.0  # empty prefix
+
+        for i in range(batch_size):
+            row = sentences[i]
+            try:
+                stop_pos = (row == termination_token_id).nonzero(as_tuple=True)[0][0].item()
+            except Exception:
+                stop_pos = seq_len
+
+            term_state = min(int(stop_pos), seq_len)
+
+            final_text = tokenizer.decode(row[:stop_pos], skip_special_tokens=True).strip()
+            final_text = self._sanitize_caption(final_text)
+            full_tokens.append(final_text)
+
+            cov_final, hard_ok = self._coverage_ratio_lemma(final_text, concepts_norm)
+            global_score[i] = float(cov_final)
+
+            legal_ok = self._is_english_sentence_like(final_text)
+            if self.validity_mode == "keywords":
+                # Alternative validity notion: a sentence is valid iff it covers every concept.
+                legal_ok = bool(hard_ok)
+
+            # Prefix scores: soft coverage plus optional quality and terminability shaping.
+            for pos in range(stop_pos):
+                prefix_text = tokenizer.decode(row[: pos + 1], skip_special_tokens=True)
+                prefix_text = self._sanitize_caption(prefix_text)
+                if not self._chars_ok(prefix_text):
+                    invalid[i, pos + 1] = 1.0
+                    local_score[i, pos + 1] = 0.0
+                    continue
+                cov_pref, _ = self._coverage_ratio_surface(prefix_text, concepts_norm)
+                q_pref = 0.0
+                if ref_for_shaping:
+                    q_pref = self._ngram_f1(prefix_text, ref_for_shaping, self.ngram_n)
+
+                v_pref = 0.0
+                if self.valid_step_weight != 0.0 and ((pos + 1) % self.valid_step_every == 0):
+                    v_pref = 1.0 if self._would_be_valid_if_terminated(prefix_text) else 0.0
+                local = (self.coverage_weight * cov_pref) + (self.quality_weight * q_pref)
+                local = local + (self.valid_step_weight * v_pref)
+                local_score[i, pos + 1] = float(local)
+
+                # Character-legal prefixes are reachable states.
+                invalid[i, pos + 1] = 0.0
+
+            invalid[i, term_state] = 0.0 if legal_ok else 1.0
+
+            if legal_ok and self.valid_terminal_bonus != 0.0:
+                local_score[i, term_state] = local_score[i, term_state] + float(
+                    self.valid_terminal_bonus
+                )
+
+            if hard_ok:
+                local_score[i, term_state] = local_score[i, term_state] + float(
+                    self.hard_coverage_bonus
+                )
+
+            invalid[i, -1] = invalid[i, term_state].clone()
+
+        return {
+            "invalid": invalid,
+            "global_score": global_score,
+            "local_score": local_score,
+            "full_tokens": full_tokens,
+        }

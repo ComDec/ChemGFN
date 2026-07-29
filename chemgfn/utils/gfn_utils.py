@@ -1,142 +1,143 @@
-import importlib
-import warnings
+"""Sampling utilities for GFlowNet fine-tuning of language models.
 
-import numpy as np
+The core entry point is :func:`generate_and_return_termination_logprob`, which rolls out the
+policy autoregressively under a grammar constraint, records the per-step forward and termination
+log-probabilities that the trajectory-balance objectives consume, and scores the resulting
+sequences with a reward module.
+"""
+
+from collections.abc import Sequence
+from typing import Any, Callable, Optional
+
 import torch
-
-# slient the warning
-from rdkit import Chem, RDLogger
 from transformers import PreTrainedTokenizer
 from transformers.generation.logits_process import LogitsProcessorList
 
-# Backwards compatibility for legacy ReplayBuffer import path used in old configs/checkpoints.
-_LEGACY_REPLAY_BUFFER_ATTRS = {
-    "ReplayBuffer",
-    "ReplayBufferNative",
-    "ReplayBufferSubmodular",
-    "ReplayBufferSubmodularV1",
-}
 
-
-def __getattr__(name):
-    if name in _LEGACY_REPLAY_BUFFER_ATTRS:
-        warnings.warn(
-            f"{name} has moved to chemgfn.utils.replay_buffer; please update imports/configs.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        module = importlib.import_module("chemgfn.utils.replay_buffer")
-        return getattr(module, name)
-    raise AttributeError(f"module {__name__} has no attribute {name}")
-
-
-RDLogger.DisableLog("rdApp.*")
-
-
-def lora_to_base(model):
-    """Disable LoRA adapters and set model to eval mode for base model inference.
+def lora_to_base(model) -> None:
+    """Disable the LoRA adapters and switch to eval mode, exposing the frozen base policy.
 
     Args:
-        model: PEFT model with LoRA adapters.
+        model: PEFT-wrapped causal language model.
     """
     model.base_model.disable_adapter_layers()
     model.eval()
 
 
-def base_to_lora(model):
-    """Enable LoRA adapters and set model to train mode.
+def base_to_lora(model) -> None:
+    """Re-enable the LoRA adapters and switch back to train mode.
 
     Args:
-        model: PEFT model with LoRA adapters.
+        model: PEFT-wrapped causal language model.
     """
     model.base_model.enable_adapter_layers()
     model.train()
 
 
-def prepare_token_mask(tokenizer: PreTrainedTokenizer, vocab_path: str, reverse: bool = False):
-    """Prepare token masks for legal and illegal vocabulary tokens.
+def prepare_token_mask(
+    tokenizer: PreTrainedTokenizer, vocab_path: str
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Build boolean vocabulary masks from a file listing the task's legal tokens.
+
+    Each line of ``vocab_path`` holds one legal token. EOS is always legal so that trajectories
+    can terminate; BOS is always illegal so that it is never resampled mid-trajectory.
 
     Args:
-        tokenizer: Pre-trained tokenizer instance.
-        vocab_path: Path to file containing legal tokens (one per line).
-        reverse: If True, reverse the legal/illegal masks (default: False).
+        tokenizer: Tokenizer used for generation.
+        vocab_path: Path to the legal-token file, one token per line.
 
     Returns:
-        Tuple of (legal_token_mask, illegal_token_mask, legal_token_ids_list):
-            - legal_token_mask: Boolean tensor of shape [vocab_size] marking legal tokens
-            - illegal_token_mask: Boolean tensor of shape [vocab_size] marking illegal tokens
-            - legal_token_ids_list: List of legal token IDs
+        Tuple of ``(legal_token_mask, illegal_token_mask, legal_token_ids)``, where the masks are
+        boolean tensors of shape ``[vocab_size]`` and ``legal_token_ids`` lists the legal ids.
     """
     with open(vocab_path) as f:
-        legal_tokens = f.readlines()
+        legal_tokens = [line.rstrip("\n") for line in f.readlines()]
 
-    legal_tokens = [line.rstrip("\n") for line in legal_tokens]
-    legal_tokens = [tokenizer.encode(t, add_special_tokens=False)[0] for t in legal_tokens]
+    legal_token_ids = [tokenizer.encode(t, add_special_tokens=False)[0] for t in legal_tokens]
 
     legal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
-
-    # tokenize legal tokens, leave numbers as they are
-    legal_tokens = [
-        [t] if isinstance(t, int) else tokenizer.encode(t, add_special_tokens=False)
-        for t in legal_tokens
-    ]
-    assert all(len(t) == 1 for t in legal_tokens)
-
-    # get inx of legal tokens
-    legal_tokens = [t[0] for t in legal_tokens]
-    legal_token_mask[legal_tokens] = True
-
-    # add bos and eos as legal tokens
+    legal_token_mask[legal_token_ids] = True
     legal_token_mask[tokenizer.bos_token_id] = False
     legal_token_mask[tokenizer.eos_token_id] = True
 
     illegal_token_mask = ~legal_token_mask
 
-    return legal_token_mask, illegal_token_mask, legal_tokens
+    return legal_token_mask, illegal_token_mask, legal_token_ids
 
 
-def calculate_diversity(token_id_list):
-    """Calculate diversity of LLM sampling results using average per-position entropy.
+def prepare_token_mask_from_illegal(
+    tokenizer: PreTrainedTokenizer, illegal_tokens: Sequence[str]
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """Build boolean vocabulary masks by excluding tokens from the full vocabulary.
 
-    Diversity is measured as the average entropy across all sequence positions.
-    Higher entropy indicates more diverse samples.
+    Open-vocabulary tasks such as CommonGen cannot enumerate their legal tokens, so they name the
+    few tokens to suppress instead. Only tokens that encode to a single id can be masked; anything
+    that tokenizes into multiple pieces has no single vocabulary entry to switch off.
 
     Args:
-        token_id_list: torch.Tensor of shape (num_samples, seq_len) containing token IDs
+        tokenizer: Tokenizer used for generation.
+        illegal_tokens: Token strings to forbid.
 
     Returns:
-        float: Average entropy across all sequence positions (higher = more diverse)
+        Tuple of ``(legal_token_mask, illegal_token_mask, None)``. The third element is ``None``
+        because this mode has no explicit legal-id list.
+
+    Raises:
+        ValueError: If none of ``illegal_tokens`` maps to a single vocabulary entry.
     """
-    # Convert to tensor and validate dimensions
+    illegal_ids: list[int] = []
+    for token in illegal_tokens:
+        ids = tokenizer.encode(str(token), add_special_tokens=False)
+        if len(ids) == 1:
+            illegal_ids.append(int(ids[0]))
+
+    if not illegal_ids:
+        raise ValueError(
+            f"None of the configured illegal tokens {list(illegal_tokens)!r} maps to a single "
+            "token id for this tokenizer, so no vocabulary entry can be masked."
+        )
+
+    illegal_token_mask = torch.zeros(len(tokenizer), dtype=torch.bool)
+    illegal_token_mask[illegal_ids] = True
+
+    return ~illegal_token_mask, illegal_token_mask, None
+
+
+def calculate_diversity(token_id_list: torch.Tensor) -> float:
+    """Average per-position token entropy of a batch of samples.
+
+    Args:
+        token_id_list: Token ids of shape ``[num_samples, seq_len]``.
+
+    Returns:
+        Mean entropy over sequence positions; higher values indicate more diverse samples.
+    """
     num_samples, seq_len = token_id_list.shape
 
     if num_samples == 1:
-        return 0.0  # Only one sample = zero diversity
+        return 0.0
 
     total_entropy = 0.0
 
     for pos in range(seq_len):
-        # Get token distribution at current position
         tokens = token_id_list[:, pos]
-        unique_tokens, counts = torch.unique(tokens, return_counts=True)
+        _, counts = torch.unique(tokens, return_counts=True)
         probs = counts.float() / num_samples
-
-        # Calculate entropy: -sum(p * log(p))
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10))  # Add epsilon to avoid log(0)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-10))
         total_entropy += entropy.item()
 
     return total_entropy / seq_len
 
 
 def calculate_diversity_by_length(token_id_list, eos_id: int) -> dict[int, float]:
-    """Calculate diversity grouped by length (before EOS).
+    """Group samples by their pre-EOS length and report the diversity of each group.
 
     Args:
-        token_id_list: Tensor or list of token ID sequences.
-        eos_id: Token ID that marks termination.
+        token_id_list: Tensor of shape ``[num_samples, seq_len]`` or an iterable of id sequences.
+        eos_id: Token id that terminates a trajectory.
 
     Returns:
-        Dict mapping length -> diversity for that length bucket.
+        Mapping from sequence length to the average per-position entropy at that length.
     """
     if isinstance(token_id_list, torch.Tensor):
         seqs = token_id_list.tolist()
@@ -162,71 +163,65 @@ def calculate_diversity_by_length(token_id_list, eos_id: int) -> dict[int, float
     return out
 
 
-def _stack_if_not_empty(entries):
-    tensors = [entry for entry in entries if entry is not None]
-    if not tensors:
-        return None
-    return torch.stack(tensors, dim=0)
-
-
 def generate_and_return_termination_logprob(
     model,
-    encoded_data,
-    termination_token_id,
-    reward_fn,
+    encoded_data: dict[str, Any],
+    termination_token_id: int,
+    reward_fn: Callable[..., dict[str, Any]],
     grammar_processor=None,
-    vocab_nice_mask=None,
-    vocab_invalid_mask=None,
-    illegal_vocab_penalty=float("-inf"),
-    max_len=10,
-    min_len=0,
-    temperature=1.0,
-    reward_temperature=1.0,
-    action_seq=None,
-    skip_rewards=False,
-    use_buffer_sample=False,
-    buffer_sample=None,
-    buffer_mixture_ratio=0.5,
+    vocab_nice_mask: Optional[torch.Tensor] = None,
+    vocab_invalid_mask: Optional[torch.Tensor] = None,
+    illegal_vocab_penalty: float = float("-inf"),
+    max_len: int = 10,
+    min_len: int = 0,
+    temperature: float = 1.0,
+    reward_temperature: float = 1.0,
+    scaling_factor: float = 0.0,
+    reference_logits_scale: float = 0.0,
+    action_seq: Optional[torch.Tensor] = None,
+    use_buffer_sample: bool = False,
+    buffer_sample: Optional[torch.Tensor] = None,
+    buffer_mixture_ratio: float = 0.5,
     disable_grammar: bool = False,
-    grammar_disagree_penalty=-80,
-    **kwargs,
-):
-    """Generate sequences using the model and compute termination log probabilities.
+    grammar_disagree_penalty: float = -80,
+) -> dict[str, Any]:
+    """Roll out the policy and return the quantities required by the GFlowNet objectives.
 
-    This function performs autoregressive generation with grammar constraints and computes
-    forward policy log probabilities and termination probabilities at each step.
+    At every step the raw logits are masked by the task vocabulary and the grammar processor, a
+    token is sampled (or read back from ``action_seq`` when replaying a stored trajectory), and
+    the forward and termination log-probabilities are recorded. Tokens rejected by the grammar
+    are penalised in the log-probabilities by ``grammar_disagree_penalty`` so that the policy is
+    trained against the constrained distribution. Once every trajectory has terminated, the
+    completed sequences are scored by ``reward_fn``.
 
     Args:
-        model: The language model to use for generation.
-        encoded_data: Dictionary containing 'encoded_prompt' tensor and optionally 'molecule'.
-        termination_token_id: Token ID that marks sequence termination (EOS).
-        reward_fn: Function to compute rewards for generated sequences.
-        grammar_processor: Optional grammar constraint processor for logits.
-        vocab_nice_mask: Optional mask for allowed vocabulary tokens.
-        vocab_invalid_mask: Optional mask for disallowed vocabulary tokens.
-        illegal_vocab_penalty: Penalty value for illegal tokens (default: -inf).
-        max_len: Maximum generation length (default: 10).
-        min_len: Minimum generation length before allowing termination (default: 0).
-        temperature: Sampling temperature for token selection (default: 1.0).
-        reward_temperature: Temperature for reward computation (default: 1.0).
-        action_seq: Optional pre-computed action sequence (for buffer sampling).
-        skip_rewards: If True, skip reward computation (default: False).
-        use_buffer_sample: Whether to use buffer samples for generation (default: False).
-        buffer_sample: Optional buffer samples tensor.
-        buffer_mixture_ratio: Ratio of samples to replace with buffer (default: 0.5).
-        **kwargs: Additional arguments passed to reward_fn.
+        model: Causal language model producing the forward policy.
+        encoded_data: Mapping with the batched ``encoded_prompt`` tensor and an optional
+            ``scaffold`` passed through to the reward.
+        termination_token_id: Token id that terminates a trajectory (EOS).
+        reward_fn: Callable returning the reward dictionary for a batch of finished sequences.
+        grammar_processor: Logits processor enforcing the task grammar; ``None`` disables masking.
+        vocab_nice_mask: Boolean mask marking the task's legal tokens.
+        vocab_invalid_mask: Boolean mask marking tokens excluded from sampling.
+        illegal_vocab_penalty: Log-space penalty applied by the reward to illegal tokens.
+        max_len: Maximum number of generated tokens before termination is forced.
+        min_len: Number of leading steps during which termination is suppressed.
+        temperature: Sampling temperature for the forward policy.
+        reward_temperature: Temperature applied to the reward.
+        scaling_factor: Scale of the task score relative to the reference prior.
+        reference_logits_scale: Scale of the reference-prior term in the reward.
+        action_seq: Stored token ids to replay instead of sampling; ``None`` samples on-policy.
+        use_buffer_sample: Whether to splice replay-buffer trajectories into the batch.
+        buffer_sample: Replay-buffer token ids used when ``use_buffer_sample`` is set.
+        buffer_mixture_ratio: Fraction of the batch replaced by replay-buffer trajectories.
+        disable_grammar: Bypass grammar masking while still reporting acceptance.
+        grammar_disagree_penalty: Log-space penalty added to grammar-rejected tokens.
 
     Returns:
-        Dictionary containing:
-            - state: Generated sequences tensor [batch_size, seq_len]
-            - log_pf: Forward policy log probabilities [batch_size, max_len]
-            - log_pterm: Termination log probabilities [batch_size, max_len]
-            - log_r: Reward log probabilities [batch_size, max_len]
-            - log_r_unpenalized: Unpenalized reward log probabilities [batch_size, max_len]
-            - agree_list: List of agreement tensors from grammar processor
-            - log_pf_ref: Reference forward probabilities (if available)
-            - full_tokens: Decoded token strings (if available)
-            - validator_dict: Validator output dictionary (if available)
+        Dictionary with the sampled ``state`` and the per-step tensors ``log_pf``, ``log_pterm``,
+        ``log_r`` and ``log_r_unpenalized``, the reference-policy terms ``log_pf_ref`` and
+        ``log_pterm_ref``, the per-step grammar acceptance masks ``agree_list``, the decoded
+        ``full_tokens``, and the ``validator_dict`` produced by the reward.
     """
     encoded_prompt = encoded_data["encoded_prompt"]
     scaffold = encoded_data.get("scaffold")
@@ -243,6 +238,7 @@ def generate_and_return_termination_logprob(
     past_key_values = None
 
     if grammar_processor is not None:
+        # Tolerate processors that do not expose the incremental-parsing hooks.
         try:
             grammar_processor.reset()
             grammar_processor.set_prompt_length(prompt_len)
@@ -251,8 +247,6 @@ def generate_and_return_termination_logprob(
         logits_processor = grammar_processor
     else:
         logits_processor = LogitsProcessorList([])
-
-    default_processor = LogitsProcessorList([])
 
     nums_replace = 0
     if use_buffer_sample and buffer_sample is not None:
@@ -265,12 +259,10 @@ def generate_and_return_termination_logprob(
 
         if action_seq is None:
             scores = logits.clone().detach()
-            # apply nice_vocab_mask if possible
 
             if vocab_nice_mask is not None:
                 scores[:, vocab_invalid_mask] = -torch.inf
 
-            scores = default_processor(state, scores)
             results = logits_processor(state, scores, disable_grammar=disable_grammar)
 
             if isinstance(results, dict):
@@ -324,9 +316,9 @@ def generate_and_return_termination_logprob(
                 )
             else:
                 token_ids = action_seq[:, idx].unsqueeze(-1).to(device)
-                # TODO: simple mask, no-eos before max_len;
+                # Replaying a stored trajectory: only the grammar acceptance mask is recomputed,
+                # since the tokens are fixed the length constraints need not be re-applied.
                 scores = logits.clone().detach()
-                scores = default_processor(state, scores)
                 results = logits_processor(state, scores, disable_grammar=disable_grammar)
                 if isinstance(results, dict):
                     modified_logits = results["masked_logits"]
@@ -364,87 +356,57 @@ def generate_and_return_termination_logprob(
     log_pf = torch.stack(log_pf, dim=1)
     log_pterm = torch.stack(log_pterm, dim=1)
 
-    log_r = None
-    log_r_unpenalized = None
-    log_pf_ref = None
-    full_tokens = None
-    validator_dict = None
-    phi_diag = None
-    phi_state = None
-    phi_tok = None
-    pv = None
-
-    if not skip_rewards:
-        agree_tensor = _stack_if_not_empty(agree_entries)
-        reward_results = reward_fn(
-            state[:, :-1],
-            reward_temperature=reward_temperature,
-            scaling_factor=kwargs.get("scaling_factor", 0.0),
-            reference_logits_scale=kwargs.get("reference_logits_scale", 0.0),
-            vocab_invalid_mask=vocab_invalid_mask,
-            illegal_vocab_penalty=illegal_vocab_penalty,
-            agree_list=agree_tensor,
-            termination_token_id=termination_token_id,
-            scaffold=scaffold,
-            action_seq=action_seq,
-        )
-
-        if isinstance(reward_results, dict):
-            # tensors
-            log_r = reward_results["reward"]
-            log_r_unpenalized = reward_results["reward_unpenalized"]
-            log_pf_ref = reward_results.get("log_pf_ref")
-            log_pterm_ref = reward_results.get("log_pterm_ref")
-
-            # auxiliary information
-            full_tokens = reward_results.get("full_tokens")
-            validator_dict = reward_results.get("validator_dict")
-
-            # if you use split reward and loss
-            log_r_reference = reward_results.get("reward_reference", None)
-            log_r_target = reward_results.get("reward_target", None)
-
-            # extra phi information
-            phi_diag = reward_results.get("prefix_diag", None)
-            phi_state = reward_results.get("phi_state", None)
-            phi_tok = reward_results.get("phi_tok", None)
-            phi_weight = reward_results.get("phi_weight", None)
-            pv = reward_results.get("pv", None)
-
-        else:
-            log_r, log_r_unpenalized = reward_results
+    reward_results = reward_fn(
+        state[:, :-1],
+        reward_temperature=reward_temperature,
+        scaling_factor=scaling_factor,
+        reference_logits_scale=reference_logits_scale,
+        vocab_invalid_mask=vocab_invalid_mask,
+        illegal_vocab_penalty=illegal_vocab_penalty,
+        termination_token_id=termination_token_id,
+        scaffold=scaffold,
+        action_seq=action_seq,
+    )
 
     return {
         "state": state,
         "log_pf": log_pf,
         "log_pterm": log_pterm,
-        "log_r": log_r,
-        "log_r_unpenalized": log_r_unpenalized,
-        "log_r_reference": log_r_reference,
-        "log_r_target": log_r_target,
-        "log_pf_ref": log_pf_ref,
-        "log_pterm_ref": log_pterm_ref,
+        "log_r": reward_results["reward"],
+        "log_r_unpenalized": reward_results["reward_unpenalized"],
+        "log_pf_ref": reward_results.get("log_pf_ref"),
+        "log_pterm_ref": reward_results.get("log_pterm_ref"),
         "agree_list": agree_entries,
-        "full_tokens": full_tokens,
-        "validator_dict": validator_dict,
-        "phi_diag": phi_diag,
-        "prefix_diag": phi_diag,
-        "phi_state": phi_state,
-        "phi_tok": phi_tok,
-        "pv": pv,
-        "phi_weight": phi_weight,
+        "full_tokens": reward_results.get("full_tokens"),
+        "validator_dict": reward_results.get("validator_dict"),
     }
 
 
 def get_termination_vals(
-    generated_text,
-    log_pf,
-    log_pterm,
-    log_r,
-    log_r_unpenalized,
-    termination_token_id,
-    prompt_len,
-):
+    generated_text: torch.Tensor,
+    log_pf: Optional[torch.Tensor],
+    log_pterm: Optional[torch.Tensor],
+    log_r: torch.Tensor,
+    log_r_unpenalized: torch.Tensor,
+    termination_token_id: int,
+    prompt_len: int,
+) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read off the per-trajectory quantities at the terminating step.
+
+    Args:
+        generated_text: Prompt-and-completion token ids of shape ``[batch, prompt_len + steps]``.
+        log_pf: Per-step forward log-probabilities, or ``None`` to skip the policy term.
+        log_pterm: Per-step termination log-probabilities, or ``None``.
+        log_r: Per-step log rewards.
+        log_r_unpenalized: Per-step log rewards before the invalid-token penalty.
+        termination_token_id: Token id that terminates a trajectory (EOS).
+        prompt_len: Number of prompt tokens preceding the generated part.
+
+    Returns:
+        Tuple of ``(log_pfs, log_r, log_r_unpenalized, gen_len)`` evaluated at the EOS position,
+        where ``log_pfs`` is the complete trajectory log-probability (``None`` when ``log_pf``
+        and ``log_pterm`` are both ``None``) and ``gen_len`` is the generated length.
+    """
     batch_idx = torch.arange(generated_text.size(0))
     gen_len = (generated_text[:, prompt_len:] == termination_token_id).byte().argmax(dim=-1)
     if log_pf is None and log_pterm is None:

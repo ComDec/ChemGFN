@@ -32,7 +32,7 @@ exp_name: "default"
 tags: ["dev"]
 
 # set False to skip model training
-train: True
+train: true
 
 # simply provide checkpoint path to resume training
 ckpt_path: null

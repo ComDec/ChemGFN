@@ -1,9 +1,13 @@
-"""AMP oracle: ProtTrans AlBert features → MLP classifier.
+"""Antimicrobial-peptide oracle: ProtTrans ALBERT features feeding an MLP classifier.
 
-Reproduces the oracle from BioSeq-GFN-AL (Jain et al., 2022).
-Architecture: Linear(4096,1024) → Dropout → ReLU → Linear(1024,1024) → Dropout → ReLU → Linear(1024,2)
-Score = softmax(logits)[:, 1]  (probability of AMP class)
-Weights: D2_target_MLP_best_Layer_1024_AlBert.pt from MJ10/clamp-gen-data
+This reproduces the AMP oracle of BioSeq-GFN-AL (Jain et al., 2022). A peptide is embedded by
+mean-pooling the ProtTrans ALBERT hidden states over its amino-acid tokens, and the 4096-dim
+embedding is classified by ``Linear(4096, 1024) - Dropout - ReLU - Linear(1024, 1024) - Dropout -
+ReLU - Linear(1024, 2)``. The reported score is ``softmax(logits)[:, 1]``, the probability that
+the peptide is antimicrobial.
+
+The MLP weights are ``D2_target_MLP_best_Layer_1024_AlBert.pt`` from the ``MJ10/clamp-gen-data``
+release; the layer names below (``fc1``, ``fc2``, ``fc4``) match that checkpoint.
 """
 
 from __future__ import annotations
@@ -18,10 +22,7 @@ from torch import Tensor
 
 
 class AMPMLP(nn.Module):
-    """MLP matching the clamp-gen-data oracle architecture.
-
-    Note: layer naming skips fc3 (fc1 → fc2 → fc4) to match saved weights.
-    """
+    """Classification head of the AMP oracle."""
 
     def __init__(
         self,
@@ -30,6 +31,15 @@ class AMPMLP(nn.Module):
         num_outputs: int = 2,
         dropout_rate: float = 0.5,
     ) -> None:
+        """Build the head.
+
+        Args:
+            num_inputs: Dimension of the ProtTrans embedding.
+            num_hiddens: Width of the two hidden layers.
+            num_outputs: Number of classes; the AMP probability is class 1.
+            dropout_rate: Dropout probability, also used for MC-dropout sampling.
+        """
+
         super().__init__()
         self.fc1 = nn.Linear(num_inputs, num_hiddens)
         self.fc2 = nn.Linear(num_hiddens, num_hiddens)
@@ -38,6 +48,8 @@ class AMPMLP(nn.Module):
         self.dropout_rate = dropout_rate
 
     def forward(self, x: Tensor, mc_dropout: bool = False) -> Tensor:
+        """Map embeddings to class logits, optionally keeping dropout active."""
+
         training_or_mc = self.training or mc_dropout
         x = F.dropout(self.act(self.fc1(x)), p=self.dropout_rate, training=training_or_mc)
         x = F.dropout(self.act(self.fc2(x)), p=self.dropout_rate, training=training_or_mc)
@@ -45,18 +57,10 @@ class AMPMLP(nn.Module):
 
 
 class AMPOracle:
-    """Full oracle: ProtTrans feature extraction + MLP scoring.
+    """ProtTrans feature extraction followed by MLP scoring.
 
-    Parameters
-    ----------
-    weights_path : str | Path | None
-        Path to .pt state dict. If None, MLP uses random weights (for testing).
-    prot_albert_name : str
-        HuggingFace model name for ProtTrans AlBert.
-    device : str
-        Torch device.
-    mc_samples : int
-        Number of MC-dropout forward passes (0 = deterministic).
+    The ALBERT encoder is loaded lazily on first use, so constructing the oracle is cheap and
+    the heavy download only happens when a peptide is actually scored.
     """
 
     def __init__(
@@ -66,6 +70,16 @@ class AMPOracle:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         mc_samples: int = 0,
     ) -> None:
+        """Build the oracle.
+
+        Args:
+            weights_path: Path to the MLP state dict. ``None`` leaves the head randomly
+                initialised, which is only useful for smoke tests.
+            prot_albert_name: Hugging Face id of the ProtTrans ALBERT encoder.
+            device: Torch device the encoder and head run on.
+            mc_samples: Number of MC-dropout forward passes; ``0`` scores deterministically.
+        """
+
         self.device = torch.device(device)
         self.mc_samples = int(mc_samples)
 
